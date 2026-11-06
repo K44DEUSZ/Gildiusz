@@ -1,0 +1,15 @@
+{
+  "attachmentDenied": "Usunąłem wiadomość z niedozwolonym załącznikiem. Aktualne dozwolone formaty sprawdzisz komendą /pomoc. Jeśli wiadomość zawierała też opis albo poprawne pliki, wyślij je jeszcze raz bez tego załącznika.",
+  "attachmentFailed": "Nie udało mi się sprawdzić załącznika, więc usunąłem wiadomość. Spróbuj ponownie za chwilę. Jeśli problem wraca, zgłoś go moderatorowi.",
+  "roomClosed": "Pokój jest zamknięty dla nowych osób. Obecni uczestnicy zachowują dostęp. Moderatorzy nadal mogą wejść.",
+  "roomDenied": "Tym pokojem zarządza jego właściciel. W razie problemu zgłoś się do moderatora.",
+  "roomFailed": "Nie udało się utworzyć pokoju. Spróbuj za chwilę. Jeśli błąd wraca, zgłoś go moderatorowi.",
+  "reportSent": "Zgłoszenie trafiło do moderatorów. Jeśli trzeba będzie coś doprecyzować, odezwą się do ciebie.",
+  "pending": "Zaakceptuj zasady serwera, żeby korzystać z tej funkcji.",
+  "timeout": "Ta funkcja jest niedostępna podczas czasowego ograniczenia konta.",
+  "cooldown": "Spróbuj ponownie za chwilę. Ta funkcja ma krótkie ograniczenie liczby prób.",
+  "roomOpened": "Pokój jest otwarty dla członków serwera.",
+  "roomRenamed": "Nazwa pokoju została zmieniona.",
+  "roomInvited": "Dostęp został przyznany. Odnośnik do pokoju: {{room.link}}.",
+  "operationFailed": "Nie udało się wykonać działania. Jeśli problem wraca, zgłoś go moderatorowi."
+}

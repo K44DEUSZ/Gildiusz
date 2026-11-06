@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/gildiusz.sqlite
+      TZ: Europe/Warsaw
+    volumes:
+      - bot-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+volumes:
+  bot-data:

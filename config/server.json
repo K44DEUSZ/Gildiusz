@@ -1,0 +1,259 @@
+{
+  "brand": {
+    "name": "Kampus Projektów",
+    "description": "Polska społeczność dla osób, które robią własne projekty albo dopiero chcą zacząć. Technologia, aplikacje, startupy i media cyfrowe. Pokaż, nad czym pracujesz, znajdź ekipę lub zapytaj o pomoc.",
+    "discordDescription": "Polska społeczność twórców aplikacji, startupów i mediów cyfrowych. Pokaż projekt, znajdź ekipę lub zapytaj."
+  },
+  "roles": [
+    {
+      "key": "programming",
+      "name": "Programowanie"
+    },
+    {
+      "key": "design",
+      "name": "Design"
+    },
+    {
+      "key": "marketing",
+      "name": "Marketing"
+    },
+    {
+      "key": "business",
+      "name": "Biznes"
+    },
+    {
+      "key": "media",
+      "name": "Media cyfrowe"
+    },
+    {
+      "key": "hasProject",
+      "name": "Mam projekt"
+    },
+    {
+      "key": "seeksTeam",
+      "name": "Szukam ekipy"
+    },
+    {
+      "key": "joinsProject",
+      "name": "Chcę dołączyć"
+    },
+    {
+      "key": "seeksFeedback",
+      "name": "Szukam feedbacku"
+    },
+    {
+      "key": "seeksInspiration",
+      "name": "Szukam inspiracji"
+    }
+  ],
+  "categories": [
+    {
+      "key": "start",
+      "name": "👋 START"
+    },
+    {
+      "key": "community",
+      "name": "💬 SPOŁECZNOŚĆ"
+    },
+    {
+      "key": "projects",
+      "name": "🚀 PROJEKTY"
+    },
+    {
+      "key": "knowledge",
+      "name": "📚 WIEDZA"
+    },
+    {
+      "key": "voice",
+      "name": "🎙️ GŁOSOWE"
+    },
+    {
+      "key": "rooms",
+      "name": "🛠️ POKOJE PROJEKTOWE"
+    },
+    {
+      "key": "admin",
+      "name": "🔒 ADMINISTRACJA"
+    }
+  ],
+  "channels": [
+    {
+      "key": "start",
+      "name": "👋・start-tutaj",
+      "category": "start",
+      "kind": "readonly"
+    },
+    {
+      "key": "rules",
+      "name": "📜・regulamin",
+      "category": "start",
+      "kind": "readonly"
+    },
+    {
+      "key": "introductions",
+      "name": "🙋・przedstaw-się",
+      "category": "start",
+      "kind": "text"
+    },
+    {
+      "key": "general",
+      "name": "💬・ogólny",
+      "category": "community",
+      "kind": "text"
+    },
+    {
+      "key": "help",
+      "name": "❓・pytania-i-feedback",
+      "category": "community",
+      "kind": "text"
+    },
+    {
+      "key": "offtopic",
+      "name": "☕・luźne-rozmowy",
+      "category": "community",
+      "kind": "text"
+    },
+    {
+      "key": "showcase",
+      "name": "🚀・pokaż-projekt",
+      "category": "projects",
+      "kind": "forum"
+    },
+    {
+      "key": "collaboration",
+      "name": "🤝・szukam-ekipy",
+      "category": "projects",
+      "kind": "forum"
+    },
+    {
+      "key": "resources",
+      "name": "📚・materiały-i-linki",
+      "category": "knowledge",
+      "kind": "text"
+    },
+    {
+      "key": "social",
+      "name": "💬・Pogaduchy",
+      "category": "voice",
+      "kind": "voice"
+    },
+    {
+      "key": "meet",
+      "name": "👋・Poznajmy się",
+      "category": "voice",
+      "kind": "voice"
+    },
+    {
+      "key": "coworking",
+      "name": "💻・Coworking",
+      "category": "voice",
+      "kind": "voice"
+    },
+    {
+      "key": "join",
+      "name": "➕・Utwórz pokój",
+      "category": "voice",
+      "kind": "voice"
+    },
+    {
+      "key": "moderation",
+      "name": "🛡️・moderacja",
+      "category": "admin",
+      "kind": "admin"
+    },
+    {
+      "key": "logs",
+      "name": "📋・logi",
+      "category": "admin",
+      "kind": "admin"
+    }
+  ],
+  "rooms": {
+    "ownerLimit": 1,
+    "emptySeconds": 60,
+    "transferSeconds": 30,
+    "maximum": 20,
+    "creationCooldownSeconds": 30
+  },
+  "attachments": {
+    "extensions": ["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+    "maxBytes": 4096,
+    "timeoutMs": 5000,
+    "concurrency": 4,
+    "queueLimit": 100,
+    "hosts": ["cdn.discordapp.com", "media.discordapp.net"],
+    "excludedApplicationIds": [],
+    "uploadsEnabled": false
+  },
+  "moderation": {
+    "mentionLimit": 5,
+    "reportCooldownSeconds": 60,
+    "notificationCooldownSeconds": 60,
+    "retentionDays": 30,
+    "spamDomains": []
+  },
+  "onboarding": [
+    {
+      "key": "interests",
+      "title": "Co cię interesuje?",
+      "options": [
+        {
+          "role": "programming",
+          "title": "Programowanie",
+          "description": "Aplikacje, strony i automatyzacje. Także nauka od zera."
+        },
+        {
+          "role": "design",
+          "title": "Design",
+          "description": "Grafika, interfejsy i projektowanie doświadczeń."
+        },
+        {
+          "role": "marketing",
+          "title": "Marketing",
+          "description": "Promocja, treści, sprzedaż i docieranie do odbiorców."
+        },
+        {
+          "role": "business",
+          "title": "Biznes",
+          "description": "Pomysły na produkty, przedsiębiorczość i rozwijanie projektów."
+        },
+        {
+          "role": "media",
+          "title": "Media cyfrowe",
+          "description": "Podcasty, YouTube, wideo i inne własne formaty."
+        },
+        {
+          "title": "Dopiero się rozglądam",
+          "description": "Jeszcze sprawdzam, co mnie wciągnie.",
+          "channel": "general"
+        }
+      ]
+    },
+    {
+      "key": "intentions",
+      "title": "Czego teraz szukasz?",
+      "options": [
+        {
+          "role": "hasProject",
+          "title": "Rozwijam swój projekt"
+        },
+        {
+          "role": "seeksTeam",
+          "title": "Szukam osób do wspólnego projektu"
+        },
+        {
+          "role": "joinsProject",
+          "title": "Chcę dołączyć do czyjegoś projektu"
+        },
+        {
+          "role": "seeksFeedback",
+          "title": "Przydadzą mi się opinie"
+        },
+        {
+          "role": "seeksInspiration",
+          "title": "Na razie szukam inspiracji"
+        }
+      ]
+    }
+  ]
+}

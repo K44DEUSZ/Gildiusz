@@ -1,0 +1,10 @@
+.git
+.env*
+node_modules
+dist
+data
+backups
+reports
+work
+test
+docs

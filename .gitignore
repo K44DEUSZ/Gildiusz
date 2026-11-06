@@ -1,0 +1,17 @@
+node_modules/
+*.tgz
+.DS_Store
+dist/
+.env
+.env.*
+!.env.example
+data/
+backups/
+reports/*
+!reports/acceptance-report.md
+coverage/
+*.log
+*.db*
+*.sqlite*
+*.lock/
+work/

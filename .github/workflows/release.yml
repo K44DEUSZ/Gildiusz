@@ -1,0 +1,38 @@
+name: Wydanie Gildiusza
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Opublikuj sprawdzoną wersję z package.json
+        type: boolean
+        default: false
+      version:
+        description: Dokładny numer z package.json
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: gildiusz-release
+  cancel-in-progress: false
+jobs:
+  check:
+    uses: ./.github/workflows/check.yml
+  release:
+    needs: check
+    if: github.repository == 'K44DEUSZ/gildiusz' && github.ref == 'refs/heads/main' && inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Publish the exact checked commit
+        run: node scripts/release.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_PUBLISH: ${{ inputs.publish }}

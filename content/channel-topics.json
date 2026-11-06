@@ -1,0 +1,11 @@
+{
+  "start": "Pierwsze kroki: zasady, przedstawienie się, wybór tematów i własny pokój. Kanał informacyjny.",
+  "rules": "10 zasad społeczności oraz informacja o prywatności. Zgłoszenia: /zglos lub wiadomość do moderatora.",
+  "introductions": "Daj się poznać: co cię interesuje, nad czym pracujesz i kogo chcesz poznać. Dwa lub trzy zdania wystarczą.",
+  "general": "Rozmowy o projektach, narzędziach i życiu społeczności. Konkretne pytania: {{channel.help}}.",
+  "offtopic": "Rozmowy poza projektami. Można też pogadać o czymś innym.",
+  "help": "Jedna wiadomość na problem: cel, co nie działa i co już sprawdzono. Dalsze odpowiedzi we wątku. Usuń hasła i prywatne dane.",
+  "resources": "Materiały, narzędzia i linki z krótkim opisem. Własne materiały i współprace oznaczaj uczciwie.",
+  "moderation": "Prywatne zgłoszenia /zglos i alerty AutoMod. Dostęp dla moderacji. Dane wrażliwe ograniczaj do niezbędnego minimum.",
+  "logs": "Prywatne zdarzenia techniczne bota i aktualizacje Discorda. Logi zdarzeń bota są usuwane po 30 dniach."
+}
