@@ -4,7 +4,8 @@
 
 Polski bot Discord do prowadzenia społeczności: tworzy tymczasowe pokoje głosowe, przyjmuje zgłoszenia i sprawdza formaty załączników. Administracja może ustawić mu własną nazwę i awatar na swoim serwerze.
 
-To wczesna wersja do samodzielnego uruchomienia. Jeden proces obsługuje jeden wskazany serwer. Bot potrzebuje stale działającego hosta; publiczna instalacja jednej wspólnej instancji na wielu serwerach jest w planie.
+To wczesna wersja do samodzielnego uruchomienia. Jeden proces może obsługiwać kilka jawnie skonfigurowanych serwerów Discorda, z osobnymi bazami i ustawieniami. Bot potrzebuje stale działającego hosta. Instalacja nowych serwerów wymaga operatora; nie ma jeszcze publicznej samoobsługi.
+
 
 ## Co potrafi
 

@@ -46,23 +46,27 @@ export interface Environment {
   databasePath: string;
 }
 
-export function loadEnvironment(): Environment {
-  const token = process.env.DISCORD_TOKEN;
+export function loadCredentials(values = process.env): Pick<Environment, "token" | "clientId"> {
+  const token = values.DISCORD_TOKEN;
   if (!token || token.trim() !== token)
     throw new Error("Set DISCORD_TOKEN in the local environment.");
   return {
     token,
-    clientId: requireId(process.env.DISCORD_CLIENT_ID, "DISCORD_CLIENT_ID"),
-    guildId: requireId(process.env.DISCORD_GUILD_ID, "DISCORD_GUILD_ID"),
-    ownerId: requireId(process.env.OWNER_USER_ID, "OWNER_USER_ID"),
-    databasePath: resolve(process.env.DATABASE_PATH || "data/gildiusz.sqlite"),
+    clientId: requireId(values.DISCORD_CLIENT_ID, "DISCORD_CLIENT_ID"),
   };
 }
 
-export function loadConfig(): Config {
-  const config = JSON.parse(
-    readFileSync(process.env.CONFIG_PATH || "config/server.json", "utf8"),
-  ) as Config;
+export function loadEnvironment(values = process.env): Environment {
+  return {
+    ...loadCredentials(values),
+    guildId: requireId(values.DISCORD_GUILD_ID, "DISCORD_GUILD_ID"),
+    ownerId: requireId(values.OWNER_USER_ID, "OWNER_USER_ID"),
+    databasePath: resolve(values.DATABASE_PATH || "data/gildiusz.sqlite"),
+  };
+}
+
+export function loadConfig(path = process.env.CONFIG_PATH || "config/server.json"): Config {
+  const config = JSON.parse(readFileSync(path, "utf8")) as Config;
   validateConfig(config);
   return config;
 }

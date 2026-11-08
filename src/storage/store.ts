@@ -31,7 +31,10 @@ export interface EventRow {
 
 export class Store {
   readonly db: DatabaseSync;
-  constructor(readonly path: string) {
+  constructor(
+    readonly path: string,
+    guildId?: string,
+  ) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
@@ -52,6 +55,17 @@ export class Store {
       this.db.exec(`BEGIN IMMEDIATE;
       CREATE TABLE runtime_settings (guild TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL, actor TEXT NOT NULL, updated INTEGER NOT NULL);
       PRAGMA user_version=2; COMMIT;`);
+    if (guildId) {
+      this.db.exec(
+        "CREATE TABLE IF NOT EXISTS guild_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), guild TEXT NOT NULL)",
+      );
+      const bound = this.db.prepare("SELECT guild FROM guild_identity WHERE singleton=1").get();
+      if (bound && bound.guild !== guildId) {
+        this.db.close();
+        throw Error("This database belongs to a different guild.");
+      }
+      this.db.prepare("INSERT OR IGNORE INTO guild_identity VALUES (1,?)").run(guildId);
+    }
   }
   resources(): Resource[] {
     return this.db.prepare("SELECT * FROM resources ORDER BY key").all() as unknown as Resource[];

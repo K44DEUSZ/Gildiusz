@@ -4,7 +4,8 @@
 
 A Discord community bot with a Polish interface: temporary voice rooms, reports to moderators, attachment format checks, and a server-specific bot nickname and avatar.
 
-This is an early, self-hosted version. Each process serves one configured guild and needs a continuously running host. A shared installation serving multiple guilds is planned.
+This is an early, self-hosted version. One process can serve several explicitly configured guilds, each with a separate database and settings. It needs a continuously running host. New guilds require operator setup; public self-service installation is not implemented.
+
 
 ## Features
 

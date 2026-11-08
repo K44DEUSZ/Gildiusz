@@ -27,3 +27,22 @@ jobs:
       - run: npm run cli -- validate
       - run: npm audit --audit-level=moderate
       - run: docker build -t gildiusz-check .
+  hosting-package:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: node scripts/build-package.mjs "$RUNNER_TEMP/hosting-package"
+      - run: node scripts/publish-build.mjs "$RUNNER_TEMP/hosting-package"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

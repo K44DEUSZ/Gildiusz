@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
-import { loadConfig, loadEnvironment } from "./config.js";
+import { dirname, resolve } from "node:path";
+import { loadConfig, loadCredentials, loadEnvironment } from "./config.js";
 import { contentDigest, lintContent, publications, readJson } from "./content.js";
 import { Store } from "./storage/store.js";
 import { acquireLock } from "./storage/lock.js";
@@ -9,6 +9,7 @@ import { discordApi, snapshot, type Body } from "./bootstrap/api.js";
 import { applyPlan, buildPlan, type Plan } from "./bootstrap/plan.js";
 import { auditPermissions } from "./permissions/audit.js";
 import { digest, errorCode, requireId, warsawTime } from "./shared/utils.js";
+import { selectInstallation, healthPath } from "./installations.js";
 import { initializeForumGuides } from "./bootstrap/forum-guides.js";
 
 function option(name: string, fallback?: string): string | undefined {
@@ -27,22 +28,22 @@ async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
   if (command === "help") {
     console.log(
-      "Commands: validate, check-env, plan [--offline] [--phase core|community|content], apply --file FILE --approve SHA256 [--allow-sensitive] [--allow-drift], forum-guides [--approve SHA256], permissions, status, backup --output FILE, adopt --key KEY --id ID --approve SHA256, resolve-operation --key KEY --approve SHA256, health",
+      "Commands: validate, check-env, plan [--offline] [--phase core|community|content], apply --file FILE --approve SHA256 [--allow-sensitive] [--allow-drift], forum-guides [--approve SHA256], permissions, status, backup --output FILE, adopt --key KEY --id ID --approve SHA256, resolve-operation --key KEY --approve SHA256, health; use --guild ID with multiple installations",
     );
     return;
   }
   if (command === "health") {
-    const path = join(
-      dirname(resolve(process.env.DATABASE_PATH || "data/kampus.sqlite")),
-      "health.json",
-    );
+    const path = healthPath();
     const health = JSON.parse(readFileSync(path, "utf8")) as { ready: boolean; updated: number };
     if (!health.ready || Date.now() - health.updated > 60000)
       throw new Error("Bot health is stale or unavailable.");
     console.log("Bot health: ok");
     return;
   }
-  const config = loadConfig();
+  const installation = process.env.GUILDS_PATH ? selectInstallation(option("guild")) : undefined;
+  if (!installation && option("guild") && option("guild") !== process.env.DISCORD_GUILD_ID)
+    throw Error("This guild is not configured.");
+  const config = loadConfig(installation?.configPath);
   const errors = lintContent(config);
   if (errors.length) throw new Error(errors.join("\n"));
   if (command === "validate") {
@@ -96,7 +97,8 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "backup") {
-    const path = resolve(process.env.DATABASE_PATH || "data/kampus.sqlite");
+    const path =
+      installation?.databasePath ?? resolve(process.env.DATABASE_PATH || "data/gildiusz.sqlite");
     if (!existsSync(path)) throw new Error("No database to back up.");
     const output = resolve(option("output") ?? "");
     if (!option("output") || existsSync(output) || output === path)
@@ -119,7 +121,7 @@ async function main(): Promise<void> {
     }
     return;
   }
-  const environment = loadEnvironment();
+  const environment = installation ? { ...loadCredentials(), ...installation } : loadEnvironment();
   const api = discordApi(environment);
   if (command === "check-env") {
     const state = await snapshot(api, environment);
@@ -141,7 +143,7 @@ async function main(): Promise<void> {
     ["apply", "adopt", "resolve-operation"].includes(command) ||
     (command === "forum-guides" && Boolean(option("approve")));
   const release = mutations ? await acquireLock(environment.databasePath) : null;
-  const store = new Store(environment.databasePath);
+  const store = new Store(environment.databasePath, environment.guildId);
   try {
     const state = await snapshot(api, environment);
     if (command === "plan") {

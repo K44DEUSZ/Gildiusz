@@ -3,6 +3,7 @@ import {
   closeSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   realpathSync,
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve, basename } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
+import { archiveName, validateBuild, verifyArchive } from "./build-package.mjs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -242,10 +244,12 @@ async function waitReady(root, revision, after, timeout = 100000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const state = readJson(p.state);
+    const health = readJson(p.health);
     if (
       state?.release === revision &&
       state.started >= after &&
-      healthy(readJson(p.health), Date.now(), state.started)
+      healthy(health, Date.now(), state.started) &&
+      (health.guilds ?? []).every((guild) => guild.ready)
     )
       return true;
     await delay(2000);
@@ -274,33 +278,151 @@ async function stopSupervisor(root) {
   }
 }
 
-export async function install(root, sha) {
+async function checkedWorkflow(sha) {
+  const response = await globalThis.fetch(
+    `https://api.github.com/repos/K44DEUSZ/gildiusz/actions/workflows/check.yml/runs?head_sha=${sha}&event=push&per_page=10`,
+    {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: globalThis.AbortSignal.timeout(15000),
+    },
+  );
+  if (!response.ok) throw Error(`GitHub checks unavailable: HTTP ${response.status}`);
+  return (await response.json()).workflow_runs?.find((run) => checkedRun([run], sha, "main"));
+}
+
+async function download(url, maximum) {
+  const response = await globalThis.fetch(url, { signal: globalThis.AbortSignal.timeout(120000) });
+  if (!response.ok) throw Error(`Build download HTTP ${response.status}`);
+  let length = 0;
+  const chunks = [];
+  for await (const chunk of response.body) {
+    length += chunk.length;
+    if (length > maximum) throw Error("Build download exceeds the size limit.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export function validateArchiveEntries(names, types) {
+  const allowed = new Set([
+    "dist",
+    "content",
+    "config",
+    "scripts",
+    "node_modules",
+    "package.json",
+    "package-lock.json",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "build.json",
+  ]);
+  for (const raw of names) {
+    const name = raw.replace(/^\.\//, "");
+    if (!name) continue;
+    if (
+      name.startsWith("/") ||
+      name.includes("\\") ||
+      name.split("/").includes("..") ||
+      !allowed.has(name.split("/")[0])
+    )
+      throw Error("Unsafe entry in the hosting package.");
+  }
+  if (types.some((type) => type !== "-" && type !== "d"))
+    throw Error("Hosting packages cannot contain links or special files.");
+}
+
+export function prepareRelease(root, manifest, bytes) {
+  validateBuild(manifest, manifest.revision, manifest.workflowRun);
+  verifyArchive(manifest, bytes);
+  const releases = join(root, "releases");
+  mkdirSync(releases, { recursive: true, mode: 0o700 });
+  const release = join(releases, manifest.revision);
+  if (existsSync(release)) {
+    const previous = readJson(join(release, "build.json"));
+    if (previous?.revision !== manifest.revision || previous?.workflowRun !== manifest.workflowRun)
+      throw Error("Existing release does not match this build.");
+    return release;
+  }
+  const staging = mkdtempSync(join(releases, ".incoming-"));
+  if (dirname(staging) !== releases) throw Error("Unexpected staging directory.");
+  try {
+    const archive = join(staging, archiveName);
+    writeFileSync(archive, bytes, { mode: 0o600 });
+    const names = run("tar", ["-tzf", archive], root).split("\n");
+    const types = run("tar", ["-tvzf", archive], root)
+      .split("\n")
+      .map((line) => line[0]);
+    validateArchiveEntries(names, types);
+    execFileSync("tar", ["-xzf", archive, "-C", staging]);
+    rmSync(archive);
+    const metadata = readJson(join(staging, "build.json"));
+    if (
+      metadata?.revision !== manifest.revision ||
+      metadata?.workflowRun !== manifest.workflowRun ||
+      metadata?.nodeMajor !== 24
+    )
+      throw Error("Unpacked build identity differs.");
+    if (
+      !existsSync(join(staging, "dist", "bot", "main.js")) ||
+      !existsSync(join(staging, "node_modules", "discord.js", "package.json"))
+    )
+      throw Error("Incomplete production package.");
+    run(process.execPath, ["dist/cli.js", "validate"], staging);
+    writeFileSync(join(staging, ".built"), manifest.revision + "\n");
+    renameSync(staging, release);
+    return release;
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+async function retrieveRelease(root, sha, workflow) {
+  const commit = run(
+    "git",
+    ["ls-remote", "origin", "refs/heads/hosting-build"],
+    join(root, "source"),
+  ).split(/\s/)[0];
+  if (!/^[a-f0-9]{40}$/.test(commit ?? "")) throw Error("The hosting build is not published yet.");
+  const base = `https://raw.githubusercontent.com/K44DEUSZ/gildiusz/${commit}`;
+  const manifest = JSON.parse((await download(`${base}/manifest.json`, 16384)).toString("utf8"));
+  validateBuild(manifest, sha, String(workflow.id));
+  const bytes = await download(`${base}/${archiveName}`, manifest.size);
+  return prepareRelease(root, manifest, bytes);
+}
+
+export function deploymentState(root, release) {
+  return JSON.parse(
+    run(
+      process.execPath,
+      [
+        "--env-file=" + join(root, "shared", ".env"),
+        "--input-type=module",
+        "-e",
+        'import {loadInstallations} from "./dist/installations.js";import {loadConfig} from "./dist/config.js";import {lintContent} from "./dist/content.js";const entries=loadInstallations();for(const entry of entries){const errors=lintContent(loadConfig(entry.configPath));if(errors.length)throw Error("Invalid guild configuration.");}console.log(JSON.stringify(entries.map(({guildId,databasePath})=>({guildId,databasePath}))));',
+      ],
+      release,
+    ),
+  );
+}
+
+export async function install(root, sha, checked) {
   if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Expected a full commit SHA.");
+  const workflow = checked ?? (await checkedWorkflow(sha));
+  if (!workflow) throw Error("This revision has no successful main push checks.");
   const p = paths(root);
-  const release = join(root, "releases", sha);
-  const source = join(root, "source");
-  if (!existsSync(release)) {
-    mkdirSync(release, { mode: 0o700 });
-    // Export only tracked source; deployment state never enters a release archive.
-    const archive = execFileSync("git", ["archive", "--format=tar", sha], {
-      cwd: source,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    execFileSync("tar", ["-xf", "-", "-C", release], { input: archive });
-  }
-  if (!existsSync(join(release, ".built"))) {
-    run("npm", ["ci", "--ignore-scripts"], release);
-    run("npm", ["run", "build"], release);
-    run("npm", ["run", "cli", "--", "validate"], release);
-    writeFileSync(join(release, ".built"), sha + "\n");
-  }
+  const release = await retrieveRelease(root, sha, workflow);
+  const installations = deploymentState(root, release);
   const previous = existsSync(p.current) ? realpathSync(p.current) : null;
   if (previous === release) return event(root, `already active ${sha}`);
-  if (existsSync(p.database)) {
+  for (const installation of installations) {
+    if (!existsSync(installation.databasePath)) continue;
     const { DatabaseSync, backup } = await import("node:sqlite");
-    const database = new DatabaseSync(p.database, { readOnly: true });
+    const database = new DatabaseSync(installation.databasePath, { readOnly: true });
     try {
-      await backup(database, join(p.shared, "backups", `${Date.now()}-before-${sha}.sqlite`));
+      await backup(
+        database,
+        join(p.shared, "backups", `${Date.now()}-${installation.guildId}-before-${sha}.sqlite`),
+      );
     } finally {
       database.close();
     }
@@ -342,20 +464,12 @@ async function update(root) {
     return;
   const failed = join(root, "shared", "failed-revision");
   if (existsSync(failed) && readFileSync(failed, "utf8") === sha) return;
-  const response = await globalThis.fetch(
-    `https://api.github.com/repos/K44DEUSZ/gildiusz/actions/workflows/check.yml/runs?head_sha=${sha}&event=push&per_page=10`,
-    {
-      headers: { Accept: "application/vnd.github+json" },
-      signal: globalThis.AbortSignal.timeout(15000),
-    },
-  );
-  if (!response.ok) throw Error(`GitHub checks unavailable: HTTP ${response.status}`);
-  if (!checkedRun((await response.json()).workflow_runs ?? [], sha, "main"))
-    return event(root, `waiting for successful main checks ${sha}`);
+  const workflow = await checkedWorkflow(sha);
+  if (!workflow) return event(root, `waiting for successful main checks and package ${sha}`);
   // Do not activate an older revision if main advanced while checks were being read.
   const remote = run("git", ["ls-remote", "origin", "refs/heads/main"], source).split(/\s/)[0];
   if (remote !== sha) return event(root, "main advanced; waiting for the next scheduler run");
-  await install(root, sha);
+  await install(root, sha, workflow);
 }
 
 async function main() {
