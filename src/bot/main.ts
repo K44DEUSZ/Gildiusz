@@ -57,6 +57,7 @@ async function main(): Promise<void> {
   const registry = new GuildRegistry<GuildRuntime>(installations);
   let stopping = false,
     ticking = false,
+    initializing = false,
     connected = false;
   const inFlight = new Set<Promise<unknown>>();
   function track(task: Promise<unknown>): void {
@@ -121,14 +122,27 @@ async function main(): Promise<void> {
     return { context, filter, rooms, retentionAt: Date.now() + 3600000 };
   }
   const timer = setInterval(() => {
-    if (ticking || stopping || !connected || !client.isReady()) return;
+    if (stopping) return;
+    // A slow guild API request must not suppress health signals or other guilds' maintenance.
+    health();
+    if (!connected || !client.isReady()) return;
+    if (!initializing) {
+      initializing = true;
+      track(
+        registry
+          .initialize(createRuntime, (guildId, error) => {
+            console.error(`Guild unavailable: ${guildId}; ${errorCode(error)}`);
+          })
+          .finally(() => {
+            initializing = false;
+            health();
+          }),
+      );
+    }
+    if (ticking) return;
     ticking = true;
     track(
       (async () => {
-        await registry.initialize(createRuntime, (guildId, error) => {
-          console.error(`Guild unavailable: ${guildId}; ${errorCode(error)}`);
-        });
-        if (stopping) return;
         await Promise.all(
           registry.values().map(async (runtime) => {
             if (!available(runtime)) return;

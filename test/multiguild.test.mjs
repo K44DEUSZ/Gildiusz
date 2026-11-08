@@ -11,6 +11,28 @@ import { SettingsService } from "../dist/settings.js";
 import { loadConfig } from "../dist/config.js";
 
 const guilds = ["100000000000000001", "100000000000000002"];
+test("a slow unavailable guild does not delay initialization of another community", async () => {
+  const registry = new GuildRegistry(guilds.map((guildId) => ({ guildId })));
+  let complete;
+  const pending = new Promise((resolve) => {
+    complete = resolve;
+  });
+  const initialization = registry.initialize(
+    async (entry) => {
+      if (entry.guildId === guilds[0]) await pending;
+      return { guildId: entry.guildId };
+    },
+    () => {},
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(registry.get(guilds[1]).guildId, guilds[1]);
+    assert.equal(registry.get(guilds[0]), undefined);
+  } finally {
+    complete();
+    await initialization;
+  }
+});
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), "gildiusz-multiguild-"));
   t.after(() => {

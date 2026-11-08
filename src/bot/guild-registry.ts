@@ -29,17 +29,19 @@ export class GuildRegistry<T> {
     onError: (guildId: string, error: unknown) => void,
     now = Date.now(),
   ): Promise<void> {
-    for (const entry of this.entries.values()) {
-      if (entry.value || entry.retryAt > now) continue;
-      entry.retryAt = now + 60000;
-      try {
-        const value = await create(entry.installation);
-        // A leave event may invalidate an installation during asynchronous initialization.
-        if (entry.retryAt === now + 60000) entry.value = value;
-      } catch (error) {
-        onError(entry.installation.guildId, error);
-      }
-    }
+    await Promise.all(
+      [...this.entries.values()].map(async (entry) => {
+        if (entry.value || entry.retryAt > now) return;
+        entry.retryAt = now + 60000;
+        try {
+          const value = await create(entry.installation);
+          // A leave event may invalidate an installation during asynchronous initialization.
+          if (entry.retryAt === now + 60000) entry.value = value;
+        } catch (error) {
+          onError(entry.installation.guildId, error);
+        }
+      }),
+    );
   }
   statuses(ready: (value: T) => boolean): { guildId: string; ready: boolean }[] {
     return [...this.entries.values()].map(({ installation, value }) => ({
