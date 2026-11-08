@@ -34,8 +34,15 @@ test(
         "-e",
         `import {supervise} from ${JSON.stringify(new URL("../scripts/hosting.mjs", import.meta.url).href)};await supervise(${JSON.stringify(root)},{interval:25,restartDelay:50,workerArguments:['--input-type=module','-e',${JSON.stringify(worker)}]});`,
       ],
-      { stdio: "ignore" },
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
+    let diagnostics = "";
+    supervisor.stdout.on("data", (chunk) => {
+      diagnostics += chunk;
+    });
+    supervisor.stderr.on("data", (chunk) => {
+      diagnostics += chunk;
+    });
     let workerPid;
     const state = () => {
       try {
@@ -69,7 +76,7 @@ test(
         "Supervisor did not reach the expected state: " +
           JSON.stringify(state()) +
           " " +
-          readFileSync(join(root, "shared", "logs", "hosting.log"), "utf8"),
+          diagnostics,
       );
     };
     try {

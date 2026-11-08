@@ -13,11 +13,10 @@ import {
 } from "node:fs";
 import { dirname, join, resolve, basename } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 export const repository = "https://github.com/K44DEUSZ/gildiusz.git";
-const script = fileURLToPath(import.meta.url);
 const environment = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH}` };
 
 function paths(root) {
@@ -41,8 +40,16 @@ function readJson(path) {
 }
 
 function atomicJson(path, value) {
-  writeFileSync(`${path}.tmp`, JSON.stringify(value) + "\n", { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
+  const text = JSON.stringify(value) + "\n";
+  writeFileSync(`${path}.tmp`, text, { mode: 0o600 });
+  try {
+    renameSync(`${path}.tmp`, path);
+  } catch (error) {
+    // Windows readers can temporarily deny replacement; Linux hosting keeps atomic renames.
+    if (process.platform !== "win32" || error.code !== "EPERM") throw error;
+    writeFileSync(path, text, { mode: 0o600 });
+    rmSync(`${path}.tmp`, { force: true });
+  }
 }
 
 function event(root, message) {
@@ -69,6 +76,7 @@ export function checkedRun(runs, sha, branch) {
 
 export async function supervise(root, options = {}) {
   const p = paths(root);
+  const supervisorRevision = basename(realpathSync(p.current));
   const previous = readJson(p.state);
   if (process.platform === "linux" && previous?.childPid && previous?.childBirth) {
     const matchesPreviousWorker = () => {
@@ -108,6 +116,7 @@ export async function supervise(root, options = {}) {
   const state = () =>
     atomicJson(p.state, {
       supervisorPid: process.pid,
+      supervisorRevision,
       childPid: child?.pid ?? null,
       childBirth: child ? childBirth : null,
       release: release ? basename(release) : null,
@@ -194,7 +203,15 @@ function background(root, command, lock) {
   const log = openSync(join(root, "shared", "logs", "scheduler.log"), "a", 0o600);
   const child = spawn(
     "flock",
-    ["-o", "-n", join(root, "shared", lock), process.execPath, script, command, root],
+    [
+      "-o",
+      "-n",
+      join(root, "shared", lock),
+      process.execPath,
+      join(root, "current", "scripts", "hosting.mjs"),
+      command,
+      root,
+    ],
     { detached: true, stdio: ["ignore", log, log], env: environment },
   );
   child.on("error", (error) => event(root, `scheduler spawn error: ${error.code}`));
@@ -236,6 +253,27 @@ async function waitReady(root, revision, after, timeout = 100000) {
   return false;
 }
 
+async function stopSupervisor(root) {
+  const state = readJson(paths(root).state);
+  if (!state?.supervisorPid) return;
+  const matches = () => {
+    try {
+      const args = readFileSync(`/proc/${state.supervisorPid}/cmdline`, "utf8").split("\0");
+      return args.includes("supervise") && args.includes(root);
+    } catch {
+      return false;
+    }
+  };
+  if (!matches()) return;
+  process.kill(state.supervisorPid, "SIGTERM");
+  const deadline = Date.now() + 20000;
+  while (matches() && Date.now() < deadline) await delay(250);
+  if (matches()) {
+    process.kill(state.supervisorPid, "SIGKILL");
+    await delay(500);
+  }
+}
+
 export async function install(root, sha) {
   if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Expected a full commit SHA.");
   const p = paths(root);
@@ -268,6 +306,8 @@ export async function install(root, sha) {
     }
   }
   const activated = Date.now();
+  // Restart the supervisor as well, so updates to hosting code take effect with the release.
+  await stopSupervisor(root);
   pointTo(root, release);
   event(root, `activating ${sha}`);
   background(root, "supervise", "supervisor.lock");
@@ -279,6 +319,7 @@ export async function install(root, sha) {
   writeFileSync(join(p.shared, "failed-revision"), sha, { mode: 0o600 });
   if (previous) {
     const reverted = Date.now();
+    await stopSupervisor(root);
     pointTo(root, previous);
     event(root, `rollback to ${basename(previous)}`);
     background(root, "supervise", "supervisor.lock");
@@ -347,6 +388,11 @@ async function main() {
   else if (command === "resume") rmSync(p.pause, { force: true });
   else if (command === "restart") writeFileSync(p.restart, String(Date.now()), { mode: 0o600 });
   else if (command !== "tick") throw Error("Unknown hosting command.");
+  if (
+    command === "tick" &&
+    readJson(p.state)?.supervisorRevision !== basename(realpathSync(p.current))
+  )
+    await stopSupervisor(root);
   background(root, "supervise", "supervisor.lock");
   if (command === "tick") background(root, "update", "deploy.lock");
 }
