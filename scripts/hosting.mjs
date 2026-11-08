@@ -69,7 +69,34 @@ export function checkedRun(runs, sha, branch) {
 
 export async function supervise(root, options = {}) {
   const p = paths(root);
+  const previous = readJson(p.state);
+  if (process.platform === "linux" && previous?.childPid && previous?.childBirth) {
+    const matchesPreviousWorker = () => {
+      try {
+        const birth = readFileSync(`/proc/${previous.childPid}/stat`, "utf8")
+          .split(") ")[1]
+          .split(" ")[19];
+        const command = readFileSync(`/proc/${previous.childPid}/cmdline`, "utf8").split("\0");
+        return (
+          birth === previous.childBirth &&
+          command.includes("--env-file=" + join(p.shared, ".env")) &&
+          realpathSync(`/proc/${previous.childPid}/cwd`) ===
+            join(root, "releases", previous.release)
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (matchesPreviousWorker()) {
+      event(root, `stopping orphan worker pid=${previous.childPid}`);
+      process.kill(previous.childPid, "SIGTERM");
+      const deadline = Date.now() + 20000;
+      while (matchesPreviousWorker() && Date.now() < deadline) await delay(250);
+      if (matchesPreviousWorker()) process.kill(previous.childPid, "SIGKILL");
+    }
+  }
   let child;
+  let childBirth;
   let started = 0;
   let release;
   let stopping = false;
@@ -82,6 +109,7 @@ export async function supervise(root, options = {}) {
     atomicJson(p.state, {
       supervisorPid: process.pid,
       childPid: child?.pid ?? null,
+      childBirth: child ? childBirth : null,
       release: release ? basename(release) : null,
       started,
       restarts,
@@ -129,6 +157,15 @@ export async function supervise(root, options = {}) {
           { cwd: release, env: environment, stdio: ["ignore", log, log] },
         );
         closeSync(log);
+        if (process.platform === "linux" && child.pid) {
+          try {
+            childBirth = readFileSync(`/proc/${child.pid}/stat`, "utf8")
+              .split(") ")[1]
+              .split(" ")[19];
+          } catch {
+            childBirth = null;
+          }
+        }
         event(root, `worker started pid=${child.pid} revision=${basename(release)}`);
         child.once("exit", (code, signal) => {
           event(root, `worker exited code=${code} signal=${signal}`);
@@ -157,7 +194,7 @@ function background(root, command, lock) {
   const log = openSync(join(root, "shared", "logs", "scheduler.log"), "a", 0o600);
   const child = spawn(
     "flock",
-    ["-n", join(root, "shared", lock), process.execPath, script, command, root],
+    ["-o", "-n", join(root, "shared", lock), process.execPath, script, command, root],
     { detached: true, stdio: ["ignore", log, log], env: environment },
   );
   child.on("error", (error) => event(root, `scheduler spawn error: ${error.code}`));
