@@ -44,6 +44,20 @@ test(
         return {};
       }
     };
+    const ready = (s) => {
+      try {
+        return (
+          s.childPid &&
+          healthy(
+            JSON.parse(readFileSync(join(root, "shared", "data", "health.json"), "utf8")),
+            Date.now(),
+            s.started,
+          )
+        );
+      } catch {
+        return false;
+      }
+    };
     const waitFor = async (predicate) => {
       const end = Date.now() + 5000;
       while (Date.now() < end) {
@@ -51,18 +65,23 @@ test(
         if (predicate(value)) return value;
         await delay(25);
       }
-      throw Error("Supervisor did not reach the expected state.");
+      throw Error(
+        "Supervisor did not reach the expected state: " +
+          JSON.stringify(state()) +
+          " " +
+          readFileSync(join(root, "shared", "logs", "hosting.log"), "utf8"),
+      );
     };
     try {
-      workerPid = (await waitFor((s) => s.childPid)).childPid;
+      workerPid = (await waitFor(ready)).childPid;
       process.kill(workerPid, "SIGKILL");
-      const recovered = await waitFor((s) => s.childPid && s.childPid !== workerPid);
+      const recovered = await waitFor((s) => ready(s) && s.childPid !== workerPid);
       workerPid = recovered.childPid;
       assert.ok(recovered.restarts >= 1);
       writeFileSync(join(root, "shared", "paused"), "pause");
       await waitFor((s) => s.paused && s.childPid === null);
       rmSync(join(root, "shared", "paused"));
-      workerPid = (await waitFor((s) => s.childPid)).childPid;
+      workerPid = (await waitFor(ready)).childPid;
     } finally {
       supervisor.kill("SIGTERM");
       await delay(200);
