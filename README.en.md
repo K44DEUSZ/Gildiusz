@@ -42,6 +42,9 @@ npm start
 ```
 
 
+Shared hosting can use a separate worker supervised through CRON. The
+private state, recovery and explicitly enabled updates from checked pushes to `main`.
+
 ## License
 
 MIT. Copyright 2026 Bartosz Golat. Dependencies retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

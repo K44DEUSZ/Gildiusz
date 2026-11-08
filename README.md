@@ -42,6 +42,9 @@ npm start
 ```
 
 
+Na hostingu współdzielonym można uruchomić osobny proces z nadzorcą i CRON.
+restarty i jawnie włączane pobieranie sprawdzonego `main` po pushu.
+
 ## Licencja
 
 MIT. Copyright 2026 Bartosz Golat. Zależności zachowują własne licencje; wykaz jest w [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
