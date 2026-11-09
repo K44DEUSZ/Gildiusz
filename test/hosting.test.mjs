@@ -1,12 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { healthy, checkedRun } from "../scripts/hosting.mjs";
+import { healthy, checkedRun, expectedRepository } from "../scripts/hosting.mjs";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+
+test("changing only the repository name casing preserves the existing deployment origin", () => {
+  assert.equal(expectedRepository("https://github.com/K44DEUSZ/gildiusz.git"), true);
+  assert.equal(expectedRepository("https://github.com/K44DEUSZ/Gildiusz.git"), true);
+  assert.equal(expectedRepository("https://github.com/another-owner/Gildiusz.git"), false);
+});
 
 test("hosting requires a fresh ready signal from the current worker", () => {
   assert.equal(healthy({ ready: true, updated: 1000 }, 2000, 500), true);

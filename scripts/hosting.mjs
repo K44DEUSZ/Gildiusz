@@ -19,7 +19,10 @@ import { cleanLegacyBuild, pruneReleases, rotateLogs } from "./maintenance.mjs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
-export const repository = "https://github.com/K44DEUSZ/gildiusz.git";
+export const repository = "https://github.com/K44DEUSZ/Gildiusz.git";
+export function expectedRepository(remote) {
+  return remote.toLowerCase() === repository.toLowerCase();
+}
 const environment = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH}` };
 
 function paths(root) {
@@ -281,7 +284,7 @@ async function stopSupervisor(root) {
 
 async function checkedWorkflow(sha) {
   const response = await globalThis.fetch(
-    `https://api.github.com/repos/K44DEUSZ/gildiusz/actions/workflows/check.yml/runs?head_sha=${sha}&event=push&per_page=10`,
+    `https://api.github.com/repos/K44DEUSZ/Gildiusz/actions/workflows/check.yml/runs?head_sha=${sha}&event=push&per_page=10`,
     {
       headers: { Accept: "application/vnd.github+json" },
       signal: globalThis.AbortSignal.timeout(15000),
@@ -384,7 +387,7 @@ async function retrieveRelease(root, sha, workflow) {
     join(root, "source"),
   ).split(/\s/)[0];
   if (!/^[a-f0-9]{40}$/.test(commit ?? "")) throw Error("The hosting build is not published yet.");
-  const base = `https://raw.githubusercontent.com/K44DEUSZ/gildiusz/${commit}`;
+  const base = `https://raw.githubusercontent.com/K44DEUSZ/Gildiusz/${commit}`;
   const manifest = JSON.parse((await download(`${base}/manifest.json`, 16384)).toString("utf8"));
   validateBuild(manifest, sha, String(workflow.id));
   const bytes = await download(`${base}/${archiveName}`, manifest.size);
@@ -464,7 +467,7 @@ export async function install(root, sha, checked) {
 async function update(root) {
   if (!existsSync(join(root, "shared", "autodeploy-enabled"))) return;
   const source = join(root, "source");
-  if (run("git", ["remote", "get-url", "origin"], source) !== repository)
+  if (!expectedRepository(run("git", ["remote", "get-url", "origin"], source)))
     throw Error("Unexpected source repository.");
   run("git", ["fetch", "--quiet", "origin", "main"], source);
   const sha = run("git", ["rev-parse", "FETCH_HEAD"], source);
@@ -525,7 +528,7 @@ async function main() {
       state?.release !== basename(active)
     )
       throw Error("Cleanup requires a healthy current deployment.");
-    if (run("git", ["remote", "get-url", "origin"], join(root, "source")) !== repository)
+    if (!expectedRepository(run("git", ["remote", "get-url", "origin"], join(root, "source"))))
       throw Error("Unexpected source repository.");
     const removedReleases = pruneReleases(root, sha);
     const legacy = cleanLegacyBuild(root);

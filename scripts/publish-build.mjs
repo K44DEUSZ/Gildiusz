@@ -6,7 +6,7 @@ import { archiveName, validateBuild, verifyArchive } from "./build-package.mjs";
 export async function publishBuild(manifest, bytes, api) {
   validateBuild(manifest, manifest.revision, manifest.workflowRun);
   verifyArchive(manifest, bytes);
-  const base = "/repos/K44DEUSZ/gildiusz";
+  const base = "/repos/K44DEUSZ/Gildiusz";
   const ref = await api(`${base}/git/ref/heads/hosting-build`);
   if (ref) {
     const previous = await api(`${base}/git/commits/${ref.object.sha}`);
@@ -42,7 +42,7 @@ export async function publishBuild(manifest, bytes, api) {
 async function main() {
   const env = process.env;
   if (
-    env.GITHUB_REPOSITORY !== "K44DEUSZ/gildiusz" ||
+    env.GITHUB_REPOSITORY?.toLowerCase() !== "k44deusz/gildiusz" ||
     env.GITHUB_REF !== "refs/heads/main" ||
     env.GITHUB_EVENT_NAME !== "push"
   )

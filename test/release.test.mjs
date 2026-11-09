@@ -4,7 +4,7 @@ import { publishRelease, releaseRequest } from "../scripts/release.mjs";
 
 const sha = "a".repeat(40);
 const environment = {
-  GITHUB_REPOSITORY: "K44DEUSZ/gildiusz",
+  GITHUB_REPOSITORY: "K44DEUSZ/Gildiusz",
   GITHUB_REF: "refs/heads/main",
   GITHUB_EVENT_NAME: "workflow_dispatch",
   GITHUB_SHA: sha,
@@ -54,7 +54,7 @@ test("a release targets the checked SHA without changing the manifest or deployi
   await publishRelease({ version: "0.1.0", sha }, api);
   assert.equal(writes.length, 2);
   assert.deepEqual(writes[0].body, { ref: "refs/tags/v0.1.0", sha });
-  assert.equal(writes[1].path, "/repos/K44DEUSZ/gildiusz/releases");
+  assert.equal(writes[1].path, "/repos/K44DEUSZ/Gildiusz/releases");
   assert.equal(writes[1].body.target_commitish, sha);
   assert.equal(writes[1].body.tag_name, "v0.1.0");
   assert.equal(writes[1].body.prerelease, true);

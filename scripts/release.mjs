@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 
 export function releaseRequest(environment, metadata) {
   if (
-    environment.GITHUB_REPOSITORY !== "K44DEUSZ/gildiusz" ||
+    environment.GITHUB_REPOSITORY?.toLowerCase() !== "k44deusz/gildiusz" ||
     environment.GITHUB_REF !== "refs/heads/main" ||
     environment.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
     environment.RELEASE_PUBLISH !== "true"
@@ -22,7 +22,7 @@ export function releaseRequest(environment, metadata) {
 }
 
 export async function publishRelease(request, api) {
-  const base = "/repos/K44DEUSZ/gildiusz";
+  const base = "/repos/K44DEUSZ/Gildiusz";
   const { version, sha } = request;
   const head = await api(`${base}/git/ref/heads/main`);
   if (head.object.sha !== sha) throw Error("main changed after checks; start a new release run.");

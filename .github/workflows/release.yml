@@ -20,7 +20,7 @@ jobs:
     uses: ./.github/workflows/check.yml
   release:
     needs: check
-    if: github.repository == 'K44DEUSZ/gildiusz' && github.ref == 'refs/heads/main' && inputs.publish
+    if: github.repository == 'K44DEUSZ/Gildiusz' && github.ref == 'refs/heads/main' && inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
