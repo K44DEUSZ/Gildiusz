@@ -22,16 +22,16 @@ export interface Desired {
 export const reference = (key: string) => `@{${key}}`;
 
 const roleColors: Record<string, number> = {
-  programming: 0x7cb8ff,
+  programming: 0x4da3ff,
   design: 0xc89bff,
-  marketing: 0xff9ec4,
-  business: 0xf3b46c,
-  media: 0x68d6ce,
-  hasProject: 0x8bd49c,
-  seeksTeam: 0x83cedb,
-  joinsProject: 0xa9b8ff,
-  seeksFeedback: 0xd5aaf0,
-  seeksInspiration: 0xd1d5db,
+  marketing: 0xec76bd,
+  business: 0xdf9100,
+  media: 0x00b2b2,
+  hasProject: 0x68ad00,
+  seeksTeam: 0x80d2ff,
+  joinsProject: 0xff6e66,
+  seeksFeedback: 0xf9aeb5,
+  seeksInspiration: 0xa69c85,
   moderator: 0x66d9a6,
 };
 
