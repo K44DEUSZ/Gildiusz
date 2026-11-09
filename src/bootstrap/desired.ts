@@ -21,6 +21,20 @@ export interface Desired {
 }
 export const reference = (key: string) => `@{${key}}`;
 
+const roleColors: Record<string, number> = {
+  programming: 0x7cb8ff,
+  design: 0xc89bff,
+  marketing: 0xff9ec4,
+  business: 0xf3b46c,
+  media: 0x68d6ce,
+  hasProject: 0x8bd49c,
+  seeksTeam: 0x83cedb,
+  joinsProject: 0xa9b8ff,
+  seeksFeedback: 0xd5aaf0,
+  seeksInspiration: 0xd1d5db,
+  moderator: 0x66d9a6,
+};
+
 export function desired(
   config: Config,
   environment: Environment,
@@ -45,13 +59,20 @@ export function desired(
       result.push({
         key: `role.${role.key}`,
         kind: "role",
-        body: { name: role.name, permissions: "0", hoist: false, mentionable: false, color: 0 },
+        body: {
+          name: role.name,
+          permissions: "0",
+          hoist: false,
+          mentionable: false,
+          color: roleColors[role.key] ?? 0,
+        },
       });
     result.push({
       key: "role.moderator",
       kind: "role",
       body: {
         name: "Moderator",
+        color: roleColors.moderator,
         hoist: true,
         mentionable: false,
       },
@@ -96,6 +117,11 @@ export function desired(
         rate_limit_per_user: 0,
         nsfw: false,
       };
+      if (channel.key === "start") {
+        const entries = body.permission_overwrites as { id: string; allow: string }[];
+        const botEntry = entries.find((entry) => entry.id === bot)!;
+        botEntry.allow = (BigInt(botEntry.allow) | P.AddReactions).toString();
+      }
       if (channel.kind === "voice") {
         body.user_limit = 0;
         body.bitrate = 64000;

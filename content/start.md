@@ -3,7 +3,7 @@
 
 Zaakceptuj zasady w {{channel.rules}} i wybierz tematy, które cię interesują. Nie musisz mieć doświadczenia ani własnego projektu.
 
-Zainteresowania i role wybierzesz w zakładce **Kanały i role** nad listą kanałów. Możesz zaznaczyć kilka opcji i później zmienić wybór.
+Zainteresowania i role wybierzesz reakcjami w panelu **Wybierz swoje role** poniżej. Kliknięcie emoji nadaje rolę, a cofnięcie reakcji ją odbiera. Możesz wybrać kilka opcji.
 
 Na {{channel.introductions}} możesz napisać kilka zdań o sobie.
 

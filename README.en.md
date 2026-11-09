@@ -12,6 +12,7 @@ This is an early, self-hosted version. One process can serve several explicitly 
 - Personal voice rooms created through a technical entry channel, configurable room limits, creation cooldowns, and empty-room cleanup.
 - `/pokoj`: rename, lock, unlock, and invite a participant.
 - `/zglos`: send a private report to moderators.
+- Interest roles through reactions on the bot's selection panel: adding a reaction grants its role, removing it revokes that role. Selections are reconciled on restart and every five minutes; rules acceptance remains separate.
 - `/ustawienia` and `/panel`: a private administration panel, also available through a persistent channel button.
 - A per-server nickname and avatar with preview, confirmation, cancellation, and reset to defaults. PNG, JPG, and GIF images up to 2 MB.
 - An attachment format allowlist covering PDF, PNG, JPG, JPEG, WebP, and GIF, with file header checks after a message is posted.

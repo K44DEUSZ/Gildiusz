@@ -12,6 +12,7 @@ To wczesna wersja do samodzielnego uruchomienia. Jeden proces może obsługiwać
 - Własny pokój po wejściu na kanał techniczny, limit pokojów, przerwa między tworzeniem i sprzątanie pustych kanałów.
 - `/pokoj`: zmiana nazwy, zamknięcie, otwarcie i zaproszenie uczestnika.
 - `/zglos`: prywatne zgłoszenie do moderacji.
+- Role zainteresowań przez reakcje pod panelem Gildiusza: dodanie reakcji nadaje rolę, cofnięcie ją odbiera. Wybory są sprawdzane po restarcie i co pięć minut; akceptacja zasad pozostaje osobna.
 - `/ustawienia` i `/panel`: prywatny panel administracyjny, także z przycisku opublikowanego na kanale.
 - Profil bota: nazwa i awatar na serwerze, podgląd przed zapisem, anulowanie i przywrócenie profilu domyślnego. Obrazy PNG, JPG i GIF do 2 MB.
 - Wybór dozwolonych formatów: PDF, PNG, JPG, JPEG, WebP i GIF. Filtr porównuje format z nagłówkiem pliku po wysłaniu wiadomości.

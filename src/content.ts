@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "./config.js";
 import { digest } from "./shared/utils.js";
+import { roleChoices } from "./role-selection.js";
 
 export function readContent(file: string): string {
   return readFileSync(join("content", file), "utf8").trim();
@@ -104,6 +105,19 @@ export function publications(
   const sources: [string, string, string][] = [
     ["start", "start", readContent("start.md")],
     ["room-help", "start", readContent("room-help.md")],
+    [
+      "roles",
+      "start",
+      "**🎭 Wybierz swoje role**\nKliknij reakcje pod tą wiadomością. Każda nadaje przypisaną rolę, a cofnięcie reakcji ją odbiera. Możesz wybrać kilka.\n\n" +
+        roleChoices
+          .map((choice) => {
+            const role = config.roles.find((entry) => entry.key === choice.key);
+            if (!role) throw Error(`Missing self-selection role: ${choice.key}`);
+            return `${choice.emoji} · **${role.name}**`;
+          })
+          .join("\n") +
+        "\n\nTo role zainteresowań i współpracy. Akceptację zasad wykonujesz osobno w formularzu Discorda przy dołączaniu.",
+    ],
     ["rules", "rules", rulesText],
     ["privacy", "rules", readContent("privacy-note.md")],
     ["introductions", "introductions", readContent("introductions.md")],
@@ -115,12 +129,17 @@ export function publications(
       [string, string, string]
     >(([key, text]) => [`voice-${key}`, key, text]),
   ];
+  const seen = new Set<string>();
   return sources.flatMap(([key, channel, text]) =>
-    chunks(render(text, config)).map((part, index) => ({
-      key: `message.${key}.${index}`,
-      channel,
-      text: part,
-      pin: config.channels.find((entry) => entry.key === channel)?.kind !== "voice",
-    })),
+    chunks(render(text, config)).map((part, index) => {
+      const prefix = seen.has(channel) ? "\u200b\n\n" : "";
+      seen.add(channel);
+      return {
+        key: `message.${key}.${index}`,
+        channel,
+        text: prefix + part,
+        pin: config.channels.find((entry) => entry.key === channel)?.kind !== "voice",
+      };
+    }),
   );
 }

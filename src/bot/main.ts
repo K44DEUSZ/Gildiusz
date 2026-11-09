@@ -20,6 +20,7 @@ import { errorCode, noMentions } from "../shared/utils.js";
 import { lintContent } from "../content.js";
 import { isManagedPinNotice } from "../shared/pin-notices.js";
 import { settingsInteraction } from "./settings-panel.js";
+import { discordRoleSelection } from "./role-selection.js";
 
 import { loadInstallations, healthPath, type GuildInstallation } from "../installations.js";
 import { GuildRegistry } from "./guild-registry.js";
@@ -28,6 +29,8 @@ interface GuildRuntime {
   filter: AttachmentFilter;
   rooms: ReturnType<typeof discordRoomService>;
   retentionAt: number;
+  roleSelection: Awaited<ReturnType<typeof discordRoleSelection>>;
+  rolesAt: number;
 }
 
 async function main(): Promise<void> {
@@ -48,9 +51,10 @@ async function main(): Promise<void> {
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildMessageReactions,
       GatewayIntentBits.MessageContent,
     ],
-    partials: [Partials.Message, Partials.Channel],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
     allowedMentions: noMentions,
     rest: { retries: 0, timeout: 15000 },
   });
@@ -117,9 +121,20 @@ async function main(): Promise<void> {
     const filter = new AttachmentFilter(context);
     const rooms = discordRoomService(context);
     await rooms.reconcile();
+    const roleSelection = await discordRoleSelection(context).catch(async (error) => {
+      await context.alert("role-selection", "panel", errorCode(error));
+      return null;
+    });
     await context.retention();
     console.log(`Guild started: ${guild.id}`);
-    return { context, filter, rooms, retentionAt: Date.now() + 3600000 };
+    return {
+      context,
+      filter,
+      rooms,
+      roleSelection,
+      rolesAt: Date.now() + 300000,
+      retentionAt: Date.now() + 3600000,
+    };
   }
   const timer = setInterval(() => {
     if (stopping) return;
@@ -148,6 +163,11 @@ async function main(): Promise<void> {
             if (!available(runtime)) return;
             try {
               await runtime.rooms.reconcile();
+              if (Date.now() >= runtime.rolesAt) {
+                runtime.rolesAt = Date.now() + 300000;
+                if (runtime.roleSelection) await runtime.roleSelection.reconcile();
+                else runtime.roleSelection = await discordRoleSelection(runtime.context);
+              }
               if (Date.now() > runtime.retentionAt) {
                 await runtime.context.retention();
                 runtime.retentionAt = Date.now() + 3600000;
@@ -173,6 +193,8 @@ async function main(): Promise<void> {
     client.removeAllListeners(Events.MessageCreate);
     client.removeAllListeners(Events.MessageUpdate);
     client.removeAllListeners(Events.InteractionCreate);
+    client.removeAllListeners(Events.MessageReactionAdd);
+    client.removeAllListeners(Events.MessageReactionRemove);
     shutdown = (async () => {
       try {
         await Promise.all([...inFlight]);
@@ -180,6 +202,7 @@ async function main(): Promise<void> {
           registry.values().map(async (runtime) => {
             await runtime.filter.drain();
             await runtime.rooms.queue.drain();
+            await runtime.roleSelection?.queue.drain();
           }),
         );
       } finally {
@@ -220,7 +243,14 @@ async function main(): Promise<void> {
   // Losing access to one guild must not restart the other installations.
   client.on(Events.GuildDelete, (guild) => {
     const runtime = registry.invalidate(guild.id);
-    if (runtime) track(runtime.filter.drain().then(() => runtime.rooms.queue.drain()));
+    if (runtime)
+      track(
+        Promise.all([
+          runtime.filter.drain(),
+          runtime.rooms.queue.drain(),
+          runtime.roleSelection?.queue.drain(),
+        ]),
+      );
     health();
   });
   client.on(Events.MessageCreate, (message) => {
@@ -270,6 +300,27 @@ async function main(): Promise<void> {
           .catch((error) => context?.alert("attachments", message.id, errorCode(error))),
       );
   });
+  for (const [event, active] of [
+    [Events.MessageReactionAdd, true],
+    [Events.MessageReactionRemove, false],
+  ] as const)
+    client.on(event, (...args) => {
+      const [reaction, user] = args;
+      const runtime = lookup(reaction.message.guildId);
+      if (!runtime?.roleSelection || user.id === credentials.clientId || user.bot) return;
+      track(
+        runtime.roleSelection
+          .handle({
+            guild: reaction.message.guildId,
+            channel: reaction.message.channelId,
+            message: reaction.message.id,
+            emoji: reaction.emoji.id ? null : reaction.emoji.name,
+            user: user.id,
+            active,
+          })
+          .catch((error) => runtime.context.alert("role-selection", user.id, errorCode(error))),
+      );
+    });
   client.on(Events.VoiceStateUpdate, (previous, state) => {
     const runtime = lookup(state.guild.id);
     if (!runtime) return;

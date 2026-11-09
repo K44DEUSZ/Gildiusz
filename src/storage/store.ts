@@ -66,6 +66,21 @@ export class Store {
       }
       this.db.prepare("INSERT OR IGNORE INTO guild_identity VALUES (1,?)").run(guildId);
     }
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS role_selections (member TEXT NOT NULL, role_key TEXT NOT NULL, PRIMARY KEY(member,role_key))",
+    );
+  }
+  roleSelections(key: string): string[] {
+    return this.db
+      .prepare("SELECT member FROM role_selections WHERE role_key=?")
+      .all(key)
+      .map((row) => row.member as string);
+  }
+  setRoleSelection(member: string, key: string, active: boolean): void {
+    if (active)
+      this.db.prepare("INSERT OR IGNORE INTO role_selections VALUES (?,?)").run(member, key);
+    else
+      this.db.prepare("DELETE FROM role_selections WHERE member=? AND role_key=?").run(member, key);
   }
   resources(): Resource[] {
     return this.db.prepare("SELECT * FROM resources ORDER BY key").all() as unknown as Resource[];
