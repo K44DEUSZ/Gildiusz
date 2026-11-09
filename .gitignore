@@ -15,3 +15,7 @@ coverage/
 *.sqlite*
 *.lock/
 work/
+.bot/
+.next/
+*.tsbuildinfo
+.gildiusz-web/

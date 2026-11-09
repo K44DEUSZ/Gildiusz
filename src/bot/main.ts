@@ -8,7 +8,8 @@ import {
   PermissionFlagsBits as P,
 } from "discord.js";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import type { Server } from "node:http";
+import { dirname, join } from "node:path";
 import { loadConfig, loadCredentials } from "../config.js";
 import { Store } from "../storage/store.js";
 import { acquireLock } from "../storage/lock.js";
@@ -24,10 +25,24 @@ import { discordRoleSelection } from "./role-selection.js";
 
 import { loadInstallations, healthPath, type GuildInstallation } from "../installations.js";
 import { GuildRegistry } from "./guild-registry.js";
+import { PublicInstallations } from "../control/installations.js";
+import { publicConfig } from "../control/configuration.js";
+import { startControlServer } from "../control/server.js";
+import { ControlError, type ControlSnapshot } from "../control/contracts.js";
+import {
+  authorizeControl,
+  controlResources,
+  validateControl,
+  prepareRolePanel,
+  finishRolePanel,
+  rolePanel,
+  selectionChoices,
+} from "./control.js";
+import { commands } from "./commands.js";
 interface GuildRuntime {
   context: BotContext;
   filter: AttachmentFilter;
-  rooms: ReturnType<typeof discordRoomService>;
+  rooms: ReturnType<typeof discordRoomService> | null;
   retentionAt: number;
   roleSelection: Awaited<ReturnType<typeof discordRoleSelection>>;
   rolesAt: number;
@@ -35,11 +50,23 @@ interface GuildRuntime {
 
 async function main(): Promise<void> {
   const credentials = loadCredentials();
-  const installations = loadInstallations();
+  const publicInstallations =
+    process.env.PUBLIC_INSTALLS === "1"
+      ? new PublicInstallations(
+          process.env.CONTROL_DATA_DIR || join(dirname(healthPath()), "public-guilds"),
+        )
+      : undefined;
+  const legacy = loadInstallations();
+  const installations = [
+    ...legacy,
+    ...(publicInstallations
+      ?.values()
+      .filter((entry) => !legacy.some((value) => value.guildId === entry.guildId)) ?? []),
+  ];
   const configs = new Map(
     installations.map((installation) => {
-      const config = loadConfig(installation.configPath);
-      const errors = lintContent(config);
+      const config = installation.public ? publicConfig() : loadConfig(installation.configPath);
+      const errors = installation.public ? [] : lintContent(config);
       if (errors.length) throw Error(errors.join("\n"));
       return [installation.guildId, config];
     }),
@@ -64,6 +91,9 @@ async function main(): Promise<void> {
     initializing = false,
     connected = false;
   const inFlight = new Set<Promise<unknown>>();
+  const controlTasks = new Set<Promise<unknown>>();
+  const changing = new Set<string>();
+  let controlServer: Server | undefined;
   function track(task: Promise<unknown>): void {
     const tracked = task
       .catch((error) => console.error(`Event failed: ${errorCode(error)}`))
@@ -76,7 +106,8 @@ async function main(): Promise<void> {
     runtime.context.guild.available && client.isReady() && client.ws.status === 0;
   function health() {
     const guilds = registry.statuses(available);
-    const ready = !stopping && connected && guilds.some((guild) => guild.ready);
+    const ready =
+      !stopping && connected && (guilds.length === 0 || guilds.some((guild) => guild.ready));
     writeFileSync(
       path,
       JSON.stringify({
@@ -89,38 +120,26 @@ async function main(): Promise<void> {
   }
   function lookup(guildId: string | null | undefined) {
     const runtime = registry.get(guildId);
-    return !stopping && runtime && available(runtime) ? runtime : undefined;
+    return !stopping && !changing.has(guildId ?? "") && runtime && available(runtime)
+      ? runtime
+      : undefined;
   }
   async function createRuntime(installation: GuildInstallation): Promise<GuildRuntime> {
     const config = configs.get(installation.guildId)!;
     const store = stores.get(installation.guildId)!;
     const environment = { ...credentials, ...installation };
     const guild = await client.guilds.fetch(installation.guildId);
-    if (guild.ownerId !== installation.ownerId)
+    if (!installation.public && guild.ownerId !== installation.ownerId)
       throw new Error("Expected owner differs from the guild owner.");
     await guild.channels.fetch();
     const me = await guild.members.fetchMe();
     if (me.permissions.has(P.Administrator)) throw new Error("Remove Administrator from the bot.");
-    if (!me.permissions.has([P.ManageChannels, P.MoveMembers]))
-      throw new Error("Missing runtime guild permissions.");
-    for (const channelSpec of config.channels) {
-      const channel = guild.channels.cache.get(store.id(`channel.${channelSpec.key}`));
-      if (!channel) throw new Error(`Configured channel is missing: ${channelSpec.key}`);
-      if (
-        !channel
-          .permissionsFor(me)
-          ?.has([P.ViewChannel, P.ReadMessageHistory, P.SendMessages, P.ManageMessages])
-      )
-        throw new Error(`Missing message/filter permissions in ${channelSpec.key}.`);
-    }
-    if (
-      !guild.channels.cache.get(store.id("category.rooms"))?.permissionsFor(me)?.has(P.ManageRoles)
-    )
-      throw new Error("Room overwrite management is unavailable.");
-    const context = new BotContext(client, guild, store, config, environment);
+    const context = new BotContext(client, guild, store, config, environment, !installation.public);
     const filter = new AttachmentFilter(context);
-    const rooms = discordRoomService(context);
-    await rooms.reconcile();
+    const rooms = context.control.rooms.categoryId ? discordRoomService(context) : null;
+    await rooms?.reconcile();
+    if (context.control.modules.reactions && store.resource("control.role-panel"))
+      await finishRolePanel(context, rolePanel(context));
     const roleSelection = await discordRoleSelection(context).catch(async (error) => {
       await context.alert("role-selection", "panel", errorCode(error));
       return null;
@@ -136,6 +155,172 @@ async function main(): Promise<void> {
       retentionAt: Date.now() + 3600000,
     };
   }
+
+  async function snapshot(runtime: GuildRuntime): Promise<ControlSnapshot> {
+    const { context } = runtime,
+      panel = rolePanel(context);
+    return {
+      configuration: context.control,
+      resources: await controlResources(context.guild),
+      installation: {
+        ready: available(runtime),
+        managedLayout: context.managedLayout,
+        activeRooms: context.store.rooms().length,
+        ...(panel
+          ? {
+              rolePanelUrl:
+                "https://discord.com/channels/" +
+                context.guild.id +
+                "/" +
+                panel.channelId +
+                "/" +
+                panel.id,
+            }
+          : {}),
+      },
+    };
+  }
+  async function controlRequest(path: string, body: unknown): Promise<unknown> {
+    if (stopping)
+      throw new ControlError(503, "stopping", "Bot jest ponownie uruchamiany. Spróbuj za chwilę.");
+    const guildId = path.split("/")[2];
+    const authorization = await authorizeControl(client, guildId, body);
+    if (!guildId) {
+      const candidates = (body as { guildIds?: unknown }).guildIds;
+      if (
+        !Array.isArray(candidates) ||
+        candidates.length > 200 ||
+        candidates.some((id) => typeof id !== "string" || !/^\d{17,20}$/.test(id))
+      )
+        throw new ControlError(400, "guilds", "Nieprawidłowa lista serwerów.");
+      const guilds: string[] = [];
+      for (const id of new Set(candidates as string[])) {
+        const guild = client.guilds.cache.get(id);
+        if (!guild) continue;
+        try {
+          const member = await guild.members.fetch({ user: authorization.actor, force: true });
+          if (
+            !member.pending &&
+            !member.isCommunicationDisabled() &&
+            (guild.ownerId === member.id || member.permissions.has(P.ManageGuild))
+          )
+            guilds.push(id);
+        } catch {
+          /* Guild access may have been revoked. */
+        }
+      }
+      return { guilds };
+    }
+    if (changing.has(guildId))
+      throw new ControlError(409, "busy", "Trwa zapisywanie ustawień tego serwera.");
+    let runtime = lookup(guildId);
+    let installation = installations.find((entry) => entry.guildId === guildId);
+    if (!installation) {
+      if (!publicInstallations || !authorization.guild)
+        throw new ControlError(404, "not_configured", "Ten serwer nie ma jeszcze konfiguracji.");
+      installation = publicInstallations.add(guildId, authorization.guild.ownerId);
+      releases.push(await acquireLock(installation.databasePath));
+      stores.set(guildId, new Store(installation.databasePath, guildId));
+      configs.set(guildId, publicConfig());
+      installations.push(installation);
+      runtime = await createRuntime(installation);
+      registry.register(installation);
+      registry.replace(guildId, runtime);
+    }
+    if (!runtime)
+      throw new ControlError(503, "not_ready", "Bot uruchamia ten serwer. Spróbuj za chwilę.");
+    if (!path.endsWith("/save")) return snapshot(runtime);
+    changing.add(guildId);
+    let committed = false;
+    try {
+      await Promise.all([...inFlight]);
+      await runtime.filter.drain();
+      await runtime.rooms?.queue.drain();
+      await runtime.roleSelection?.queue.drain();
+      await authorizeControl(client, guildId, body);
+      const value = await validateControl(runtime.context, authorization.configuration);
+      const old = rolePanel(runtime.context),
+        oldChoices = selectionChoices(runtime.context);
+      const panel = await prepareRolePanel(runtime.context, value);
+      if (old && (!value.modules.reactions || panel?.id !== old.id)) {
+        for (const choice of oldChoices)
+          for (const user of runtime.context.store.roleSelections(choice.key))
+            await runtime.roleSelection?.handle({
+              guild: guildId,
+              channel: old.channelId,
+              message: old.id,
+              emoji: choice.emoji,
+              user,
+              active: false,
+            });
+      }
+      const current = runtime.context.settings.read();
+      await authorizeControl(client, guildId, body);
+      const values = {
+        ...current.values,
+        maximum: value.rooms.maxRooms,
+        emptySeconds: value.rooms.idleSeconds,
+        extensions: value.files.formats.length
+          ? value.files.formats.map((entry) => entry.toLowerCase())
+          : current.values.extensions,
+      };
+      try {
+        stores
+          .get(guildId)!
+          .saveControlConfiguration(
+            guildId,
+            value,
+            values,
+            value.revision,
+            authorization.actor,
+            panel && panel.id !== old?.id ? panel : undefined,
+          );
+      } catch (error) {
+        if (error instanceof Error && error.message === "settings_conflict")
+          throw new ControlError(
+            409,
+            "conflict",
+            "Ustawienia zmieniły się podczas zapisu. Odśwież panel.",
+          );
+        throw error;
+      }
+      committed = true;
+      runtime = await createRuntime(installation);
+      registry.replace(guildId, runtime);
+
+      if (old && (!value.modules.reactions || old.id !== panel?.id)) {
+        try {
+          const channel = await runtime.context.guild.channels.fetch(old.channelId);
+          if (channel?.isTextBased()) {
+            const message = await channel.messages.fetch(old.id);
+            if (message.author.id === credentials.clientId)
+              await message.edit({
+                content:
+                  "Ten panel wyboru ról został wyłączony. Aktualne ustawienia prowadzi administracja serwera.",
+                allowedMentions: noMentions,
+              });
+          }
+        } catch {
+          runtime.context.store.event("role-panel", old.id, "retire_notice_failed");
+        }
+      }
+      changing.delete(guildId);
+      health();
+      return snapshot(runtime);
+    } catch (error) {
+      if (committed) {
+        registry.invalidate(guildId);
+        const saved = await snapshot(runtime);
+        saved.installation.ready = false;
+        return saved;
+      } else await runtime.roleSelection?.reconcile().catch(() => {});
+      throw error;
+    } finally {
+      changing.delete(guildId);
+      health();
+    }
+  }
+
   const timer = setInterval(() => {
     if (stopping) return;
     // A slow guild API request must not suppress health signals or other guilds' maintenance.
@@ -160,9 +345,9 @@ async function main(): Promise<void> {
       (async () => {
         await Promise.all(
           registry.values().map(async (runtime) => {
-            if (!available(runtime)) return;
+            if (!available(runtime) || changing.has(runtime.context.guild.id)) return;
             try {
-              await runtime.rooms.reconcile();
+              await runtime.rooms?.reconcile();
               if (Date.now() >= runtime.rolesAt) {
                 runtime.rolesAt = Date.now() + 300000;
                 if (runtime.roleSelection) await runtime.roleSelection.reconcile();
@@ -188,6 +373,7 @@ async function main(): Promise<void> {
     if (shutdown) return shutdown;
     stopping = true;
     clearInterval(timer);
+    controlServer?.close();
     health();
     client.removeAllListeners(Events.VoiceStateUpdate);
     client.removeAllListeners(Events.MessageCreate);
@@ -197,11 +383,11 @@ async function main(): Promise<void> {
     client.removeAllListeners(Events.MessageReactionRemove);
     shutdown = (async () => {
       try {
-        await Promise.all([...inFlight]);
+        await Promise.all([...inFlight, ...controlTasks]);
         await Promise.all(
           registry.values().map(async (runtime) => {
             await runtime.filter.drain();
-            await runtime.rooms.queue.drain();
+            await runtime.rooms?.queue.drain();
             await runtime.roleSelection?.queue.drain();
           }),
         );
@@ -232,6 +418,23 @@ async function main(): Promise<void> {
         !application.flags.has(flags.GatewayMessageContentLimited)
       )
         throw Error("Enable Message Content Intent in Developer Portal before starting.");
+      if (publicInstallations) {
+        await client.application!.commands.set(commands());
+      }
+      if (process.env.CONTROL_KEY)
+        controlServer = await startControlServer(
+          process.env.CONTROL_KEY,
+          Number(process.env.CONTROL_PORT || 35471),
+          (path, body) => {
+            const task = controlRequest(path, body);
+            controlTasks.add(task);
+            void task.finally(() => controlTasks.delete(task)).catch(() => {});
+            return task;
+          },
+        );
+      for (const installation of installations)
+        if (installation.public && !client.guilds.cache.has(installation.guildId))
+          registry.remove(installation.guildId);
       connected = true;
       console.log("Bot connected. Timezone: Europe/Warsaw.");
     })().catch(async (error) => {
@@ -241,13 +444,19 @@ async function main(): Promise<void> {
     });
   });
   // Losing access to one guild must not restart the other installations.
+  client.on(Events.GuildCreate, (guild) => {
+    const installation = installations.find((entry) => entry.guildId === guild.id);
+    if (installation) registry.register(installation);
+  });
   client.on(Events.GuildDelete, (guild) => {
     const runtime = registry.invalidate(guild.id);
+    if (installations.find((entry) => entry.guildId === guild.id)?.public)
+      registry.remove(guild.id);
     if (runtime)
       track(
         Promise.all([
           runtime.filter.drain(),
-          runtime.rooms.queue.drain(),
+          runtime.rooms?.queue.drain(),
           runtime.roleSelection?.queue.drain(),
         ]),
       );
@@ -325,6 +534,7 @@ async function main(): Promise<void> {
     const runtime = lookup(state.guild.id);
     if (!runtime) return;
     const { context, rooms } = runtime;
+    if (!rooms) return;
     const { store } = context;
     track(
       (async () => {
@@ -350,7 +560,11 @@ async function main(): Promise<void> {
             }
           }
         }
-        if (state.channelId === store.id("channel.join") && state.member) {
+        if (
+          context.control.modules.rooms &&
+          state.channelId === context.control.rooms.entryChannelId &&
+          state.member
+        ) {
           const member = state.member;
           try {
             await rooms.enter({ id: member.id, name: member.displayName, bot: member.user.bot });
@@ -360,7 +574,7 @@ async function main(): Promise<void> {
               null,
               error instanceof Error && context.texts[error.message] ? error.message : "roomFailed",
             );
-            if (member.voice.channelId === store.id("channel.join"))
+            if (member.voice.channelId === context.control.rooms.entryChannelId)
               await member.voice.disconnect("Nie udało się utworzyć pokoju");
             await context.alert("rooms", member.id, errorCode(error));
           }
@@ -387,6 +601,20 @@ async function main(): Promise<void> {
     const { environment } = context;
     track(
       (async () => {
+        if (interaction.isChatInputCommand() && interaction.commandName === "konfiguracja") {
+          const member = await context.member(interaction.user.id);
+          if (member.id !== context.guild.ownerId && !member.permissions.has(P.ManageGuild))
+            throw Error("Missing ManageGuild");
+          const origin = process.env.WEB_ORIGIN;
+          await interaction.reply({
+            content: origin
+              ? "Ustawienia serwera: " + new URL("/panel/" + context.guild.id, origin).href
+              : "Panel WWW nie ma jeszcze publicznego adresu. Użyj /ustawienia.",
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: noMentions,
+          });
+          return;
+        }
         if (await settingsInteraction(context, interaction)) return;
         if (!interaction.isChatInputCommand()) return;
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -394,9 +622,19 @@ async function main(): Promise<void> {
           if (stopping || interaction.guildId !== environment.guildId)
             throw new Error("Ta komenda działa na skonfigurowanym serwerze.");
           await context.member(interaction.user.id);
-          if (interaction.commandName === "pokoj") await roomCommand(context, rooms, interaction);
-          else if (interaction.commandName === "zglos") await submitReport(context, interaction);
-          else throw new Error("Unknown command.");
+          if (interaction.commandName === "pokoj") {
+            if (!rooms || (!context.control.modules.rooms && !context.store.rooms().length)) {
+              await interaction.editReply("Pokoje są wyłączone na tym serwerze.");
+              return;
+            }
+            await roomCommand(context, rooms, interaction);
+          } else if (interaction.commandName === "zglos") {
+            if (!context.control.modules.reports) {
+              await interaction.editReply("Zgłoszenia są wyłączone na tym serwerze.");
+              return;
+            }
+            await submitReport(context, interaction);
+          } else throw new Error("Unknown command.");
         } catch (error) {
           const known = error instanceof Error ? context.texts[error.message] : undefined;
           await interaction.editReply(known ?? context.texts.operationFailed);

@@ -12,6 +12,7 @@ import { noMentions, errorCode } from "../shared/utils.js";
 import { SettingsService } from "../settings.js";
 import { ProfileService } from "../profile.js";
 import { writeProfile } from "./profile-panel.js";
+import { readControlConfiguration } from "../control/configuration.js";
 
 export class BotContext {
   readonly texts = readJson<Record<string, string>>("bot-messages.json");
@@ -23,6 +24,7 @@ export class BotContext {
     readonly store: Store,
     readonly config: Config,
     readonly environment: Environment,
+    readonly managedLayout = true,
   ) {
     this.settings = new SettingsService(store, config, guild.id);
     this.profile = new ProfileService(guild.id, {
@@ -44,9 +46,20 @@ export class BotContext {
       },
     });
   }
+  get control() {
+    return readControlConfiguration(
+      this.store,
+      this.config,
+      this.settings,
+      this.guild.id,
+      this.managedLayout,
+    );
+  }
   moderator(member: GuildMember): boolean {
     return (
-      member.id === this.guild.ownerId || member.roles.cache.has(this.store.id("role.moderator"))
+      member.id === this.guild.ownerId ||
+      member.permissions.has(P.ManageGuild) ||
+      member.roles.cache.has(this.store.resource("role.moderator")?.id ?? "")
     );
   }
   async member(id: string): Promise<GuildMember> {
@@ -56,7 +69,13 @@ export class BotContext {
     return member;
   }
   async textChannel(key: string): Promise<GuildTextBasedChannel> {
-    const channel = await this.guild.channels.fetch(this.store.id(`channel.${key}`));
+    const id =
+      key === "moderation"
+        ? this.control.reports.channelId
+        : key === "start"
+          ? this.control.reactions.channelId
+          : this.store.id(`channel.${key}`);
+    const channel = id ? await this.guild.channels.fetch(id) : null;
     if (!channel?.isTextBased()) throw new Error("Missing text channel.");
     return channel;
   }

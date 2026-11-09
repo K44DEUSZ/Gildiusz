@@ -91,6 +91,7 @@ function contextFor(messages) {
   const calls = { alerts: [], notices: [] };
   const context = {
     environment: { guildId: "guild", clientId: "self" },
+    control: { modules: { files: true }, files: { channelIds: ["forum"], includeRooms: true } },
     config: loadConfig(),
     store: {
       resources: () => [{ kind: "channel", id: "forum", key: "channel.showcase" }],

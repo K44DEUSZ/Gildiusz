@@ -103,7 +103,7 @@ test("restart reconciliation repairs interrupted writes and offline removals wit
 test("the Discord adapter refuses pending, timed-out and bot accounts, elevated roles and lost hierarchy", async (t) => {
   const { store } = fixture(t);
   const config = loadConfig();
-  store.putResource("message.roles.0", "message", panel.message, {});
+  store.putResource("message.roles.0", "message", panel.message, { channelId: panel.channel });
   store.putResource("role.programming", "role", "programming", {});
   const held = new Set();
   const writes = [];
@@ -140,10 +140,21 @@ test("the Discord adapter refuses pending, timed-out and bot accounts, elevated 
   };
   const context = {
     config,
+    control: {
+      modules: { reactions: true },
+      reactions: { choices: [{ emoji: "💻", roleId: "programming" }], channelId: panel.channel },
+    },
     store,
     environment: { clientId: "bot" },
     guild: {
       id: panel.guild,
+      channels: {
+        fetch: async () => ({
+          id: panel.channel,
+          isTextBased: () => true,
+          messages: { fetch: async () => message },
+        }),
+      },
       roles: { fetch: async () => new Map([[role.id, role]]) },
       members: { fetch: async () => member, fetchMe: async () => bot },
     },

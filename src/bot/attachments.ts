@@ -14,15 +14,12 @@ export class AttachmentFilter {
   }
   private inScope(message: Message | PartialMessage): boolean {
     const parent = message.channel.isThread() ? message.channel.parentId : message.channelId;
+    const configuration = this.context.control;
     return (
-      this.context.store
-        .resources()
-        .some(
-          (entry) =>
-            entry.kind === "channel" &&
-            entry.id === parent &&
-            !["channel.moderation", "channel.logs"].includes(entry.key),
-        ) || Boolean(this.context.store.room(parent ?? message.channelId))
+      configuration.modules.files &&
+      (configuration.files.channelIds.includes(parent ?? message.channelId) ||
+        (configuration.files.includeRooms &&
+          Boolean(this.context.store.room(parent ?? message.channelId))))
     );
   }
   async handle(incoming: Message | PartialMessage): Promise<void> {

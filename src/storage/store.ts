@@ -69,6 +69,9 @@ export class Store {
     this.db.exec(
       "CREATE TABLE IF NOT EXISTS role_selections (member TEXT NOT NULL, role_key TEXT NOT NULL, PRIMARY KEY(member,role_key))",
     );
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS control_configuration (guild TEXT PRIMARY KEY, body TEXT NOT NULL)",
+    );
   }
   roleSelections(key: string): string[] {
     return this.db
@@ -100,6 +103,9 @@ export class Store {
         "INSERT INTO resources VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET kind=excluded.kind,id=excluded.id,baseline=excluded.baseline",
       )
       .run(key, kind, id, canonical(baseline));
+  }
+  removeResource(key: string): void {
+    this.db.prepare("DELETE FROM resources WHERE key=?").run(key);
   }
   rooms(): Room[] {
     return this.db
@@ -172,6 +178,39 @@ export class Store {
     return this.db
       .prepare("SELECT revision, body FROM runtime_settings WHERE guild=?")
       .get(guild) as { revision: number; body: string } | undefined;
+  }
+  controlConfiguration(guild: string): unknown {
+    const row = this.db.prepare("SELECT body FROM control_configuration WHERE guild=?").get(guild);
+    return row ? JSON.parse(String(row.body)) : undefined;
+  }
+  saveControlConfiguration(
+    guild: string,
+    configuration: unknown,
+    settings: unknown,
+    expected: number,
+    actor: string,
+    panel?: { id: string; channelId: string },
+  ): number {
+    return this.transaction(() => {
+      if ((this.settings(guild)?.revision ?? 0) !== expected) throw new Error("settings_conflict");
+      const revision = expected + 1;
+      this.db
+        .prepare(
+          "INSERT INTO runtime_settings VALUES (?,?,?,?,?) ON CONFLICT(guild) DO UPDATE SET revision=excluded.revision,body=excluded.body,actor=excluded.actor,updated=excluded.updated",
+        )
+        .run(guild, revision, canonical(settings), actor, Date.now());
+      this.db
+        .prepare(
+          "INSERT INTO control_configuration VALUES (?,?) ON CONFLICT(guild) DO UPDATE SET body=excluded.body",
+        )
+        .run(guild, canonical(configuration));
+      if (panel) {
+        this.putResource("control.role-panel", "control", panel.id, { channelId: panel.channelId });
+        this.removeResource("control.staged-role-panel");
+      }
+      this.event("web-settings", guild, `revision:${revision};actor:${actor}`);
+      return revision;
+    });
   }
   saveSettings(guild: string, body: unknown, expected: number, actor: string): number {
     return this.transaction(() => {

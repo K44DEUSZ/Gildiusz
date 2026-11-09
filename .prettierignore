@@ -4,3 +4,6 @@ data/
 backups/
 reports/deployment-plan.json
 package-lock.json
+*.tsbuildinfo
+.bot/
+.gildiusz-web/

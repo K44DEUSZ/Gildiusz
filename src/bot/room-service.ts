@@ -68,7 +68,11 @@ export class RoomService {
         await this.port.move(member.id, existing.id);
         return existing.id;
       }
-      if (this.store.operations().length)
+      if (
+        this.store
+          .operations()
+          .some((entry) => String((entry as { key: string }).key).startsWith("room-create:"))
+      )
         throw new Error("Unfinished configuration or channel creation requires reconciliation.");
       if (
         !this.store.cooldown(

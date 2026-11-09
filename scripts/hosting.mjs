@@ -399,7 +399,7 @@ export function deploymentState(root, release) {
         "--env-file=" + join(root, "shared", ".env"),
         "--input-type=module",
         "-e",
-        'import {loadInstallations} from "./dist/installations.js";import {loadConfig} from "./dist/config.js";import {lintContent} from "./dist/content.js";const entries=loadInstallations();for(const entry of entries){const errors=lintContent(loadConfig(entry.configPath));if(errors.length)throw Error("Invalid guild configuration.");}console.log(JSON.stringify(entries.map(({guildId,databasePath})=>({guildId,databasePath}))));',
+        'import {loadInstallations} from "./dist/installations.js";import {loadConfig} from "./dist/config.js";import {lintContent} from "./dist/content.js";const entries=loadInstallations();if(process.env.PUBLIC_INSTALLS==="1"){const {PublicInstallations}=await import("./dist/control/installations.js");const {healthPath}=await import("./dist/installations.js");const {dirname,join}=await import("node:path");const registry=new PublicInstallations(process.env.CONTROL_DATA_DIR||join(dirname(healthPath()),"public-guilds"));for(const entry of registry.values())if(!entries.some(value=>value.guildId===entry.guildId))entries.push(entry);}for(const entry of entries){if(entry.public)continue;const errors=lintContent(loadConfig(entry.configPath));if(errors.length)throw Error("Invalid guild configuration.");}console.log(JSON.stringify(entries.map(({guildId,databasePath})=>({guildId,databasePath}))));',
       ],
       release,
     ),

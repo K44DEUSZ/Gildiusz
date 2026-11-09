@@ -4,7 +4,7 @@
 
 Polski bot Discord do prowadzenia społeczności: tworzy tymczasowe pokoje głosowe, przyjmuje zgłoszenia i sprawdza formaty załączników. Administracja może ustawić mu własną nazwę i awatar na swoim serwerze.
 
-To wczesna wersja do samodzielnego uruchomienia. Jeden proces może obsługiwać kilka jawnie skonfigurowanych serwerów Discorda, z osobnymi bazami i ustawieniami. Bot potrzebuje stale działającego hosta. Instalacja nowych serwerów wymaga operatora; nie ma jeszcze publicznej samoobsługi.
+To wczesna wersja do samodzielnego uruchomienia. Jeden proces może obsługiwać kilka serwerów Discorda, z osobnymi bazami i ustawieniami. Bot potrzebuje stale działającego hosta. Po włączeniu trybu publicznego administrator wybiera własne kanały, role i funkcje w panelu WWW. Publiczny adres i dostępność wspólnej usługi zależą od wdrożenia operatora.
 
 
 ## Co potrafi
@@ -48,6 +48,24 @@ Na hostingu współdzielonym można uruchomić osobny proces z nadzorcą i CRON.
 restarty i jawnie włączane pobieranie sprawdzonego `main` po pushu.
 
 Po udanym wdrożeniu instalator zachowuje bieżącą i poprzednią paczkę; CRON obraca logi po przekroczeniu 5 MiB. Prywatne kopie baz są przechowywane osobno.
+
+## Strona i panel WWW: podgląd lokalny
+
+
+Z katalogu głównego uruchom:
+
+```sh
+```
+
+
+```sh
+npm run web:dev
+```
+
+Strona jest dostępna pod http://127.0.0.1:3217. W panelu wybierz „Zobacz przykładowy panel”. Można zmieniać funkcje, kanały, role, formaty i limity oraz zapisywać je po przeglądzie podsumowania. Przykładowe ustawienia i sesje są przechowywane w prywatnym .gildiusz-web poza źródłami; można wskazać inny katalog przez GILDIUSZ_WEB_DATA_DIR.
+
+
+Kontrole WWW: npm run web:check i npm run web:build. CI ma osobny etap dla aplikacji WWW; istniejący artefakt hostingu nadal dotyczy wyłącznie bota.
 
 ## Licencja
 

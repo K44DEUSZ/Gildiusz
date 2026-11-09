@@ -11,7 +11,59 @@ import { readContent } from "../content.js";
 import { errorCode } from "../shared/utils.js";
 
 export function discordRoomService(context: BotContext): RoomService {
-  const category = context.store.id("category.rooms");
+  const category = context.control.rooms.categoryId;
+  function roomOverwrites(locked = false, allowed: string[] = []) {
+    if (context.managedLayout && category === context.store.resource("category.rooms")?.id) {
+      const entries = overwrites(
+        locked ? "private" : "voice",
+        context.guild.id,
+        context.store.id("role.moderator"),
+        context.environment.clientId,
+      );
+      if (locked)
+        for (const id of allowed)
+          entries.push({ id, type: 1, allow: (P.ViewChannel | P.Connect).toString(), deny: "0" });
+      return entries.map((entry) => ({
+        ...entry,
+        allow: BigInt(entry.allow),
+        deny: BigInt(entry.deny),
+        type: entry.type as 0 | 1,
+      }));
+    }
+    const parent = context.guild.channels.cache.get(category);
+    if (parent?.type !== ChannelType.GuildCategory) throw Error("Missing room category");
+    const access = P.ViewChannel | P.Connect;
+    const entries = [...parent.permissionOverwrites.cache.values()]
+      .filter((entry) => entry.id !== context.environment.clientId)
+      .map((entry) => ({
+        id: entry.id,
+        type: entry.type as 0 | 1,
+        allow: locked ? entry.allow.bitfield & ~access : entry.allow.bitfield,
+        deny: locked ? entry.deny.bitfield | access : entry.deny.bitfield,
+      }));
+    if (locked && !entries.some((entry) => entry.id === context.guild.id))
+      entries.push({ id: context.guild.id, type: 0, allow: 0n, deny: access });
+    for (const id of locked ? allowed : []) {
+      const index = entries.findIndex((entry) => entry.id === id);
+      if (index >= 0) entries.splice(index, 1);
+      entries.push({ id, type: 1, allow: access, deny: 0n });
+    }
+    entries.push({
+      id: context.environment.clientId,
+      type: 1,
+      allow:
+        P.ViewChannel |
+        P.Connect |
+        P.ManageChannels |
+        P.ManageRoles |
+        P.MoveMembers |
+        P.ReadMessageHistory |
+        P.SendMessages |
+        P.ManageMessages,
+      deny: 0n,
+    });
+    return entries;
+  }
   async function managedChannel(id: string): Promise<VoiceChannel | null> {
     try {
       const channel = await context.guild.channels.fetch(id);
@@ -57,7 +109,8 @@ export function discordRoomService(context: BotContext): RoomService {
       }
     },
     atEntrance: (id) =>
-      context.guild.voiceStates.cache.get(id)?.channelId === context.store.id("channel.join"),
+      context.control.modules.rooms &&
+      context.guild.voiceStates.cache.get(id)?.channelId === context.control.rooms.entryChannelId,
     capacity: () =>
       context.guild.channels.cache.size < 490 &&
       [...context.guild.channels.cache.values()].filter((channel) => channel.parentId === category)
@@ -70,22 +123,13 @@ export function discordRoomService(context: BotContext): RoomService {
           parent: category,
           reason: operation,
           rateLimitPerUser: 0,
-          permissionOverwrites: overwrites(
-            "voice",
-            context.guild.id,
-            context.store.id("role.moderator"),
-            context.environment.clientId,
-          ).map((entry) => ({
-            ...entry,
-            allow: BigInt(entry.allow),
-            deny: BigInt(entry.deny),
-            type: entry.type as 0 | 1,
-          })),
+          userLimit: context.control.rooms.userLimit,
+          permissionOverwrites: roomOverwrites(),
         })
       ).id,
     move: async (id, channel) => {
       const member = await context.member(id);
-      if (member.voice.channelId !== context.store.id("channel.join")) return false;
+      if (member.voice.channelId !== context.control.rooms.entryChannelId) return false;
       await member.voice.setChannel(channel, "Pokój projektowy");
       return true;
     },
@@ -97,22 +141,8 @@ export function discordRoomService(context: BotContext): RoomService {
     permissions: async (room) => {
       const channel = await managedChannel(room.id);
       if (!channel) throw new Error("Room no longer exists.");
-      const entries = overwrites(
-        room.locked ? "private" : "voice",
-        context.guild.id,
-        context.store.id("role.moderator"),
-        context.environment.clientId,
-      );
-      if (room.locked)
-        for (const id of room.allowed)
-          entries.push({ id, type: 1, allow: (P.ViewChannel | P.Connect).toString(), deny: "0" });
       await channel.permissionOverwrites.set(
-        entries.map((entry) => ({
-          ...entry,
-          allow: BigInt(entry.allow),
-          deny: BigInt(entry.deny),
-          type: entry.type as 0 | 1,
-        })),
+        roomOverwrites(room.locked, room.allowed),
         "Dostęp do pokoju projektowego",
       );
     },

@@ -33,9 +33,10 @@ export class RoleSelectionService {
     private store: Store,
     private panel: { guild: string; channel: string; message: string },
     private port: RoleSelectionPort,
+    private choices: readonly { key: string; emoji: string }[] = roleChoices,
   ) {}
   handle(event: RoleReaction): Promise<void> {
-    const choice = roleChoices.find((entry) => entry.emoji === event.emoji);
+    const choice = this.choices.find((entry) => entry.emoji === event.emoji);
     if (
       !choice ||
       event.guild !== this.panel.guild ||
@@ -47,7 +48,7 @@ export class RoleSelectionService {
   }
   reconcile(): Promise<void> {
     return this.queue.run(async () => {
-      for (const choice of roleChoices) {
+      for (const choice of this.choices) {
         // Read a complete page set before treating absent reactions as removals.
         const current = new Set(await this.port.reactors(choice.emoji));
         const members = new Set([...current, ...this.store.roleSelections(choice.key)]);

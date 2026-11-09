@@ -1,5 +1,10 @@
 # Zależności zewnętrzne
 
+## Aplikacja WWW
+
+
+## Bot Discord
+
 Gildiusz używa poniższych zależności produkcyjnych, według package-lock.json. Ich autorzy zachowują prawa i licencje. Instalacja npm dostarcza pliki licencyjne pakietów; niniejszy wykaz ich nie zastępuje. Repozytorium i wydania źródłowe nie zawierają node_modules.
 
 | Pakiet                          | Wersja  | Licencja   |

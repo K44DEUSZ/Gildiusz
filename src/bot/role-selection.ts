@@ -1,20 +1,24 @@
 import { PermissionFlagsBits as P } from "discord.js";
 import type { BotContext } from "./context.js";
-import { roleChoices, RoleSelectionService } from "../role-selection.js";
+import { RoleSelectionService } from "../role-selection.js";
+import { selectionChoices, rolePanel } from "./control.js";
 import { errorCode } from "../shared/utils.js";
 
 export async function discordRoleSelection(
   context: BotContext,
 ): Promise<RoleSelectionService | null> {
-  const { guild, store, environment, config } = context;
-  const panel = store.resource("message.roles.0");
+  const { guild, store, environment } = context;
+  if (!context.control.modules.reactions) return null;
+  const choices = selectionChoices(context);
+  const panel = rolePanel(context);
   if (!panel) return null;
-  const channel = await context.textChannel("start");
+  const channel = await guild.channels.fetch(panel.channelId);
+  if (!channel?.isTextBased()) throw Error("Missing role channel");
   const message = await channel.messages.fetch(panel.id);
   if (message.author.id !== environment.clientId) throw Error("Role panel author differs");
   const me = await guild.members.fetchMe({ force: true });
   if (!me.permissions.has(P.ManageRoles)) throw Error("Role selection requires ManageRoles");
-  for (const choice of roleChoices) await message.react(choice.emoji);
+  for (const choice of choices) await message.react(choice.emoji);
   const service = new RoleSelectionService(
     store,
     { guild: guild.id, channel: channel.id, message: panel.id },
@@ -37,10 +41,7 @@ export async function discordRoleSelection(
         throw Error("Role panel exceeds reconciliation limit");
       },
       apply: async (user, key, active) => {
-        if (
-          !config.roles.some((role) => role.key === key) ||
-          !roleChoices.some((role) => role.key === key)
-        )
+        if (!choices.some((role) => role.key === key))
           throw Error("Role is outside the self-selection allowlist");
         let member;
         try {
@@ -57,7 +58,7 @@ export async function discordRoleSelection(
         }
         if (member.user.bot) return false;
         const roles = await guild.roles.fetch();
-        const role = roles.get(store.id(`role.${key}`));
+        const role = roles.get(choices.find((choice) => choice.key === key)!.roleId);
         const bot = await guild.members.fetchMe({ force: true });
         if (
           !role ||
@@ -74,6 +75,7 @@ export async function discordRoleSelection(
         return true;
       },
     },
+    choices,
   );
   await service.reconcile();
   return service;

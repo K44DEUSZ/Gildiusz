@@ -7,6 +7,7 @@ export interface GuildInstallation {
   ownerId: string;
   configPath: string;
   databasePath: string;
+  public?: boolean;
 }
 
 function databaseIdentity(path: string): string {
@@ -22,6 +23,7 @@ function databaseIdentity(path: string): string {
 }
 
 export function loadInstallations(values = process.env): GuildInstallation[] {
+  if (values.PUBLIC_INSTALLS === "1" && !values.GUILDS_PATH && !values.DISCORD_GUILD_ID) return [];
   if (!values.GUILDS_PATH)
     return [
       {

@@ -87,5 +87,11 @@ export function commands() {
     .setDescription("Pokaż funkcje bota i aktualne limity.")
     .setContexts(InteractionContextType.Guild)
     .setIntegrationTypes(ApplicationIntegrationType.GuildInstall);
-  return [room, report, settings, panel, help].map((command) => command.toJSON());
+  const configure = new SlashCommandBuilder()
+    .setName("konfiguracja")
+    .setDescription("Otwórz ustawienia serwera w panelu WWW.")
+    .setDefaultMemberPermissions(P.ManageGuild)
+    .setContexts(InteractionContextType.Guild)
+    .setIntegrationTypes(ApplicationIntegrationType.GuildInstall);
+  return [room, report, settings, panel, help, configure].map((command) => command.toJSON());
 }

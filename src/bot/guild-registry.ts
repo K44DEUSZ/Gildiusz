@@ -13,6 +13,19 @@ export class GuildRegistry<T> {
   get(guildId: string | null | undefined): T | undefined {
     return guildId ? this.entries.get(guildId)?.value : undefined;
   }
+  register(installation: GuildInstallation): void {
+    if (!this.entries.has(installation.guildId))
+      this.entries.set(installation.guildId, { installation, retryAt: 0 });
+  }
+  replace(guildId: string, value: T): void {
+    const entry = this.entries.get(guildId);
+    if (!entry) throw Error("Unknown installation");
+    entry.value = value;
+    entry.retryAt = 0;
+  }
+  remove(guildId: string): void {
+    this.entries.delete(guildId);
+  }
   values(): T[] {
     return [...this.entries.values()].flatMap((entry) => (entry.value ? [entry.value] : []));
   }
