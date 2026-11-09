@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
 
 export async function relay(input, send = globalThis.fetch) {
   if (
@@ -43,7 +43,7 @@ async function main() {
   const result = await relay(JSON.parse(Buffer.concat(chunks).toString("utf8")));
   process.stdout.write(JSON.stringify(result) + "\n");
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)
   main().catch(() => {
     process.stderr.write("Private control connection failed.\n");
     process.exitCode = 1;

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../dist/storage/store.js";
@@ -14,6 +15,22 @@ import { relay } from "../scripts/control-relay.mjs";
 
 const guild = "100000000000000001",
   owner = "100000000000000002";
+
+test("the forced SSH command runs through the current release symlink", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "gildiusz-relay-")),
+    actual = join(directory, "release"),
+    alias = join(directory, "current");
+  mkdirSync(actual);
+  cpSync("scripts/control-relay.mjs", join(actual, "control-relay.mjs"));
+  symlinkSync(actual, alias, process.platform === "win32" ? "junction" : "dir");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const result = spawnSync(process.execPath, [join(alias, "control-relay.mjs")], {
+    input: "{}",
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Private control connection failed/);
+});
 
 test("the SSH relay cannot execute commands or reach another host, path or HTTP method", async () => {
   const request = {
