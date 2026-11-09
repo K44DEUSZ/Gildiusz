@@ -177,7 +177,9 @@ test("the Discord adapter refuses pending, timed-out and bot accounts, elevated 
   assert.deepEqual(writes, []);
   await service.handle(event(true));
   await service.handle(event(true));
+  member.disabled = true;
   await service.handle(event(false));
+  member.disabled = false;
   assert.deepEqual(writes, [
     ["programming", true],
     ["programming", false],
@@ -195,6 +197,6 @@ test("informational publications separate every consecutive message and include 
   const roles = messages.find((message) => message.key === "message.roles.0");
   for (const choice of roleChoices) {
     assert.ok(roles.text.includes(choice.emoji));
-    assert.ok(roles.text.includes(config.roles.find((role) => role.key === choice.key).name));
+    assert.ok(roles.text.includes(`<@&@{role.${choice.key}}>`));
   }
 });

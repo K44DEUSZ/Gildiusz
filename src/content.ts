@@ -113,7 +113,7 @@ export function publications(
           .map((choice) => {
             const role = config.roles.find((entry) => entry.key === choice.key);
             if (!role) throw Error(`Missing self-selection role: ${choice.key}`);
-            return `${choice.emoji} · **${role.name}**`;
+            return `${choice.emoji} · <@&@{role.${role.key}}>`;
           })
           .join("\n") +
         "\n\nTo role zainteresowań i współpracy. Akceptację zasad wykonujesz osobno w formularzu Discorda przy dołączaniu.",

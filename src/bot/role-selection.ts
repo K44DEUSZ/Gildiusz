@@ -44,7 +44,9 @@ export async function discordRoleSelection(
           throw Error("Role is outside the self-selection allowlist");
         let member;
         try {
-          member = await context.member(user);
+          member = active
+            ? await context.member(user)
+            : await guild.members.fetch({ user, force: true });
         } catch (error) {
           if (
             errorCode(error) === "10007" ||
