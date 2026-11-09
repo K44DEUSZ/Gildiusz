@@ -15,6 +15,7 @@ import {
 import { dirname, join, resolve, basename } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { archiveName, validateBuild, verifyArchive } from "./build-package.mjs";
+import { cleanLegacyBuild, pruneReleases, rotateLogs } from "./maintenance.mjs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -436,6 +437,13 @@ export async function install(root, sha, checked) {
   if (await waitReady(root, sha, activated)) {
     rmSync(join(p.shared, "failed-revision"), { force: true });
     event(root, `activation healthy ${sha}`);
+    try {
+      const removed = pruneReleases(root, previous ? basename(previous) : null);
+      if (removed.length) event(root, `pruned old releases count=${removed.length}`);
+    } catch (error) {
+      // A cleanup problem must never roll back a healthy deployment.
+      event(root, `release cleanup skipped: ${error.message}`);
+    }
     return;
   }
   writeFileSync(join(p.shared, "failed-revision"), sha, { mode: 0o600 });
@@ -475,7 +483,7 @@ async function update(root) {
 async function main() {
   const [command, argument, sha] = process.argv.slice(2);
   if (!argument)
-    throw Error("Usage: hosting.mjs tick|status|install|restart|pause|resume ROOT [SHA]");
+    throw Error("Usage: hosting.mjs tick|status|install|restart|pause|resume|cleanup ROOT [SHA]");
   const root = resolve(argument);
   const p = paths(root);
   for (const directory of [
@@ -488,6 +496,54 @@ async function main() {
   if (command === "supervise") return supervise(root);
   if (command === "install") return install(root, sha);
   if (command === "update") return update(root);
+  if (command === "cleanup") {
+    if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Specify the rollback release SHA.");
+    console.log(
+      run(
+        "flock",
+        [
+          "-n",
+          join(p.shared, "deploy.lock"),
+          process.execPath,
+          join(root, "current", "scripts", "hosting.mjs"),
+          "cleanup-locked",
+          root,
+          sha,
+        ],
+        root,
+      ),
+    );
+    return;
+  }
+  if (command === "cleanup-locked") {
+    const active = realpathSync(p.current);
+    const state = readJson(p.state),
+      health = readJson(p.health);
+    if (
+      !healthy(health) ||
+      health.guilds?.some((guild) => !guild.ready) ||
+      state?.release !== basename(active)
+    )
+      throw Error("Cleanup requires a healthy current deployment.");
+    if (run("git", ["remote", "get-url", "origin"], join(root, "source")) !== repository)
+      throw Error("Unexpected source repository.");
+    const removedReleases = pruneReleases(root, sha);
+    const legacy = cleanLegacyBuild(root);
+    const receipt = {
+      time: new Date().toISOString(),
+      current: basename(active),
+      previous: sha,
+      removedReleases,
+      ...legacy,
+    };
+    atomicJson(join(p.shared, "logs", "cleanup.json"), receipt);
+    event(
+      root,
+      `cleanup completed: old releases=${removedReleases.length}; legacy=${legacy.removed.length}`,
+    );
+    console.log(JSON.stringify(receipt));
+    return;
+  }
   if (command === "status") {
     console.log(
       JSON.stringify({
@@ -507,6 +563,13 @@ async function main() {
     readJson(p.state)?.supervisorRevision !== basename(realpathSync(p.current))
   )
     await stopSupervisor(root);
+  if (command === "tick") {
+    try {
+      rotateLogs(root);
+    } catch (error) {
+      event(root, `log rotation skipped: ${error.message}`);
+    }
+  }
   background(root, "supervise", "supervisor.lock");
   if (command === "tick") background(root, "update", "deploy.lock");
 }
