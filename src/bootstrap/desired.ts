@@ -52,7 +52,7 @@ export function desired(
       kind: "role",
       body: {
         name: "Moderator",
-        hoist: false,
+        hoist: true,
         mentionable: false,
       },
       sensitive: true,

@@ -3,6 +3,8 @@
 
 Zaakceptuj zasady w {{channel.rules}} i wybierz tematy, które cię interesują. Nie musisz mieć doświadczenia ani własnego projektu.
 
+Zainteresowania i role wybierzesz w zakładce **Kanały i role** nad listą kanałów. Możesz zaznaczyć kilka opcji i później zmienić wybór.
+
 Na {{channel.introductions}} możesz napisać kilka zdań o sobie.
 
 Masz coś do pokazania? Dodaj post na {{channel.showcase}}. Szukasz osób do współpracy? Zajrzyj na {{channel.collaboration}}. Z konkretnym pytaniem kieruj się na {{channel.help}}.

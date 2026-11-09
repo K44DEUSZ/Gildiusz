@@ -1,3 +1,5 @@
+​
+
 **🔐 Prywatność i działanie bota**
 Bot obsługuje pokoje projektowe i sprawdza załączniki. **Nie nagrywa rozmów.**
 

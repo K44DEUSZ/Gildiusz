@@ -278,6 +278,7 @@ test("configuration succeeds without granting the bot moderation powers and pres
   await f.apply(await f.plan("core"));
   const moderator = f.state.roles.find((role) => role.id === f.store.id("role.moderator"));
   assert.equal(moderator.permissions, "0");
+  assert.equal(moderator.hoist, true);
   moderator.permissions = moderatorPermissions;
   const repeated = await f.plan("core");
   assert.deepEqual(repeated.conflicts, []);
