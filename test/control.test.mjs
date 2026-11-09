@@ -95,7 +95,7 @@ test("migration reads existing bindings without writes and web/Discord share con
   const f = fixture(t);
   for (const [key, kind, id] of [
     ["channel.join", "channel", "100000000000000004"],
-    ["category.rooms", "category", "100000000000000005"],
+    ["category.rooms", "channel", "100000000000000005"],
     ["channel.moderation", "channel", "100000000000000006"],
     ["channel.forum", "channel", "100000000000000007"],
   ])
@@ -106,6 +106,7 @@ test("migration reads existing bindings without writes and web/Discord share con
   assert.equal(legacy.files.includeRooms, true);
   assert.equal(legacy.files.channelIds.includes("100000000000000007"), true);
   assert.equal(legacy.files.channelIds.includes("100000000000000006"), false);
+  assert.equal(legacy.files.channelIds.includes("100000000000000005"), false);
   assert.equal(f.store.controlConfiguration(guild), undefined);
   const current = f.settings.read();
   f.store.saveControlConfiguration(

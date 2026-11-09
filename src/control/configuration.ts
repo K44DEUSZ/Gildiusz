@@ -81,6 +81,7 @@ export function readControlConfiguration(
                 .filter(
                   (entry) =>
                     entry.kind === "channel" &&
+                    entry.key.startsWith("channel.") &&
                     !["channel.moderation", "channel.logs"].includes(entry.key),
                 )
                 .map((entry) => entry.id)

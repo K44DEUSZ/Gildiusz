@@ -99,7 +99,10 @@ export async function controlResources(guild: Guild): Promise<GuildResources> {
           [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
         )
           uses.push("reactions");
-        if (permissions?.has([P.ViewChannel, P.ReadMessageHistory, P.ManageMessages]))
+        if (
+          channel.type !== ChannelType.GuildCategory &&
+          permissions?.has([P.ViewChannel, P.ReadMessageHistory, P.ManageMessages])
+        )
           uses.push("files");
         if (
           permissions?.has([P.ViewChannel, P.SendMessages, P.ReadMessageHistory]) &&
