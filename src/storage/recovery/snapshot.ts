@@ -21,6 +21,7 @@ import { acquireLock } from "../lock.js";
 import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
+  assertSourcePreparationComplete,
   restoreQuarantineFile,
 } from "./lease.js";
 import { backupKey, decryptArchive, encryptArchive, manifestLimit } from "./archive.js";
@@ -251,6 +252,7 @@ export function planSnapshot(options: SnapshotOptions): {
   )
     throw new Error("Invalid snapshot paths or guild count.");
   assertRestoreStartupAllowed(options.dataRoot);
+  assertSourcePreparationComplete(options.dataRoot);
   deletionLedgers(options.dataRoot);
   if (fileExists(options.outputPath)) throw new Error("Recovery output already exists.");
   const guilds = new Set<string>(),
@@ -307,6 +309,7 @@ export async function createSnapshot(options: SnapshotOptions): Promise<Snapshot
   try {
     releases.push(await acquireDataRootLease(options.dataRoot));
     assertRestoreStartupAllowed(options.dataRoot);
+    assertSourcePreparationComplete(options.dataRoot);
     for (const path of [
       ...options.guilds.map((entry) => entry.databasePath),
       ...(options.hubDatabasePath ? [options.hubDatabasePath] : []),

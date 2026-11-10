@@ -3,6 +3,18 @@ import { isAbsolute, join, resolve } from "node:path";
 import { acquireLock } from "../lock.js";
 
 export const restoreQuarantineFile = "restore-quarantine.json";
+export const sourcePreparationFile = "source-preparation.json";
+
+export function assertSourcePreparationComplete(dataRoot: string): void {
+  if (!isAbsolute(dataRoot)) throw new Error("Recovery requires an absolute private data root.");
+  try {
+    lstatSync(join(dataRoot, sourcePreparationFile));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("Recovery source preparation is incomplete. Keep the worker paused.");
+}
 
 export function assertRestoreStartupAllowed(dataRoot: string): void {
   if (!isAbsolute(dataRoot)) throw new Error("Recovery requires an absolute private data root.");

@@ -19,6 +19,7 @@ import { acquireLock } from "../storage/lock.js";
 import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
+  assertSourcePreparationComplete,
   currentRecoverySchemaPolicy,
   schemaOf,
   verifySchema,
@@ -107,6 +108,7 @@ async function main(): Promise<void> {
   const path = healthPath(),
     dataRoot = dirname(path);
   assertRestoreStartupAllowed(dataRoot);
+  assertSourcePreparationComplete(dataRoot);
   const credentials = loadCredentials();
   const memberEvents = process.env.GILDIUSZ_MEMBER_EVENTS === "1";
   const publicDirectory = resolve(process.env.CONTROL_DATA_DIR || join(dataRoot, "public-guilds"));
@@ -1567,6 +1569,7 @@ async function main(): Promise<void> {
     releases.push(await acquireDataRootLease(dataRoot));
     ownsDataRoot = true;
     assertRestoreStartupAllowed(dataRoot);
+    assertSourcePreparationComplete(dataRoot);
     health();
     uninstallRetention = new GuildUninstallRetention({
       dataRoot,

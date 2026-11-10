@@ -42,7 +42,9 @@ export function validatePackagePath(name) {
         part === "." ||
         privateDirectories.has(part.toLowerCase()) ||
         part.toLowerCase().startsWith(".env") ||
-        ["restore-quarantine.json", "restore-manifest.json"].includes(part.toLowerCase()) ||
+        ["restore-quarantine.json", "restore-manifest.json", "source-preparation.json"].includes(
+          part.toLowerCase(),
+        ) ||
         /\.(?:gldbak|gldledger|gldproof)(?:$|[-.])/i.test(part) ||
         /\.(?:sqlite3?|db)(?:$|[-.])/i.test(part),
     ) ||

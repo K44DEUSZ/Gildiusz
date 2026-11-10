@@ -1,7 +1,9 @@
 export {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
+  assertSourcePreparationComplete,
   restoreQuarantineFile,
+  sourcePreparationFile,
 } from "./lease.js";
 export {
   createSnapshot,
