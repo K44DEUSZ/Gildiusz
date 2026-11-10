@@ -124,6 +124,88 @@ test("reports and questions are private and lists apply current authorization to
   assert.deepEqual(await f.service.list(staff), []);
 });
 
+test("a failed post-apply authority fence rolls back content, hook jobs and idempotency together", async (t) => {
+  const f = fixture(t);
+  let allowed = true,
+    revokeInHook = true,
+    transactionalChecks = 0;
+  const service = new CaseService(f.jobs, {
+    guildId,
+    clock: f.now,
+    authorize: ({ actorId }) => ({
+      member: {
+        guildId,
+        userId: actorId,
+        owner: true,
+        manageGuild: false,
+        pending: false,
+        timedOut: false,
+        isBot: false,
+        roleIds: [],
+      },
+      policy: { guildId },
+      assertCurrent: () => {
+        if (f.store.db.isTransaction) transactionalChecks++;
+        if (!allowed) throw new CaseError("permission_revoked");
+      },
+    }),
+    onCreated: (value) => {
+      f.jobs.enqueue({
+        guildId,
+        type: "fixture.created",
+        objectId: value.id,
+        dueAt: f.now(),
+        dedupeKey: "hook-" + value.id,
+        payload: { caseId: value.id },
+      });
+      if (revokeInHook) allowed = false;
+    },
+  });
+  await assert.rejects(
+    service.create(author, "atomic-authority-guard", draft()),
+    code("permission_revoked"),
+  );
+  assert.equal(transactionalChecks, 2);
+  for (const table of ["cases", "case_events", "case_actions", "jobs", "idempotency_keys"])
+    assert.equal(f.store.db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n, 0);
+  allowed = true;
+  revokeInHook = false;
+  const result = await service.create(author, "atomic-authority-guard", draft());
+  assert.equal(
+    (await service.create(author, "atomic-authority-guard", draft())).case.id,
+    result.case.id,
+  );
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM cases").get().n, 1);
+  assert.deepEqual(f.store.db.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("an asynchronous authority guard is rejected before any case write", async (t) => {
+  const f = fixture(t);
+  const service = new CaseService(f.jobs, {
+    guildId,
+    authorize: ({ actorId }) => ({
+      member: {
+        guildId,
+        userId: actorId,
+        owner: true,
+        manageGuild: false,
+        pending: false,
+        timedOut: false,
+        isBot: false,
+        roleIds: [],
+      },
+      policy: { guildId },
+      assertCurrent: async () => {},
+    }),
+  });
+  await assert.rejects(
+    service.create(author, "async-guard", draft()),
+    /guards must be synchronous/,
+  );
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM cases").get().n, 0);
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM idempotency_keys").get().n, 0);
+});
+
 test("author, staff and public views never contain internal notes; notes require a separate staff action", async (t) => {
   const f = fixture(t);
   const saved = await f.service.create(author, "create", draft());

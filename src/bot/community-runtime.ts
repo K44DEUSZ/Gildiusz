@@ -11,6 +11,7 @@ import {
   discordErrorCode,
   freshMember,
   isDiscordChannelUnavailable,
+  memberFacts,
 } from "./module-permissions.js";
 import { DiscordVoiceRooms, VoiceRoomError } from "./voice-rooms.js";
 import {
@@ -196,17 +197,50 @@ export class CommunityRuntime {
     return this.caseService();
   }
   private caseService(authorize?: CaseOptions["authorize"]): CaseService {
-    const configuration = this.caseSettings();
+    const settings = this.settings.read(),
+      configuration = settings.cases ?? emptyCases;
+    const assertConfiguration = () => {
+      this.require("cases");
+      if (this.settings.read().revision !== settings.revision)
+        throw new ControlError(409, "conflict", "Ustawienia spraw zmieniły się. Spróbuj ponownie.");
+    };
     return new CaseService(this.jobs, {
       guildId: this.context.guild.id,
       ...configuration,
-      authorize:
-        authorize ??
-        (async (request) => {
-          this.require("cases");
-          const current = await freshMember(this.context.guild, request.actorId);
-          return { member: current.facts, policy: this.settings.policy() };
-        }),
+      authorize: async (request) => {
+        assertConfiguration();
+        if (authorize) {
+          const authority = await authorize(request),
+            priorGuard = authority.assertCurrent;
+          const assertCurrent = () => {
+            assertConfiguration();
+            return priorGuard?.();
+          };
+          assertCurrent();
+          return { ...authority, assertCurrent };
+        }
+        const current = await freshMember(this.context.guild, request.actorId);
+        const assertCurrent = () => {
+          assertConfiguration();
+          // Fresh REST is required above. Cache can only revoke that grant while another await
+          // (for example the assignee check) completes; it is never used to grant a new request.
+          const member = current.guild.members.cache
+            ? current.guild.members.cache.get(request.actorId)
+            : current.member;
+          if (
+            !member ||
+            !canPerform(
+              request.operation,
+              memberFacts(current.guild, member),
+              this.settings.policy(),
+              request.object,
+            )
+          )
+            throw new ControlError(403, "permission_revoked", "Sprawdź aktualne uprawnienia.");
+        };
+        assertCurrent();
+        return { member: current.facts, policy: this.settings.policy(), assertCurrent };
+      },
       onCreated: (value) => {
         if (value.visibility === "private")
           this.enqueueEffect({

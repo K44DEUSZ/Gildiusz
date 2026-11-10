@@ -228,7 +228,13 @@ export class CaseService {
       if (error instanceof ModulePermissionError) throw new CaseError("permission_revoked");
       throw error;
     }
+    this.assertAuthority(result);
     return result;
+  }
+  private assertAuthority(authority: CaseAuthority): void {
+    const result: unknown = authority.assertCurrent?.();
+    if (result && typeof result === "object" && "then" in result)
+      throw new TypeError("Case authority guards must be synchronous.");
   }
   private changed(caseId: string, revision: number, generation?: number): CaseRecord {
     const value = this.read(caseId);
@@ -261,13 +267,20 @@ export class CaseService {
     requestId: string,
     input: unknown,
     apply: () => T,
+    authorities: readonly CaseAuthority[],
   ): T {
-    const result = this.jobs.idempotent<T | { retiredCaseId: string }>(
-      `case:${this.guildId}:${actor}:${operation}`,
-      key(requestId),
-      input,
-      apply,
-    );
+    const result = this.jobs.transaction(() => {
+      for (const authority of authorities) this.assertAuthority(authority);
+      const value = this.jobs.idempotent<T | { retiredCaseId: string }>(
+        `case:${this.guildId}:${actor}:${operation}`,
+        key(requestId),
+        input,
+        apply,
+      );
+      // Also fences synchronous enqueue hooks and replays; failures roll back the entire command.
+      for (const authority of authorities) this.assertAuthority(authority);
+      return value;
+    });
     if (result && typeof result === "object" && "retiredCaseId" in result)
       throw new CaseError("not_found");
     return result as T;
@@ -334,34 +347,46 @@ export class CaseService {
     const title = text(input.title, 140),
       content = text(input.content, 4000);
     input = { kind: input.kind, title, content };
-    await this.authority(actor, "cases.create");
-    return this.command(actor, "create", requestId, input, () => {
-      this.action(actor, "write");
-      const counts = this.jobs.db
-        .prepare(
-          "SELECT COUNT(*) AS count,COALESCE(SUM(owner_id=?),0) AS own FROM cases WHERE guild_id=? AND status NOT IN ('closed','rejected','implemented')",
-        )
-        .get(actor, this.guildId)!;
-      if (Number(counts.count) >= this.limit || Number(counts.own) >= this.authorLimit)
-        throw new CaseError("limit_exceeded");
-      const caseId = randomUUID(),
-        now = this.now(),
-        visibility =
-          input.kind === "suggestion" && this.options.suggestionVisibility === "immediate"
-            ? "public"
-            : "private";
-      this.jobs.db
-        .prepare(
-          "INSERT INTO cases (id,guild_id,owner_id,kind,visibility,title,content,status,revision,generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'new',1,1,?,?)",
-        )
-        .run(caseId, this.guildId, actor, input.kind, visibility, title, content, now, now);
-      const value = this.read(caseId);
-      const created: unknown = this.options.onCreated?.(value);
-      if (created && typeof created === "object" && "then" in created)
-        throw new TypeError("Case creation hooks must be synchronous.");
-      const job = this.event(value, actor, "created", visibility === "public" ? "public" : "staff");
-      return this.result(caseId, job);
-    });
+    const authority = await this.authority(actor, "cases.create");
+    return this.command(
+      actor,
+      "create",
+      requestId,
+      input,
+      () => {
+        this.action(actor, "write");
+        const counts = this.jobs.db
+          .prepare(
+            "SELECT COUNT(*) AS count,COALESCE(SUM(owner_id=?),0) AS own FROM cases WHERE guild_id=? AND status NOT IN ('closed','rejected','implemented')",
+          )
+          .get(actor, this.guildId)!;
+        if (Number(counts.count) >= this.limit || Number(counts.own) >= this.authorLimit)
+          throw new CaseError("limit_exceeded");
+        const caseId = randomUUID(),
+          now = this.now(),
+          visibility =
+            input.kind === "suggestion" && this.options.suggestionVisibility === "immediate"
+              ? "public"
+              : "private";
+        this.jobs.db
+          .prepare(
+            "INSERT INTO cases (id,guild_id,owner_id,kind,visibility,title,content,status,revision,generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'new',1,1,?,?)",
+          )
+          .run(caseId, this.guildId, actor, input.kind, visibility, title, content, now, now);
+        const value = this.read(caseId);
+        const created: unknown = this.options.onCreated?.(value);
+        if (created && typeof created === "object" && "then" in created)
+          throw new TypeError("Case creation hooks must be synchronous.");
+        const job = this.event(
+          value,
+          actor,
+          "created",
+          visibility === "public" ? "public" : "staff",
+        );
+        return this.result(caseId, job);
+      },
+      [authority],
+    );
   }
   async get(actor: string, caseId: string): Promise<CaseView> {
     const value = this.read(caseId);
@@ -478,7 +503,7 @@ export class CaseService {
   ): Promise<CaseMutation> {
     text(content, 4000);
     const before = this.read(caseId);
-    await this.authority(actor, internal ? "cases.note" : "cases.reply", before);
+    const authority = await this.authority(actor, internal ? "cases.note" : "cases.reply", before);
     return this.command(
       actor,
       internal ? "note" : "reply",
@@ -520,6 +545,7 @@ export class CaseService {
         );
         return this.result(caseId, job);
       },
+      [authority],
     );
   }
   async assign(
@@ -531,20 +557,27 @@ export class CaseService {
   ): Promise<CaseMutation> {
     if (assigneeId !== null) id(assigneeId);
     const before = this.read(caseId);
-    await this.authority(actor, "cases.assign", before);
-    if (assigneeId) await this.authority(assigneeId, "cases.assign", before);
-    return this.command(actor, "assign", requestId, { caseId, revision, assigneeId }, () => {
-      const value = this.changed(caseId, revision, before.generation);
-      this.open(value);
-      this.action(actor, "write");
-      this.jobs.db
-        .prepare(
-          "UPDATE cases SET assignee_id=?,revision=revision+1,updated_at=? WHERE guild_id=? AND id=?",
-        )
-        .run(assigneeId, this.now(), this.guildId, caseId);
-      const job = this.event(this.read(caseId), actor, "assigned", "staff");
-      return this.result(caseId, job);
-    });
+    const authorities = [await this.authority(actor, "cases.assign", before)];
+    if (assigneeId) authorities.push(await this.authority(assigneeId, "cases.assign", before));
+    return this.command(
+      actor,
+      "assign",
+      requestId,
+      { caseId, revision, assigneeId },
+      () => {
+        const value = this.changed(caseId, revision, before.generation);
+        this.open(value);
+        this.action(actor, "write");
+        this.jobs.db
+          .prepare(
+            "UPDATE cases SET assignee_id=?,revision=revision+1,updated_at=? WHERE guild_id=? AND id=?",
+          )
+          .run(assigneeId, this.now(), this.guildId, caseId);
+        const job = this.event(this.read(caseId), actor, "assigned", "staff");
+        return this.result(caseId, job);
+      },
+      authorities,
+    );
   }
   async transition(
     actor: string,
@@ -562,39 +595,46 @@ export class CaseService {
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
     };
     const before = this.read(caseId);
-    await this.authority(actor, "cases.transition", before);
-    return this.command(actor, "transition", requestId, { caseId, revision, input }, () => {
-      const value = this.changed(caseId, revision, before.generation);
-      if (!allowedCaseStatuses(value.kind, value.status).includes(input.status))
-        throw new CaseError("state_conflict");
-      if (
-        this.options.reasonRequiredStatuses?.includes(input.status as "accepted" | "rejected") &&
-        !input.reason?.trim()
-      )
-        throw new CaseError("invalid_input");
-      this.action(actor, "write");
-      const closed = ["closed", "rejected", "implemented"].includes(input.status),
-        now = this.now();
-      this.jobs.db
-        .prepare(
-          "UPDATE cases SET status=?,revision=revision+1,updated_at=?,closed_at=?,retention_at=? WHERE guild_id=? AND id=?",
+    const authority = await this.authority(actor, "cases.transition", before);
+    return this.command(
+      actor,
+      "transition",
+      requestId,
+      { caseId, revision, input },
+      () => {
+        const value = this.changed(caseId, revision, before.generation);
+        if (!allowedCaseStatuses(value.kind, value.status).includes(input.status))
+          throw new CaseError("state_conflict");
+        if (
+          this.options.reasonRequiredStatuses?.includes(input.status as "accepted" | "rejected") &&
+          !input.reason?.trim()
         )
-        .run(
-          input.status,
-          now,
-          closed ? now : null,
-          closed && value.visibility === "private" && this.retention !== null
-            ? now + this.retention
-            : null,
-          this.guildId,
-          caseId,
-        );
-      const description = input.reason
-        ? `${statusLabels[input.status]}\n${input.reason}`
-        : statusLabels[input.status];
-      const job = this.event(this.read(caseId), actor, "status_changed", "author", description);
-      return this.result(caseId, job);
-    });
+          throw new CaseError("invalid_input");
+        this.action(actor, "write");
+        const closed = ["closed", "rejected", "implemented"].includes(input.status),
+          now = this.now();
+        this.jobs.db
+          .prepare(
+            "UPDATE cases SET status=?,revision=revision+1,updated_at=?,closed_at=?,retention_at=? WHERE guild_id=? AND id=?",
+          )
+          .run(
+            input.status,
+            now,
+            closed ? now : null,
+            closed && value.visibility === "private" && this.retention !== null
+              ? now + this.retention
+              : null,
+            this.guildId,
+            caseId,
+          );
+        const description = input.reason
+          ? `${statusLabels[input.status]}\n${input.reason}`
+          : statusLabels[input.status];
+        const job = this.event(this.read(caseId), actor, "status_changed", "author", description);
+        return this.result(caseId, job);
+      },
+      [authority],
+    );
   }
   async approve(
     actor: string,
@@ -603,29 +643,36 @@ export class CaseService {
     revision: number,
   ): Promise<CaseMutation> {
     const before = this.read(caseId);
-    await this.authority(actor, "cases.transition", before);
-    return this.command(actor, "approve", requestId, { caseId, revision }, () => {
-      const value = this.changed(caseId, revision, before.generation);
-      if (value.kind !== "suggestion" || value.visibility !== "private")
-        throw new CaseError("state_conflict");
-      this.open(value);
-      this.action(actor, "write");
-      for (const pending of this.jobs.list({
-        guildId: this.guildId,
-        type: "case.notify",
-        objectId: caseId,
-        states: ["pending", "retry", "running", "unknown"],
-        limit: 500,
-      }))
-        this.jobs.cancel(pending.id);
-      this.jobs.db
-        .prepare(
-          "UPDATE cases SET visibility='public',approved_by=?,generation=generation+1,revision=revision+1,updated_at=? WHERE guild_id=? AND id=?",
-        )
-        .run(actor, this.now(), this.guildId, caseId);
-      const job = this.event(this.read(caseId), actor, "approved", "public");
-      return this.result(caseId, job);
-    });
+    const authority = await this.authority(actor, "cases.transition", before);
+    return this.command(
+      actor,
+      "approve",
+      requestId,
+      { caseId, revision },
+      () => {
+        const value = this.changed(caseId, revision, before.generation);
+        if (value.kind !== "suggestion" || value.visibility !== "private")
+          throw new CaseError("state_conflict");
+        this.open(value);
+        this.action(actor, "write");
+        for (const pending of this.jobs.list({
+          guildId: this.guildId,
+          type: "case.notify",
+          objectId: caseId,
+          states: ["pending", "retry", "running", "unknown"],
+          limit: 500,
+        }))
+          this.jobs.cancel(pending.id);
+        this.jobs.db
+          .prepare(
+            "UPDATE cases SET visibility='public',approved_by=?,generation=generation+1,revision=revision+1,updated_at=? WHERE guild_id=? AND id=?",
+          )
+          .run(actor, this.now(), this.guildId, caseId);
+        const job = this.event(this.read(caseId), actor, "approved", "public");
+        return this.result(caseId, job);
+      },
+      [authority],
+    );
   }
   async vote(
     actor: string,
@@ -635,36 +682,43 @@ export class CaseService {
   ): Promise<{ votes: CaseVotes; ownVote: 1 | -1 | null }> {
     if (value !== null && value !== 1 && value !== -1) throw new CaseError("invalid_input");
     const before = this.read(caseId);
-    await this.authority(actor, "cases.read", before);
+    const authority = await this.authority(actor, "cases.read", before);
     if (before.kind !== "suggestion" || before.visibility !== "public")
       throw new CaseError("approval_required");
     if (!this.options.voting?.enabled || !this.votingStatuses.has(before.status))
       throw new CaseError("voting_closed");
-    await this.authority(actor, "cases.vote", before);
-    return this.command(actor, "vote", requestId, { caseId, value }, () => {
-      const current = this.read(caseId);
-      if (current.generation !== before.generation) throw new CaseError("stale_generation");
-      if (!this.votingStatuses.has(current.status)) throw new CaseError("voting_closed");
-      this.action(actor, "vote");
-      const prior = this.jobs.db
-        .prepare("SELECT value FROM case_votes WHERE guild_id=? AND case_id=? AND user_id=?")
-        .get(this.guildId, caseId, actor);
-      if (value === null)
-        this.jobs.db
-          .prepare("DELETE FROM case_votes WHERE guild_id=? AND case_id=? AND user_id=?")
-          .run(this.guildId, caseId, actor);
-      else
-        this.jobs.db
-          .prepare(
-            "INSERT INTO case_votes VALUES (?,?,?,?,?) ON CONFLICT(guild_id,case_id,user_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-          )
-          .run(this.guildId, caseId, actor, value, this.now());
-      if ((prior ? Number(prior.value) : null) !== value)
-        this.jobs.db
-          .prepare("UPDATE cases SET votes_revision=votes_revision+1 WHERE guild_id=? AND id=?")
-          .run(this.guildId, caseId);
-      return { votes: this.votes(this.read(caseId)), ownVote: value };
-    });
+    const votingAuthority = await this.authority(actor, "cases.vote", before);
+    return this.command(
+      actor,
+      "vote",
+      requestId,
+      { caseId, value },
+      () => {
+        const current = this.read(caseId);
+        if (current.generation !== before.generation) throw new CaseError("stale_generation");
+        if (!this.votingStatuses.has(current.status)) throw new CaseError("voting_closed");
+        this.action(actor, "vote");
+        const prior = this.jobs.db
+          .prepare("SELECT value FROM case_votes WHERE guild_id=? AND case_id=? AND user_id=?")
+          .get(this.guildId, caseId, actor);
+        if (value === null)
+          this.jobs.db
+            .prepare("DELETE FROM case_votes WHERE guild_id=? AND case_id=? AND user_id=?")
+            .run(this.guildId, caseId, actor);
+        else
+          this.jobs.db
+            .prepare(
+              "INSERT INTO case_votes VALUES (?,?,?,?,?) ON CONFLICT(guild_id,case_id,user_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            )
+            .run(this.guildId, caseId, actor, value, this.now());
+        if ((prior ? Number(prior.value) : null) !== value)
+          this.jobs.db
+            .prepare("UPDATE cases SET votes_revision=votes_revision+1 WHERE guild_id=? AND id=?")
+            .run(this.guildId, caseId);
+        return { votes: this.votes(this.read(caseId)), ownVote: value };
+      },
+      [authority, votingAuthority],
+    );
   }
 
   private lease(job: Job): Job {

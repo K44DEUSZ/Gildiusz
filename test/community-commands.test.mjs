@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import {
   ChannelType,
+  GuildChannelManager,
   MessageFlags,
   PermissionFlagsBits as P,
   PermissionsBitField,
@@ -17,6 +18,7 @@ import {
 import { ModuleRuntime } from "../dist/bot/module-runtime.js";
 import { Store } from "../dist/storage/store.js";
 import { noMentions } from "../dist/shared/utils.js";
+import { submitReport } from "../dist/bot/reports.js";
 
 const guildId = "700000000000000001",
   ownerId = "700000000000000002",
@@ -262,7 +264,7 @@ function fixture(t, { beta = true } = {}) {
   };
 }
 
-test("community registration exposes four guild-only commands and leaves legacy reports alone", () => {
+test("community registration keeps the existing report command registration", () => {
   const values = communityCommands();
   assert.deepEqual(
     values.map((command) => command.name),
@@ -284,7 +286,7 @@ test("community registration exposes four guild-only commands and leaves legacy 
 test("unrelated commands and buttons are ignored without a reply or membership fetch", async (t) => {
   const f = fixture(t);
   for (const value of [
-    f.interaction("zglos", "utworz"),
+    f.interaction("ustawienia", "utworz"),
     f.interaction("", "", {}, { customId: "another:button" }),
   ]) {
     assert.equal(await communityInteraction(f.runtime(), value.value), false);
@@ -292,6 +294,307 @@ test("unrelated commands and buttons are ignored without a reply or membership f
     assert.equal(value.deferred.length, 0);
   }
   assert.deepEqual(f.order, []);
+  assert.equal(f.requests.length, 0);
+});
+
+function prepareReport(f) {
+  f.people.get(botId).permissions = flags(P.ManageChannels | P.ManageRoles);
+  f.runtime().context.config = { moderation: { reportCooldownSeconds: 60 } };
+  f.store().putResource("channel.moderation", "channel", textId, {});
+  f.store()
+    .db.prepare("INSERT OR IGNORE INTO control_configuration VALUES (?,?)")
+    .run(guildId, JSON.stringify({ modules: { reports: true }, reports: { channelId: textId } }));
+  const channel = f.channels.get(textId);
+  channel.isTextBased = () => true;
+  channel.isThread = () => false;
+  channel.messages = {
+    async fetch(options) {
+      assert.deepEqual(options, { message: "700000000000000031", force: true });
+      return { id: options.message };
+    },
+  };
+  return () =>
+    f.store().db.prepare("SELECT body FROM control_configuration WHERE guild=?").get(guildId).body;
+}
+
+test("report alias creates one private case through the shared backend and replays after restart", async (t) => {
+  const f = fixture(t),
+    legacy = prepareReport(f),
+    before = legacy(),
+    input = { powod: "Opis problemu bez osobnego tematu" },
+    result = await f.run("zglos", "", input);
+  assert.match(result.last(), /Sprawa została zapisana.*Widoczność: prywatna/);
+  assert.deepEqual(f.order.slice(0, 4), ["defer", "guild", "roles", "member"]);
+  const row = f.store().db.prepare("SELECT * FROM cases").get();
+  assert.equal(row.kind, "report");
+  assert.equal(row.title, "Zgłoszenie");
+  assert.equal(row.content, input.powod);
+  assert.equal(row.visibility, "private");
+  assert.equal(f.requests[0][1], "cases.create");
+  assert.equal(f.requests[0][4], "discord_" + result.value.id);
+  assert.equal(f.requests[0][0].owner, false);
+  assert.equal(f.requests[0][0].manageGuild, false);
+  assert.equal(
+    f.store().db.prepare("SELECT COUNT(*) n FROM events WHERE kind='report'").get().n,
+    0,
+  );
+  assert.equal(
+    f.store().db.prepare("SELECT COUNT(*) n FROM jobs WHERE type='community.case-channel'").get().n,
+    1,
+  );
+  assert.equal(legacy(), before);
+  f.reopen();
+  prepareReport(f);
+  assert.equal(await communityInteraction(f.runtime(), result.value), true);
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 1);
+  assert.equal(
+    f.store().db.prepare("SELECT COUNT(*) n FROM jobs WHERE type='community.case-channel'").get().n,
+    1,
+  );
+  assert.equal(legacy(), before);
+  assert.equal(f.effects.length, 0);
+  result.value.options.getString = (key) =>
+    key === "powod" ? "Inny opis tej samej interakcji" : null;
+  await communityInteraction(f.runtime(), result.value);
+  assert.match(result.last(), /Ta próba ma już inne zapisane dane/);
+  assert.equal(f.store().db.prepare("SELECT content FROM cases").get().content, input.powod);
+});
+
+test("case OFF leaves the original report destination and event-only storage in use", async (t) => {
+  const f = fixture(t),
+    legacy = prepareReport(f),
+    before = legacy();
+  const settings = f.runtime().settings.read();
+  f.runtime().settings.save(
+    { ...settings, enabled: { ...settings.enabled, cases: false } },
+    ownerId,
+  );
+  const command = f.interaction("zglos", "", { powod: "Opis na dawnym kanale" });
+  assert.equal(await communityInteraction(f.runtime(), command.value), false);
+  assert.equal(command.deferred.length, 0);
+  const sent = [];
+  f.runtime().context.member = async () => f.people.get(userId);
+  f.runtime().context.texts = { reportSent: "Przekazano zgłoszenie." };
+  f.runtime().context.textChannel = async (key) => {
+    assert.equal(key, "moderation");
+    return {
+      id: textId,
+      send: async (payload) => {
+        sent.push(payload);
+        return { id: "700000000000000032" };
+      },
+    };
+  };
+  await command.value.deferReply({ flags: MessageFlags.Ephemeral });
+  await submitReport(f.runtime().context, command.value);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].allowedMentions, noMentions);
+  assert.equal(
+    f.store().db.prepare("SELECT channel FROM events WHERE kind='report'").get().channel,
+    textId,
+  );
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 0);
+  assert.equal(legacy(), before);
+});
+
+test("enabled cases never fall back to legacy reports when configuration or bot access is missing", async (t) => {
+  for (const missing of ["category", "permissions", "role", "beta"]) {
+    await t.test(missing, async (t) => {
+      const f = fixture(t, { beta: missing !== "beta" });
+      prepareReport(f);
+      if (missing === "category") {
+        const settings = f.runtime().settings.read();
+        f.runtime().settings.save(
+          { ...settings, cases: { ...settings.cases, categoryId: "" } },
+          ownerId,
+        );
+      }
+      if (missing === "permissions") f.people.get(botId).permissions = flags();
+      if (missing === "role") f.roles.delete(staffRole);
+      const writes = f.store().db.prepare("SELECT total_changes() n").get().n;
+      const result = await f.run("zglos", "", {
+        powod: "Prywatny opis nie może trafić na stary kanał",
+      });
+      assert.ok(/konfiguracji|uprawnienia bota|niedostępna/.test(result.last()));
+      assert.equal(f.store().db.prepare("SELECT total_changes() n").get().n, writes);
+      assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 0);
+      assert.equal(f.effects.length, 0);
+      assert.equal(f.requests.length, 0);
+    });
+  }
+});
+
+test("report alias checks fresh ordinary-member eligibility before any write", async (t) => {
+  for (const kind of ["pending", "timeout", "bot", "departed", "foreign"]) {
+    await t.test(kind, async (t) => {
+      const f = fixture(t);
+      prepareReport(f);
+      if (kind === "pending") f.people.get(userId).pending = true;
+      if (kind === "timeout") f.people.get(userId).timedOut = true;
+      if (kind === "bot") f.people.get(userId).user.bot = true;
+      if (kind === "departed") f.people.delete(userId);
+      const writes = f.store().db.prepare("SELECT total_changes() n").get().n;
+      const result = await f.run(
+        "zglos",
+        "",
+        { powod: "Nie zapisuj nieuprawnionej sprawy" },
+        kind === "foreign" ? { guildId: strangerId } : {},
+      );
+      assert.ok(!result.last().includes("została zapisana"));
+      assert.equal(f.store().db.prepare("SELECT total_changes() n").get().n, writes);
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.effects.length, 0);
+    });
+  }
+});
+
+test("report alias preserves old input limits and cooldown without blocking the same receipt", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  for (const powod of ["  ", "ab", "x".repeat(1001)]) {
+    const result = await f.run("zglos", "", { powod });
+    assert.match(result.last(), /od 3 do 1000/);
+  }
+  assert.equal(f.requests.length, 0);
+  const first = await f.run("zglos", "", { powod: "x".repeat(1000) });
+  assert.match(first.last(), /Sprawa została zapisana/);
+  assert.equal(await communityInteraction(f.runtime(), first.value), true);
+  assert.match(first.last(), /Sprawa została zapisana/);
+  assert.match((await f.run("zglos", "", { powod: "Kolejna sprawa" })).last(), /Odczekaj/);
+  t.mock.timers.tick(60001);
+  assert.match(
+    (await f.run("zglos", "", { powod: "Po odczekaniu" })).last(),
+    /Sprawa została zapisana/,
+  );
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 2);
+  assert.equal(f.effects.length, 0);
+});
+
+test("report links remain guild-scoped and require current message visibility", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  const link = `https://discord.com/channels/${guildId}/${textId}/700000000000000031`;
+  assert.match(
+    (
+      await f.run("zglos", "", {
+        powod: "Problem z wiadomością",
+        wiadomosc: link.replace(guildId, strangerId),
+      })
+    ).last(),
+    /z tego serwera/,
+  );
+  const channel = f.channels.get(textId),
+    original = channel.permissionsFor;
+  channel.permissionsFor = (member) => (member.id === userId ? flags() : original(member));
+  assert.match(
+    (await f.run("zglos", "", { powod: "Problem z wiadomością", wiadomosc: link })).last(),
+    /Nie masz dostępu/,
+  );
+  assert.equal(f.requests.length, 0);
+  channel.permissionsFor = original;
+  assert.match(
+    (await f.run("zglos", "", { powod: "Problem z wiadomością", wiadomosc: link })).last(),
+    /Sprawa została zapisana/,
+  );
+  assert.equal(
+    f.store().db.prepare("SELECT content FROM cases").get().content,
+    `Problem z wiadomością\n\n${link}`,
+  );
+  assert.equal(f.effects.length, 0);
+});
+
+test("report preflight preserves Discord network failures instead of writing or falling back", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  for (const error of [
+    Object.assign(Error("private transport detail"), { status: 429 }),
+    Error("private network detail"),
+  ]) {
+    f.state.channelError = error;
+    const writes = f.store().db.prepare("SELECT total_changes() n").get().n;
+    const result = await f.run("zglos", "", { powod: "Nie publikuj podczas awarii" });
+    assert.match(result.last(), /Nie udało się potwierdzić wyniku/);
+    assert.equal(result.last().includes("private"), false);
+    assert.equal(f.store().db.prepare("SELECT total_changes() n").get().n, writes);
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.effects.length, 0);
+  }
+});
+
+test("report alias rejects a foreign category returned through the actual Discord SDK before writing", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  const manager = {
+    guild: { id: guildId },
+    client: {
+      rest: {
+        async get() {
+          return { id: categoryId, guild_id: strangerId, type: ChannelType.GuildCategory };
+        },
+      },
+    },
+  };
+  f.guild.channels.fetch = (id, options) =>
+    GuildChannelManager.prototype.fetch.call(manager, id, options);
+  const writes = f.store().db.prepare("SELECT total_changes() n").get().n;
+  assert.match(
+    (await f.run("zglos", "", { powod: "Nie zapisuj w obcym serwerze" })).last(),
+    /uprawnienia bota/,
+  );
+  assert.equal(f.store().db.prepare("SELECT total_changes() n").get().n, writes);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.effects.length, 0);
+});
+
+test("a private-thread report requires a forced membership read and never copies source message text", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  const channel = f.channels.get(textId);
+  channel.type = ChannelType.PrivateThread;
+  channel.isThread = () => true;
+  let reads = 0;
+  channel.members = {
+    async fetch(options) {
+      assert.deepEqual(options, { member: userId, force: true });
+      reads++;
+      return reads === 1 ? null : { id: userId };
+    },
+  };
+  channel.messages.fetch = async (options) => {
+    assert.equal(options.force, true);
+    return { id: options.message, content: "Source content must not be copied" };
+  };
+  const input = {
+    powod: "Sprawdź wiadomość z prywatnego wątku",
+    wiadomosc: `https://discord.com/channels/${guildId}/${textId}/700000000000000031`,
+  };
+  assert.match((await f.run("zglos", "", input)).last(), /Nie masz dostępu/);
+  assert.equal(f.requests.length, 0);
+  assert.match((await f.run("zglos", "", input)).last(), /Sprawa została zapisana/);
+  assert.equal(
+    f.store().db.prepare("SELECT content FROM cases").get().content.includes("Source content"),
+    false,
+  );
+  assert.equal(f.effects.length, 0);
+});
+
+test("a module-settings change during report preflight is rejected without a silent legacy send", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  f.guild.members.fetchMe = async () => {
+    const settings = f.runtime().settings.read();
+    f.runtime().settings.save(
+      { ...settings, enabled: { ...settings.enabled, cases: false } },
+      ownerId,
+    );
+    return f.people.get(botId);
+  };
+  assert.match(
+    (await f.run("zglos", "", { powod: "Nie wysyłaj po zmianie konfiguracji" })).last(),
+    /Dane zostały zmienione/,
+  );
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 0);
+  assert.equal(f.effects.length, 0);
   assert.equal(f.requests.length, 0);
 });
 
@@ -743,4 +1046,125 @@ test("an ordinary invited member cannot invite others or submit an ambiguous inv
     (await f.runtime().community.meetings.get(organizerId, id)).meeting.invitedUserIds,
     [userId],
   );
+});
+
+test("disabling cases during the final domain member fetch prevents a new report and its receipt", async (t) => {
+  const f = fixture(t);
+  prepareReport(f);
+  const fetch = f.guild.members.fetch.bind(f.guild.members);
+  let reads = 0;
+  f.guild.members.fetch = async (options) => {
+    if (++reads === 2) {
+      const settings = f.runtime().settings.read();
+      f.runtime().settings.save(
+        { ...settings, enabled: { ...settings.enabled, cases: false } },
+        ownerId,
+      );
+    }
+    return fetch(options);
+  };
+  const result = await f.run("zglos", "", { powod: "Nie zapisuj po wyłączeniu modułu." });
+  assert.equal(reads, 2);
+  assert.equal(f.runtime().settings.read().enabled.cases, false);
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, 0);
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM jobs").get().n, 0);
+  assert.equal(
+    f.store().db.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE scope LIKE 'case:%'").get()
+      .n,
+    0,
+  );
+  assert.equal(
+    f.store().db.prepare("SELECT COUNT(*) n FROM events WHERE kind='report'").get().n,
+    0,
+  );
+  assert.match(result.last(), /wyłączona lub jeszcze niedostępna/);
+  assert.equal(f.effects.length, 0);
+  const settings = f.runtime().settings.read();
+  f.runtime().settings.save(
+    { ...settings, enabled: { ...settings.enabled, cases: true } },
+    ownerId,
+  );
+  t.mock.timers.tick(60001);
+  assert.match(
+    (await f.run("zglos", "", { powod: "Nowa próba po ponownym włączeniu." })).last(),
+    /Sprawa została zapisana/,
+  );
+});
+
+test("changing case configuration during final authorization rejects create and exact replay", async (t) => {
+  for (const replay of [false, true]) {
+    await t.test(replay ? "existing receipt" : "new request", async (t) => {
+      const f = fixture(t);
+      prepareReport(f);
+      const first = replay ? await f.run("zglos", "", { powod: "Zachowaj dokładny zapis." }) : null;
+      const before = {
+        cases: f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n,
+        jobs: f.store().db.prepare("SELECT COUNT(*) n FROM jobs").get().n,
+        receipts: f
+          .store()
+          .db.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE scope LIKE 'case:%'")
+          .get().n,
+      };
+      const fetch = f.guild.members.fetch.bind(f.guild.members);
+      let reads = 0;
+      f.guild.members.fetch = async (options) => {
+        if (++reads === 2) {
+          const settings = f.runtime().settings.read();
+          f.runtime().settings.save(
+            { ...settings, cases: { ...settings.cases, categoryId: "" } },
+            ownerId,
+          );
+        }
+        return fetch(options);
+      };
+      const result =
+        first ?? f.interaction("zglos", "", { powod: "Nie używaj wcześniejszej kategorii." });
+      await communityInteraction(f.runtime(), result.value);
+      assert.match(result.last(), /Dane zostały zmienione/);
+      assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM cases").get().n, before.cases);
+      assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM jobs").get().n, before.jobs);
+      assert.equal(
+        f
+          .store()
+          .db.prepare("SELECT COUNT(*) n FROM idempotency_keys WHERE scope LIKE 'case:%'")
+          .get().n,
+        before.receipts,
+      );
+      assert.equal(f.effects.length, 0);
+    });
+  }
+});
+
+test("assignment rechecks the actor's earlier grant after awaiting the assignee", async (t) => {
+  const f = fixture(t);
+  await f.run("sprawa", "utworz", { temat: "Sprawa do obsługi", tresc: "Opis." });
+  const service = f.runtime().community.cases,
+    caseId = f.caseId();
+  const fetch = f.guild.members.fetch.bind(f.guild.members);
+  let reads = 0;
+  f.guild.members.fetch = async (options) => {
+    if (++reads === 2) f.people.get(staffId).roles.cache.clear();
+    return fetch(options);
+  };
+  const before = f.store().db.prepare("SELECT COUNT(*) n FROM jobs").get().n;
+  await assert.rejects(
+    service.assign(staffId, "assignment-after-revocation", caseId, 1, ownerId),
+    (error) => error.code === "permission_revoked",
+  );
+  assert.equal(reads, 2);
+  assert.equal(
+    f.store().db.prepare("SELECT assignee_id FROM cases WHERE id=?").get(caseId).assignee_id,
+    null,
+  );
+  assert.equal(f.store().db.prepare("SELECT COUNT(*) n FROM jobs").get().n, before);
+  assert.equal(
+    f
+      .store()
+      .db.prepare(
+        "SELECT COUNT(*) n FROM idempotency_keys WHERE request_id='assignment-after-revocation'",
+      )
+      .get().n,
+    0,
+  );
+  assert.equal(f.effects.length, 0);
 });

@@ -25,6 +25,7 @@ import { resolveLocalDateTime } from "../modules/announcements/schedule.js";
 import { noMentions } from "../shared/utils.js";
 import { freshMember } from "./module-permissions.js";
 import type { ModuleRuntime } from "./module-runtime.js";
+import { submitCaseReport } from "./reports.js";
 
 function command(name: string, description: string) {
   return new SlashCommandBuilder()
@@ -347,6 +348,14 @@ const errorMessages: Record<string, string> = {
   voting_closed: "Głosowanie na ten pomysł jest zamknięte.",
   idempotency_conflict:
     "Ta próba ma już inne zapisane dane. Sprawdź wynik przed wywołaniem nowej komendy.",
+  report_input: "Podaj opis problemu od 3 do 1000 znaków.",
+  report_link: "Podaj odnośnik do wiadomości z tego serwera.",
+  report_message_unavailable: "Nie masz dostępu do wskazanej wiadomości.",
+  report_cooldown: "Odczekaj chwilę przed kolejnym zgłoszeniem.",
+  cases_configuration_required:
+    "Obsługa spraw wymaga konfiguracji. Poproś administrację o wskazanie kategorii prywatnych spraw.",
+  cases_category_unavailable:
+    "Nie można teraz utworzyć prywatnej sprawy. Administracja powinna sprawdzić kategorię, role i uprawnienia bota.",
 };
 function safeError(error: unknown): string {
   if (
@@ -404,9 +413,13 @@ export async function communityInteraction(
   runtime: ModuleRuntime,
   interaction: Interaction,
 ): Promise<boolean> {
+  const report =
+    interaction.isChatInputCommand() &&
+    interaction.commandName === "zglos" &&
+    runtime.settings.read().enabled.cases;
   const slash =
     interaction.isChatInputCommand() &&
-    ["spotkanie", "ekipa", "sprawa", "pomysl"].includes(interaction.commandName);
+    (report || ["spotkanie", "ekipa", "sprawa", "pomysl"].includes(interaction.commandName));
   const button = interaction.isButton() && /^gildiusz:(meeting|case):/.test(interaction.customId);
   if (!slash && !button) return false;
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -420,6 +433,13 @@ export async function communityInteraction(
     });
   try {
     if (interaction.guildId !== runtime.context.guild.id) throw new ControlError(403, "guild", "");
+    if (report && interaction.isChatInputCommand()) {
+      const value = await submitCaseReport(runtime, interaction);
+      await reply(
+        `Sprawa została zapisana: \`${value.id}\`. Widoczność: prywatna. Stan sprawdzisz przez \`/sprawa stan\`.`,
+      );
+      return true;
+    }
     const { facts } = await freshMember(runtime.context.guild, interaction.user.id);
     const requestId = "discord_" + interaction.id;
     const call = (operation: ControlOperation, payload: unknown = {}, objectId?: string) =>

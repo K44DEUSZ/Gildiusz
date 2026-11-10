@@ -30,6 +30,8 @@ export interface CaseAuthorization {
 export interface CaseAuthority {
   member: MemberFacts;
   policy: ModulePolicy;
+  // Local revocation/settings fence for an already freshly authorized request; never performs IO.
+  assertCurrent?(): void;
 }
 export interface CaseOptions {
   guildId: string;
