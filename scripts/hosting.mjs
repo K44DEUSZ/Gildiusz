@@ -35,6 +35,9 @@ export function expectedRepository(remote) {
   return remote.toLowerCase() === repository.toLowerCase();
 }
 const environment = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH}` };
+// Daily recovery runs with an operator key. Resuming must not pass it to a long-lived process.
+for (const name of Object.keys(environment))
+  if (name.toUpperCase() === "BACKUP_ENCRYPTION_KEY") delete environment[name];
 
 function paths(root) {
   return {
@@ -93,6 +96,14 @@ export function checkedRun(runs, sha, branch) {
 
 export async function supervise(root, options = {}) {
   const p = paths(root);
+  const assertApplicationEnvironment = () => {
+    if (!options.workerArguments) {
+      const values = parseEnv(readFileSync(join(p.shared, ".env"), "utf8"));
+      if (Object.keys(values).some((name) => name.toUpperCase() === "BACKUP_ENCRYPTION_KEY"))
+        throw Error("Keep the backup key in the separate private operator environment.");
+    }
+  };
+  assertApplicationEnvironment();
   const supervisorRevision = basename(realpathSync(p.current));
   const previous = readJson(p.state);
   if (process.platform === "linux" && previous?.childPid && previous?.childBirth) {
@@ -170,6 +181,7 @@ export async function supervise(root, options = {}) {
           terminate();
         if (terminationAt && Date.now() - terminationAt > 20000) child.kill("SIGKILL");
       } else if (!stopping && !existsSync(p.pause) && Date.now() >= nextStart) {
+        assertApplicationEnvironment();
         release = desired;
         restartValue = requested;
         started = Date.now();
