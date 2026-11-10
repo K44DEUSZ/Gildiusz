@@ -145,60 +145,42 @@ test("a hanging transport factory cannot outlive the collector deadline or claim
   assert.equal((await f.catalog.inspectLocation()).inProgress, 1);
 });
 
-test("retiring a known deletion on the PC requires separately supplied fresh inventories from every known location", async (t) => {
-  const f = await backupFixture(t),
-    now = Date.now() + 1000;
+test("hard35 legacy retirement cannot become a fresh empty v1 offsite acknowledgement", async (t) => {
+  const f = await backupFixture(t);
+  let now = Date.now() + 1000;
   f.catalog.clock = () => now;
-  const host = new BackupCatalog({ root: join(f.root, "host"), clock: () => now });
   const ledgerRoot = join(f.dataRoot, "uninstall-retention");
   mkdirSync(ledgerRoot, { mode: 0o700 });
-  writeFileSync(
-    join(ledgerRoot, "900000000000000099.deleted.json"),
-    JSON.stringify({
-      format: 1,
-      guildId: "900000000000000099",
-      removedAt: now - 41 * 86400000,
-      purgedAt: now - 40 * 86400000,
-      outcome: "purged",
-    }),
-    { mode: 0o600 },
-  );
-  const before = await sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now: now - 1 });
-  await collectArchive(request(f, { latestLedger: before.envelope }));
-  await collectArchive(request(f, { catalog: host, latestLedger: before.envelope }));
-  const locations = await Promise.all([f.catalog.inspectLocation(), host.inspectLocation()]);
-  const retirementEvidence = {
-    knownLocationIds: locations.map((location) => location.id),
-    locations,
-    maxLocationAgeMs: 86400000,
-    legacyClassification: {
-      verifiedAt: now,
-      complete: true,
-      unknown: 0,
-      configuredLegacyGuildIds: [],
-    },
+  const decision = {
+    format: 1,
+    guildId: "900000000000000099",
+    removedAt: now - 40 * 86400000,
+    purgedAt: now - 35 * 86400000 + 1000,
+    outcome: "purged",
   };
-  const retired = await retireSourceDeletionLedgers({
-    dataRoot: f.dataRoot,
-    key: f.key,
-    now,
-    ...retirementEvidence,
+  writeFileSync(join(ledgerRoot, `${decision.guildId}.deleted.json`), JSON.stringify(decision), {
+    mode: 0o600,
   });
-  assert.equal(retired.state, "retired");
+  const before = await sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now });
+  await collectArchive(request(f, { latestLedger: before.envelope }));
+  now += 1000;
+  const retired = await retireSourceDeletionLedgers({ dataRoot: f.dataRoot, key: f.key, now });
+  assert.equal(retired.retiredCount, 1);
+  assert.equal(retired.state, "operator_block");
   await assert.rejects(
-    collectArchive(request(f, { latestLedger: retired.latest.envelope })),
-    (error) => error.code === "operator_block",
+    sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now }),
+    (error) => error.code === "source_retention_gap",
   );
-  const result = await collectArchive(
-    request(f, {
-      latestLedger: retired.latest.envelope,
-      ledgerRetirementEvidence: async () => retirementEvidence,
-    }),
+  const result = await collectArchive(request(f, { latestLedger: before.envelope }));
+  assert.equal(result.offsiteSuccess, false);
+  assert.equal(result.ledger.state, "proof_sync_required");
+  assert.equal(
+    readdirSync(join(f.catalog.root, "deletion-ledger")).some((name) =>
+      name.endsWith(".gldledger"),
+    ),
+    false,
   );
-  assert.equal(result.offsiteSuccess, true);
-  assert.equal(result.replayed, true);
 });
-
 for (const replayed of [false, true])
   test(`rotation during fresh ledger sync cannot acknowledge a removed ${replayed ? "replayed" : "new"} archive`, async (t) => {
     const f = await backupFixture(t),

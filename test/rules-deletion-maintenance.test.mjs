@@ -38,8 +38,8 @@ function fixture(overrides = {}) {
     activities = [],
     events = [],
     stores = new Map([
-      ["guild-a", { db: { id: "a" } }],
-      ["guild-b", { db: { id: "b" } }],
+      ["guild-a", { db: { id: "a" }, resource: () => undefined }],
+      ["guild-b", { db: { id: "b" }, resource: () => undefined }],
     ]);
   const ports = {
     dataRoot: "/private/data",
@@ -50,6 +50,11 @@ function fixture(overrides = {}) {
     Date: { now: () => 10000 },
     join,
     existsSync: () => true,
+    uninstallRetention: undefined,
+    sourceExists: () => false,
+    unverifiedRulesDeletionGapFile: "source-gap-unverified.json",
+    rulesDeletionInstallationKey: "retention.rules-deletion-installation",
+    rulesJournalMode: () => (overrides.existsSync?.() === false ? "legacy" : "format1"),
     errorCode: (error) => error.code ?? error.message,
     pruneRulesDeletionJournal: async () => {
       events.push("prune");

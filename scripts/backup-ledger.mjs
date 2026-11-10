@@ -27,7 +27,19 @@ import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
 } from "../dist/storage/recovery/lease.js";
-import { acquireLock } from "../dist/storage/lock.js";
+import {
+  assertGlobalDeletionEvidence,
+  acquireDeletionImportLock,
+  commitDeletionState,
+  compareGuildDeletion,
+  deletionDeadline,
+  deletionStateFile,
+  legacyDeletionGapFile,
+  pruneLockedDeletionArtifacts,
+  readDeletionState,
+  unverifiedDeletionGapFile,
+} from "./backup-deletion-state.mjs";
+import { decodeDeletionProofHistory } from "./backup-proof.mjs";
 
 export const deletionLedgerMaxAgeMs = 35 * 86400000;
 export const deletionLedgerMaxEvidenceAgeMs = 86400000;
@@ -98,6 +110,7 @@ function entriesOf(value, createdAt, maxFutureMs = 0) {
       seen.has(row.guildId) ||
       !integer(row.removedAt) ||
       !integer(row.purgedAt) ||
+      !integer(row.purgedAt + deletionLedgerMaxAgeMs) ||
       row.purgedAt < row.removedAt ||
       row.purgedAt > createdAt + maxFutureMs ||
       row.outcome !== "purged"
@@ -209,7 +222,15 @@ function keyOf(key, forbiddenKeys) {
     fail("invalid_key");
   }
 }
-export function readDeletionLedgerSourceForProof(dataRoot, now) {
+function readSourceEntries(dataRoot, now, forPrune = false) {
+  if (!forPrune)
+    for (const [name, code] of [
+      ["source-policy.json", "source_requires_v2"],
+      [legacyDeletionGapFile, "source_retention_gap"],
+      [deletionStateFile, "source_retention_gap"],
+      [unverifiedDeletionGapFile, "unverified_retention_gap"],
+    ])
+      if (!missing(join(dataRoot, "uninstall-retention", name))) fail(code);
   const directory = join(dataRoot, "uninstall-retention");
   if (missing(directory)) return [];
   const stat = lstatSync(directory);
@@ -218,6 +239,16 @@ export function readDeletionLedgerSourceForProof(dataRoot, now) {
   if (names.length > deletionLedgerLimits.entries * 2) fail("ledger_quota");
   const entries = [];
   for (const name of names) {
+    if (
+      forPrune &&
+      [
+        "source-policy.json",
+        legacyDeletionGapFile,
+        deletionStateFile,
+        unverifiedDeletionGapFile,
+      ].includes(name)
+    )
+      continue;
     const match = /^([0-9]{17,20})\.deleted\.json$/.exec(name),
       pending = /^[0-9]{17,20}\.pending\.json$/.test(name);
     if (!match && !pending) fail("operator_block");
@@ -262,7 +293,9 @@ export function readDeletionLedgerSourceForProof(dataRoot, now) {
         )
       )
         fail("invalid_ledger");
-      if (row.phase !== "prepared") fail("ledger_incomplete");
+      if (!["prepared", "committed", "hub_done", "files_done", "registry_done"].includes(row.phase))
+        fail("invalid_ledger");
+      if (row.phase !== "prepared" && !forPrune) fail("ledger_incomplete");
       continue;
     }
     if (row?.guildId !== match[1]) fail("invalid_ledger");
@@ -270,8 +303,10 @@ export function readDeletionLedgerSourceForProof(dataRoot, now) {
   }
   return entriesOf(entries, now);
 }
+export function readDeletionLedgerSourceForProof(dataRoot, now) {
+  return readSourceEntries(dataRoot, now);
+}
 
-const sourceEntries = readDeletionLedgerSourceForProof;
 export {
   sealLatestDeletionProof,
   verifyLatestDeletionProof,
@@ -279,7 +314,11 @@ export {
 } from "./backup-proof.mjs";
 
 /** Caller keeps its owned pause until this lease-protected latest snapshot is sealed. */
-async function withLockedSource({ dataRoot, key, forbiddenKeys = [], now = Date.now() }, task) {
+async function withLockedSource(
+  { dataRoot, key, forbiddenKeys = [], now = Date.now() },
+  task,
+  forPrune = false,
+) {
   optionsClock(now);
   if (!isAbsolute(dataRoot) || missing(dataRoot) || !lstatSync(dataRoot).isDirectory())
     fail("source_unavailable");
@@ -302,14 +341,18 @@ async function withLockedSource({ dataRoot, key, forbiddenKeys = [], now = Date.
     } catch {
       fail("source_quarantined");
     }
-    return task({ dataRoot, master, now, entries: sourceEntries(dataRoot, now) });
+    return task({ dataRoot, master, now, entries: readSourceEntries(dataRoot, now, forPrune) });
   } finally {
     master.fill(0);
     await release?.();
   }
 }
 export async function sealLatestDeletionLedger(options) {
-  return withLockedSource(options, ({ entries, master, now }) => encode(entries, master, now));
+  return withLockedSource(options, ({ entries, master, now }) => {
+    if (entries.some((e) => e.purgedAt + deletionLedgerMaxAgeMs <= now))
+      fail("source_retention_expired");
+    return encode(entries, master, now);
+  });
 }
 export function verifyLatestDeletionLedger({
   envelope,
@@ -326,7 +369,24 @@ export function verifyLatestDeletionLedger({
   try {
     const verified = decode(envelope, master, now, maxFutureMs);
     if (now - verified.meta.createdAt > maxAgeMs) fail("stale_ledger");
+    if (now >= deletionDeadline({ createdAt: verified.meta.createdAt, guilds: verified.entries }))
+      fail("expired_decision");
     return verified;
+  } finally {
+    master.fill(0);
+  }
+}
+/** Authenticates history for watermark/TTL; it does not assert freshness or permit restore. */
+export function decodeDeletionLedgerHistory({
+  envelope,
+  key,
+  forbiddenKeys = [],
+  now = Date.now(),
+}) {
+  optionsClock(now, 0);
+  const master = keyOf(key, forbiddenKeys);
+  try {
+    return decode(envelope, master, now, 0);
   } finally {
     master.fill(0);
   }
@@ -488,75 +548,139 @@ export function assessDeletionLedgerRetention({
 }
 
 /** Explicit operator policy only; no caller is allowed to fabricate the location inventories. */
-export async function retireSourceDeletionLedgers({
-  dataRoot,
-  key,
-  forbiddenKeys = [],
-  now = Date.now(),
-  knownLocationIds,
-  locations,
-  maxLocationAgeMs,
-  legacyClassification,
-}) {
-  return withLockedSource(
-    { dataRoot, key, forbiddenKeys, now },
-    ({ dataRoot, master, now, entries }) => {
-      const assessment = assessDeletionLedgerRetention({
-        entries,
-        now,
-        knownLocationIds,
-        locations,
-        maxLocationAgeMs,
-        legacyClassification,
+export async function retireSourceDeletionLedgers(options) {
+  const { dataRoot, key, forbiddenKeys = [] } = options,
+    now = options.now ?? Date.now();
+  optionsClock(now, 0);
+  const retirementEvidence = {
+    knownLocationIds: options.knownLocationIds,
+    locations: options.locations,
+    maxLocationAgeMs: options.maxLocationAgeMs,
+    canonicalInventory: options.canonicalInventory,
+  };
+  const approved = (entry, at) => {
+    try {
+      return assertGlobalDeletionEvidence({
+        ...retirementEvidence,
+        gap: { unsafeBefore: entry.purgedAt },
+        now: at,
       });
-      if (assessment.state === "operator_block")
+    } catch {
+      return false;
+    }
+  };
+  const retire = (root, master, entries, lifecycle) => {
+    const directory = join(root, "uninstall-retention");
+    const terminal = entries.filter((e) => e.purgedAt + deletionLedgerMaxAgeMs <= now);
+    const pendingTerminal = terminal.some(
+      (e) => !missing(join(directory, `${e.guildId}.pending.json`)),
+    );
+    const expired = terminal.filter((e) => missing(join(directory, `${e.guildId}.pending.json`)));
+    const legacyGap = !missing(join(directory, legacyDeletionGapFile))
+      ? readDeletionState({ directory, key: master, now, filename: legacyDeletionGapFile })
+      : null;
+    const previous = !missing(join(directory, deletionStateFile))
+      ? readDeletionState({ directory, key: master, now })
+      : null;
+    const unverified = !missing(join(directory, unverifiedDeletionGapFile));
+    if (!lifecycle && !expired.length) {
+      if (pendingTerminal || unverified || legacyGap || previous?.globalGap || previous?.sourceId)
         return {
           state: "operator_block",
-          retiredGuildIds: [],
+          retiredCount: 0,
           remainingCount: entries.length,
-          assessment,
-          latest: encode(entries, master, now),
+          reason: pendingTerminal ? "terminal_pending_cleanup_required" : "source_retention_gap",
         };
-      const eligible = new Set(
-        assessment.decisions
-          .filter((decision) => decision.state === "eligible")
-          .map((decision) => decision.guildId),
-      );
-      const directory = join(dataRoot, "uninstall-retention");
-      const files = entries
-        .filter((entry) => eligible.has(entry.guildId))
-        .map((entry) => {
-          const path = join(directory, `${entry.guildId}.deleted.json`),
-            bytes = boundedRead(path, 1024);
-          let current;
-          try {
-            current = entriesOf([JSON.parse(bytes.toString("utf8"))], now)[0];
-          } catch {
-            fail("invalid_ledger");
-          }
-          if (JSON.stringify(current) !== JSON.stringify(entry)) fail("source_changed");
-          return { guildId: entry.guildId, path, sha256: digest(bytes) };
-        });
-      // Recheck the complete removal set before the first unlink. The writer lease stays held.
-      for (const file of files)
-        if (digest(boundedRead(file.path, 1024)) !== file.sha256) fail("source_changed");
-      for (const file of files) unlinkSync(file.path);
-      if (files.length) syncDirectory(directory);
-      const remaining = sourceEntries(dataRoot, now);
       return {
-        state: files.length ? "retired" : "keep",
-        retiredGuildIds: files.map((file) => file.guildId),
-        remainingCount: remaining.length,
-        assessment,
-        latest: encode(remaining, master, now),
+        state: "keep",
+        retiredCount: 0,
+        remainingCount: entries.length,
+        latest: encode(entries, master, now),
       };
-    },
+    }
+    if (lifecycle)
+      for (const entry of expired) {
+        const witnessed = lifecycle.expiredRetired.some(
+          (e) =>
+            e.guildId === entry.guildId &&
+            e.removedAt === entry.removedAt &&
+            e.purgedAt === entry.purgedAt,
+        );
+        const gap = lifecycle.globalGap ?? previous?.globalGap;
+        if (!witnessed && !(gap && entry.purgedAt <= gap.unsafeBefore) && !approved(entry, now))
+          fail("operator_block");
+      }
+    if (!lifecycle) {
+      commitDeletionState({
+        directory,
+        key: master,
+        now,
+        filename: legacyDeletionGapFile,
+        gap: {
+          unsafeBefore: Math.max(...expired.map((e) => e.purgedAt)),
+          reason: "legacy_retention_expired",
+        },
+      });
+    } else {
+      commitDeletionState({
+        directory,
+        key: master,
+        now,
+        sourceCheckpoint: lifecycle,
+        retirementEvidence,
+        ...(lifecycle.globalGap
+          ? { gap: { unsafeBefore: lifecycle.globalGap.unsafeBefore, reason: "source_gap" } }
+          : {}),
+      });
+    }
+    const files = expired.map((entry) => {
+      const path = join(directory, `${entry.guildId}.deleted.json`),
+        bytes = boundedRead(path, 1024),
+        current = entriesOf([JSON.parse(bytes.toString("utf8"))], now)[0];
+      if (JSON.stringify(current) !== JSON.stringify(entry)) fail("source_changed");
+      return { path, sha256: digest(bytes) };
+    });
+    for (const file of files)
+      if (digest(boundedRead(file.path, 1024)) !== file.sha256) fail("source_changed");
+    for (const file of files) unlinkSync(file.path);
+    if (files.length) syncDirectory(directory);
+    const remaining = readSourceEntries(root, now, true);
+    const blocked =
+      pendingTerminal ||
+      !lifecycle ||
+      lifecycle.blocked ||
+      Boolean(lifecycle.globalGap) ||
+      Boolean(legacyGap) ||
+      unverified;
+    return {
+      state: blocked ? "operator_block" : files.length ? "retired" : "keep",
+      retiredCount: files.length,
+      remainingCount: remaining.length,
+      ...(blocked
+        ? { reason: pendingTerminal ? "terminal_pending_cleanup_required" : "source_retention_gap" }
+        : {}),
+    };
+  };
+  if (!missing(join(dataRoot, "uninstall-retention", "source-policy.json"))) {
+    const master = keyOf(key, forbiddenKeys);
+    try {
+      const { pruneRulesDeletionLifecycle } =
+        await import("../dist/storage/rules-deletion-lifecycle.js");
+      return await pruneRulesDeletionLifecycle(
+        { dataRoot, now, mayForgetRetired: approved },
+        (result, root) => retire(root, master, readSourceEntries(root, now, true), result),
+      );
+    } finally {
+      master.fill(0);
+    }
+  }
+  return withLockedSource(
+    options,
+    ({ dataRoot: root, master, entries }) => retire(root, master, entries, null),
+    true,
   );
 }
 const filename = (id) => `deletion-ledger-${id}.gldledger`;
-function readEnvelope(path) {
-  return boundedRead(path, deletionLedgerLimits.envelopeBytes);
-}
 function safeIndex(value) {
   return (
     exact(value, ["format", "id", "createdAt", "count", "sha256", "size", "file"]) &&
@@ -592,12 +716,11 @@ function preserveKnownDecisions(current, previous, retirementEvidence, now) {
         if (!old || entry.purgedAt > old.purgedAt) missingEntries.set(entry.guildId, entry);
         continue;
       }
-      if (
-        next.purgedAt < entry.purgedAt ||
-        (next.purgedAt === entry.purgedAt && next.removedAt !== entry.removedAt) ||
-        (next.purgedAt > entry.purgedAt && next.removedAt <= entry.purgedAt)
-      )
+      try {
+        compareGuildDeletion(entry, next);
+      } catch {
         fail("rollback_detected");
+      }
     }
   }
   if (missingEntries.size) {
@@ -611,55 +734,83 @@ function preserveKnownDecisions(current, previous, retirementEvidence, now) {
   }
 }
 
-export async function importLatestDeletionLedger({
-  directory,
-  envelope,
-  key,
-  forbiddenKeys = [],
-  now = Date.now(),
-  maxAgeMs,
-  maxFutureMs = 60000,
-  retirementEvidence,
-}) {
+function historyDecoder(master) {
+  return (bytes, kind, now) => {
+    if (kind === "proof") {
+      const value = decodeDeletionProofHistory({ envelope: bytes, key: master, now });
+      return { ...value, guilds: value.proof.guilds, acceptances: value.proof.acceptances };
+    }
+    const value = decode(bytes, master, now, 0);
+    return { ...value, guilds: value.entries, acceptances: [] };
+  };
+}
+export async function pruneImportedDeletionLedgers(options) {
+  const { directory, key, forbiddenKeys = [] } = options,
+    master = keyOf(key, forbiddenKeys),
+    clock = options.clock ?? (() => options.now ?? Date.now());
+  let release;
+  try {
+    privateDirectory(directory);
+    release = await acquireDeletionImportLock(directory);
+    const result = pruneLockedDeletionArtifacts({
+      directory,
+      key: master,
+      now: clock(),
+      decode: historyDecoder(master),
+    });
+    return {
+      removed: result.removed.length,
+      blocked: result.state?.globalGap !== null && Boolean(result.state?.globalGap),
+      watermark: result.state,
+    };
+  } catch (error) {
+    if (error instanceof BackupLedgerError) throw error;
+    fail(error.code ?? "operator_block");
+  } finally {
+    master.fill(0);
+    await release?.();
+  }
+}
+export async function importLatestDeletionLedger(options) {
+  let {
+    directory,
+    envelope,
+    key,
+    forbiddenKeys = [],
+    maxAgeMs,
+    maxFutureMs = 60000,
+    retirementEvidence,
+  } = options;
+  const clock = options.clock ?? (() => options.now ?? Date.now());
   const master = keyOf(key, forbiddenKeys);
   let release, temporary;
   try {
-    const current = verifyLatestDeletionLedger({
-      envelope,
-      key: master,
-      now,
-      maxAgeMs,
-      maxFutureMs,
-    });
     envelope = bytesOf(envelope);
     directory = privateDirectory(directory);
-    const lock = join(directory, ".deletion-ledger-import");
-    if (!missing(lock)) regularFile(lock);
     try {
-      release = await acquireLock(lock);
+      release = await acquireDeletionImportLock(directory);
     } catch {
       fail("import_busy");
     }
+    const pruned = pruneLockedDeletionArtifacts({
+      directory,
+      key: master,
+      now: clock(),
+      decode: historyDecoder(master),
+    });
+    if (
+      pruned.state?.sourceId ||
+      pruned.state?.globalGap ||
+      pruned.artifacts.some((a) => a.meta.format === 2)
+    )
+      fail("source_requires_v2");
+    const admit = () =>
+      verifyLatestDeletionLedger({ envelope, key: master, now: clock(), maxAgeMs, maxFutureMs });
+    let current = admit(),
+      now = clock();
     const indexPath = join(directory, "latest-deletion-ledger.json");
     privateDirectory(directory);
-    const all = readdirSync(directory),
-      files = all.filter((name) => /^deletion-ledger-[a-f0-9-]{36}\.gldledger$/.test(name));
-    if (
-      files.length > deletionLedgerLimits.importFiles ||
-      all.some(
-        (name) =>
-          /^\.deletion-ledger-.*\.tmp$/.test(name) ||
-          (name.startsWith("deletion-ledger-") && !files.includes(name)),
-      )
-    )
-      fail("operator_block");
-    const previous = files.map((file) => {
-      const match = /^deletion-ledger-([a-f0-9-]{36})\.gldledger$/.exec(file);
-      if (!uuid.test(match[1])) fail("invalid_index");
-      const verified = decode(readEnvelope(join(directory, file)), master, now, maxFutureMs);
-      if (verified.meta.id !== match[1]) fail("invalid_index");
-      return { ...verified, file };
-    });
+    const previous = pruned.artifacts.map((a) => ({ ...a, file: a.name }));
     let existingIndex;
     if (!missing(indexPath)) {
       try {
@@ -687,6 +838,9 @@ export async function importLatestDeletionLedger({
       temporary = undefined;
       syncDirectory(directory);
     }
+    current = admit();
+    now = clock();
+    commitDeletionState({ directory, key: master, now, incoming: current.meta });
     temporary = join(directory, `.deletion-ledger-${randomUUID()}.tmp`);
     writeFileSync(temporary, JSON.stringify({ ...current.meta, file }) + "\n", {
       flag: "wx",
@@ -703,7 +857,13 @@ export async function importLatestDeletionLedger({
         unlinkSync(join(directory, prior.file));
       }
     syncDirectory(directory);
+    await release();
+    release = undefined;
+    current = admit();
     return { ...current, path, indexPath, replay: existingIndex?.sha256 === current.meta.sha256 };
+  } catch (error) {
+    if (error instanceof BackupLedgerError) throw error;
+    fail(error.code ?? "operator_block");
   } finally {
     master.fill(0);
     try {

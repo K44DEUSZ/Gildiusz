@@ -6,10 +6,10 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredSnapshot, recoveryCommand, recoveryCredentials } from "./recovery.mjs";
 import { deploymentPause, startSupervisor, stopSupervisor } from "./hosting.mjs";
-import { sealLatestDeletionLedger } from "./backup-ledger.mjs";
+import { sealLatestDeletionProof } from "./backup-proof.mjs";
 import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
 import { archiveIdentity, BackupCatalog, backupFailure, backupDayMs } from "./backup-catalog.mjs";
-import { collectArchive } from "./backup-collector.mjs";
+import { collectArchive, pruneCollectedDeletionProofs } from "./backup-collector.mjs";
 
 export function planDailyBackup(entries, now = Date.now()) {
   if (!Number.isSafeInteger(now) || now < 0) backupFailure("invalid_backup_clock");
@@ -45,7 +45,9 @@ export async function captureStoppedBackup({
     await lifecyclePort.stop();
     const manifest = await snapshotPort.create({ outputPath });
     // This port also takes the data-root lease; it must run before writer resumption.
-    const sealedLedger = await snapshotPort.sealLatestLedger();
+    const sealedLedger = snapshotPort.sealLatestProof
+      ? await snapshotPort.sealLatestProof({ manifest })
+      : await snapshotPort.sealLatestLedger();
     if (afterSealed) await afterSealed({ manifest, sealedLedger });
     return { manifest, sealedLedger };
   } finally {
@@ -66,6 +68,7 @@ export async function runDailyBackup({
   revision = null,
   signal,
 }) {
+  await pruneCollectedDeletionProofs({ catalog, key, forbiddenKeys });
   const location = await catalog.inspectLocation();
   if (!location.complete) backupFailure("backup_reconciliation_required");
   const state = await catalog.read();
@@ -80,7 +83,12 @@ export async function runDailyBackup({
     existingArchivePath: outputPath,
     key,
     forbiddenKeys,
-    latestLedger: sealed.sealedLedger.envelope,
+    ...(sealed.sealedLedger.meta?.format === 2
+      ? {
+          latestProof: sealed.sealedLedger.envelope,
+          proofRequirements: sealed.sealedLedger.proofRequirements,
+        }
+      : { latestLedger: sealed.sealedLedger.envelope }),
     ledgerRetirementEvidence: sealed.sealedLedger.retirementEvidence,
     reason: "daily",
     revision,
@@ -101,6 +109,8 @@ export async function registerBeforeUpgrade({
   key,
   forbiddenKeys,
   latestLedger,
+  latestProof,
+  proofRequirements,
   ledgerRetirementEvidence,
   signal,
 }) {
@@ -114,6 +124,8 @@ export async function registerBeforeUpgrade({
     key,
     forbiddenKeys,
     latestLedger,
+    latestProof,
+    proofRequirements,
     ledgerRetirementEvidence,
     reason: "before-upgrade",
     revision: manifest.release,
@@ -227,12 +239,25 @@ function snapshotPorts(values) {
     create({ outputPath }) {
       return recoveryCommand("snapshot", { output: outputPath }, values);
     },
-    sealLatestLedger() {
-      return sealLatestDeletionLedger({
+    async sealLatestProof() {
+      const notBefore = Date.now(),
+        challenge = randomUUID();
+      const sealed = await sealLatestDeletionProof({
         dataRoot: options.dataRoot,
+        installations: options.guilds,
         ...recoveryCredentials(values),
-        now: Date.now(),
+        notBefore,
+        challenge,
       });
+      return {
+        ...sealed,
+        proofRequirements: {
+          expectedSourceId: sealed.meta.sourceId,
+          minSequence: sealed.meta.sequence,
+          notBefore,
+          challenge,
+        },
+      };
     },
   };
 }
@@ -293,10 +318,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const archivePath = resolve(options["--archive"]);
       if (dirname(archivePath) !== catalog.captures) backupFailure("backup_capture_not_owned");
       const configuration = configuredSnapshot(archivePath, process.env);
-      const ledger = await sealLatestDeletionLedger({
+      const notBefore = catalog.clock(),
+        challenge = randomUUID();
+      const ledger = await sealLatestDeletionProof({
         dataRoot: configuration.dataRoot,
+        installations: configuration.guilds,
         ...recoveryCredentials(process.env),
-        now: catalog.clock(),
+        notBefore,
+        challenge,
       });
       result = await registerBeforeUpgrade({
         catalog,
@@ -305,7 +334,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         upgradeId: options["--upgrade-id"],
         targetRevision: options["--target-revision"],
         ...recoveryCredentials(process.env),
-        latestLedger: ledger.envelope,
+        latestProof: ledger.envelope,
+        proofRequirements: {
+          expectedSourceId: ledger.meta.sourceId,
+          minSequence: ledger.meta.sequence,
+          notBefore,
+          challenge,
+        },
       });
       if (!result.offsiteSuccess) backupFailure("ledger_sync_required");
       rmSync(archivePath);

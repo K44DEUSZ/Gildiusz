@@ -12,7 +12,6 @@ import {
   lstatSync,
   openSync,
   readSync,
-  readdirSync,
   renameSync,
   unlinkSync,
 } from "node:fs";
@@ -25,16 +24,21 @@ import {
   withInput,
   writeAll,
 } from "../dist/storage/recovery/files.js";
-import { acquireLock } from "../dist/storage/lock.js";
-import { snapshotRulesDeletionJournal } from "../dist/storage/rules-deletion-journal.js";
 import {
   rulesDeletionRetentionMs,
   validateRulesDeletion,
 } from "../dist/modules/server-rules/deletion-outbox.js";
+import { decodeDeletionLedgerHistory } from "./backup-ledger.mjs";
 import {
-  readDeletionLedgerSourceForProof,
-  assessDeletionLedgerRetention,
-} from "./backup-ledger.mjs";
+  assertGlobalDeletionEvidence,
+  acquireDeletionImportLock,
+  commitDeletionState,
+  compareGuildDeletion,
+  deletionDeadline,
+  deletionTerminalAgeMs,
+  pruneLockedDeletionArtifacts,
+  readDeletionState,
+} from "./backup-deletion-state.mjs";
 
 const magic = Buffer.from("GLDPRF02"),
   info = "gildiusz-latest-deletion-proof-v2",
@@ -100,7 +104,7 @@ function validate(body, now, maxFutureMs) {
     !integer(body.sequence) ||
     body.sequence < 1 ||
     !integer(body.createdAt) ||
-    !integer(body.createdAt + deletionProofLimits.maxFreshnessMs) ||
+    !integer(body.createdAt + deletionTerminalAgeMs) ||
     body.createdAt > now + maxFutureMs ||
     !integer(body.coveredFrom) ||
     body.coveredFrom > body.createdAt ||
@@ -108,7 +112,6 @@ function validate(body, now, maxFutureMs) {
     body.complete !== true ||
     JSON.stringify(body.coverage) !== JSON.stringify(["guilds", "rules_acceptances"]) ||
     !Array.isArray(body.guildIds) ||
-    !body.guildIds.length ||
     body.guildIds.length > deletionProofLimits.guilds ||
     body.guildIds.some((id) => !guildId(id)) ||
     new Set(body.guildIds).size !== body.guildIds.length ||
@@ -128,6 +131,7 @@ function validate(body, now, maxFutureMs) {
       !guildId(entry.guildId) ||
       !integer(entry.removedAt) ||
       !integer(entry.purgedAt) ||
+      !integer(entry.purgedAt + deletionTerminalAgeMs) ||
       entry.removedAt > entry.purgedAt ||
       entry.purgedAt > body.createdAt ||
       entry.outcome !== "purged" ||
@@ -147,7 +151,7 @@ function validate(body, now, maxFutureMs) {
     const key = entry.guildId + ":" + entry.acceptanceId,
       sequence = entry.guildId + ":" + entry.sequence;
     if (
-      !body.guildIds.includes(entry.guildId) ||
+      (!body.guildIds.includes(entry.guildId) && !guilds.has(entry.guildId)) ||
       entry.retiredAt > body.createdAt ||
       entry.expiresAt <= body.createdAt ||
       ids.has(key) ||
@@ -157,6 +161,7 @@ function validate(body, now, maxFutureMs) {
     ids.add(key);
     sequences.add(sequence);
   }
+  if (new Set([...body.guildIds, ...guilds]).size > deletionProofLimits.guilds) fail("proof_quota");
   return body;
 }
 function metadata(bytes, body) {
@@ -166,10 +171,12 @@ function metadata(bytes, body) {
     sourceId: body.sourceId,
     sequence: body.sequence,
     createdAt: body.createdAt,
-    expiresAt: Math.min(
-      body.createdAt + deletionProofLimits.maxFreshnessMs,
-      ...body.acceptances.map((entry) => entry.expiresAt),
-    ),
+    expiresAt: deletionDeadline({
+      createdAt: body.createdAt,
+      guilds: body.guilds,
+      acceptances: body.acceptances,
+      maxAgeMs: deletionProofLimits.maxFreshnessMs,
+    }),
     coveredFrom: body.coveredFrom,
     guildCount: body.guilds.length,
     acceptanceCount: body.acceptances.length,
@@ -234,15 +241,18 @@ function decode(value, key, now, maxFutureMs) {
   }
 }
 /** Caller supplies the complete trusted installation inventory, not a client-selected guild list. */
-export async function sealLatestDeletionProof({
-  dataRoot,
-  installations,
-  key,
-  forbiddenKeys = [],
-  now = Date.now(),
-  notBefore,
-  challenge,
-}) {
+export async function sealLatestDeletionProof(options) {
+  const {
+    dataRoot,
+    installations,
+    key,
+    forbiddenKeys = [],
+    now: givenNow,
+    notBefore,
+    challenge,
+  } = options;
+  const readNow = options.clock ?? (() => givenNow ?? Date.now());
+  const now = readNow();
   clock(now);
   if (
     !integer(notBefore) ||
@@ -253,25 +263,50 @@ export async function sealLatestDeletionProof({
     fail("invalid_input");
   const master = keyOf(key, forbiddenKeys);
   try {
-    return await snapshotRulesDeletionJournal({ dataRoot, installations, now }, (journal, root) => {
-      const body = {
-        format: 2,
-        kind: "gildiusz-latest-deletion-proof",
-        id: randomUUID(),
-        sourceId: journal.sourceId,
-        sequence: journal.sequence,
-        createdAt: now,
-        coveredFrom: journal.coveredFrom,
-        challenge,
-        complete: true,
-        coverage: ["guilds", "rules_acceptances"],
-        guildIds: journal.inventory.map((i) => i.guildId),
-        guilds: readDeletionLedgerSourceForProof(root, now),
-        acceptances: journal.entries,
-      };
-      validate(body, now, 0);
-      return encode(body, master);
+    const { sealRulesDeletionLifecycleSnapshot, pruneRulesDeletionLifecycle } =
+      await import("../dist/storage/rules-deletion-lifecycle.js");
+    await pruneRulesDeletionLifecycle({
+      dataRoot,
+      ...(givenNow === undefined ? {} : { now: readNow() }),
     });
+    const sealed = await sealRulesDeletionLifecycleSnapshot(
+      { dataRoot, installations, ...(givenNow === undefined ? {} : { now: readNow() }) },
+      (journal) => {
+        if (!journal.complete || journal.blockers.length) fail("source_incomplete");
+        const now = readNow();
+        if (
+          now < journal.updatedAt ||
+          notBefore > now ||
+          now - notBefore > deletionProofLimits.maxFreshnessMs
+        )
+          fail("clock_rollback");
+        const body = {
+          format: 2,
+          kind: "gildiusz-latest-deletion-proof",
+          id: randomUUID(),
+          sourceId: journal.sourceId,
+          sequence: journal.sequence,
+          createdAt: now,
+          coveredFrom: journal.coveredFrom,
+          challenge,
+          complete: true,
+          coverage: ["guilds", "rules_acceptances"],
+          guildIds: journal.active.map((i) => i.guildId),
+          guilds: journal.retired.map(({ format, guildId, removedAt, purgedAt, outcome }) => ({
+            format,
+            guildId,
+            removedAt,
+            purgedAt,
+            outcome,
+          })),
+          acceptances: journal.entries,
+        };
+        validate(body, now, 0);
+        return encode(body, master);
+      },
+    );
+    if (readNow() >= sealed.meta.expiresAt) fail("expired_decision");
+    return sealed;
   } finally {
     master.fill(0);
   }
@@ -308,12 +343,34 @@ export function verifyLatestDeletionProof({
       (notBefore !== undefined && proof.createdAt < notBefore)
     )
       fail("stale_proof");
-    if (proof.acceptances.some((entry) => entry.expiresAt <= now)) fail("expired_decision");
+    if (
+      now >=
+      deletionDeadline({
+        createdAt: proof.createdAt,
+        guilds: proof.guilds,
+        acceptances: proof.acceptances,
+      })
+    )
+      fail("expired_decision");
     if (expectedSourceId !== undefined && proof.sourceId !== expectedSourceId)
       fail("source_changed");
     if (proof.sequence < minSequence) fail("rollback_detected");
     if (challenge !== undefined && proof.challenge !== challenge) fail("challenge_mismatch");
     return result;
+  } finally {
+    master.fill(0);
+  }
+}
+export function decodeDeletionProofHistory({
+  envelope,
+  key,
+  forbiddenKeys = [],
+  now = Date.now(),
+}) {
+  clock(now);
+  const master = keyOf(key, forbiddenKeys);
+  try {
+    return decode(envelope, master, now, 0);
   } finally {
     master.fill(0);
   }
@@ -389,20 +446,97 @@ function preserve(current, prior, now, retirementEvidence) {
     if (!next && (entry.expiresAt > now || proof.createdAt < entry.expiresAt)) fail("proof_shrink");
   }
   for (const id of old.guildIds)
-    if (!proof.guildIds.includes(id) && !proof.guilds.some((e) => e.guildId === id))
-      fail("inventory_changed");
+    if (
+      !proof.guildIds.includes(id) &&
+      !proof.guilds.some((e) => e.guildId === id && e.purgedAt >= old.createdAt)
+    ) {
+      if (
+        now < old.createdAt + deletionTerminalAgeMs ||
+        proof.createdAt < old.createdAt + deletionTerminalAgeMs
+      )
+        fail("inventory_changed");
+      try {
+        assertGlobalDeletionEvidence({
+          ...retirementEvidence,
+          gap: { unsafeBefore: old.createdAt },
+          now,
+        });
+      } catch {
+        fail("operator_block");
+      }
+    }
   const missing = [];
   for (const entry of old.guilds) {
     const next = proof.guilds.find((e) => e.guildId === entry.guildId);
-    if (next && JSON.stringify(next) !== JSON.stringify(entry)) fail("conflicting_deletion");
+    if (next) {
+      try {
+        compareGuildDeletion(entry, next);
+      } catch {
+        fail("conflicting_deletion");
+      }
+    }
     if (!next) missing.push(entry);
   }
   if (
     missing.length &&
-    assessDeletionLedgerRetention({ ...retirementEvidence, entries: missing, now }).state !==
-      "eligible"
+    missing.some(
+      (e) =>
+        now < e.purgedAt + deletionTerminalAgeMs ||
+        proof.createdAt < e.purgedAt + deletionTerminalAgeMs,
+    )
   )
     fail("proof_shrink");
+  if (missing.length) {
+    try {
+      assertGlobalDeletionEvidence({
+        ...retirementEvidence,
+        gap: { unsafeBefore: Math.max(...missing.map((e) => e.purgedAt)) },
+        now,
+      });
+    } catch {
+      fail("operator_block");
+    }
+  }
+}
+function proofHistory(master) {
+  return (bytes, kind, now) => {
+    const result =
+      kind === "proof"
+        ? decode(bytes, master, now, 0)
+        : decodeDeletionLedgerHistory({ envelope: bytes, key: master, now });
+    return {
+      ...result,
+      guilds: kind === "proof" ? result.proof.guilds : result.entries,
+      acceptances: kind === "proof" ? result.proof.acceptances : [],
+    };
+  };
+}
+export async function pruneImportedDeletionProofs(options) {
+  const { directory, key, forbiddenKeys = [] } = options,
+    master = keyOf(key, forbiddenKeys),
+    clock = options.clock ?? (() => options.now ?? Date.now());
+  let release;
+  try {
+    durablePrivateDirectory(directory);
+    release = await acquireDeletionImportLock(directory);
+    const result = pruneLockedDeletionArtifacts({
+      directory,
+      key: master,
+      now: clock(),
+      decode: proofHistory(master),
+    });
+    return {
+      removed: result.removed.length,
+      blocked: Boolean(result.state?.globalGap),
+      watermark: result.state,
+    };
+  } catch (error) {
+    if (error instanceof BackupProofError) throw error;
+    fail(error.code ?? "operator_block");
+  } finally {
+    master.fill(0);
+    await release?.();
+  }
 }
 /** Imported proof remains separate from backups and never clears restore quarantine. */
 export async function importLatestDeletionProof(options) {
@@ -413,41 +547,25 @@ export async function importLatestDeletionProof(options) {
   const bytes = Buffer.from(envelope),
     master = keyOf(key, forbiddenKeys);
   const verification = { ...options, envelope: bytes, key: master, forbiddenKeys: [] },
-    clock = () => options.now ?? Date.now(),
+    clock = options.clock ?? (() => options.now ?? Date.now()),
     admit = () => verifyLatestDeletionProof({ ...verification, now: clock() });
   let release, result;
   try {
     let current = admit();
     durablePrivateDirectory(directory);
     try {
-      release = await acquireLock(join(directory, ".deletion-proof-import"));
+      release = await acquireDeletionImportLock(directory);
       current = admit();
       const now = clock();
-      const names = readdirSync(directory),
-        files = names.filter((n) => /^deletion-proof-[a-f0-9-]{36}\.gldproof$/.test(n));
-      if (
-        files.length > deletionProofLimits.importFiles ||
-        names.length > deletionProofLimits.importFiles + 4
-      )
-        fail("proof_quota");
-      for (const name of names)
-        if (
-          !files.includes(name) &&
-          !["latest-proof.json", ".deletion-proof-import", ".deletion-proof-import.lock"].includes(
-            name,
-          )
-        )
-          fail("operator_block");
-      const previous = files.map((name) => {
-        const result = decode(
-          readBounded(join(directory, name), deletionProofLimits.envelopeBytes),
-          master,
-          now,
-          0,
-        );
-        if (fileName(result.meta.id) !== name) fail("invalid_index");
-        return result;
+      const pruned = pruneLockedDeletionArtifacts({
+        directory,
+        key: master,
+        now,
+        decode: proofHistory(master),
       });
+      const previous = pruned.artifacts.filter((a) => a.meta.format === 2),
+        legacy = pruned.artifacts.filter((a) => a.meta.format === 1),
+        files = pruned.artifacts.map((a) => a.name);
       const indexPath = join(directory, "latest-proof.json");
       try {
         lstatSync(indexPath);
@@ -458,24 +576,61 @@ export async function importLatestDeletionProof(options) {
         } catch {
           fail("invalid_index");
         }
-        if (
+        const matching =
           !exact(index, [...Object.keys(current.meta), "file"]) ||
-          !previous.some(
-            (p) =>
-              JSON.stringify({ ...p.meta, file: fileName(p.meta.id) }) === JSON.stringify(index),
-          )
-        )
-          fail("invalid_index");
+          !previous.some((p) =>
+            Object.entries({ ...p.meta, file: fileName(p.meta.id) }).every(([key, value]) =>
+              key === "expiresAt" ? integer(index.expiresAt) : index[key] === value,
+            ),
+          );
+        if (matching) {
+          const state = readDeletionState({ directory, key: master, now });
+          const retiredIndex =
+            state?.globalGap &&
+            exact(index, [...Object.keys(current.meta), "file"]) &&
+            index.format === 2 &&
+            uuid.test(index.id) &&
+            index.file === fileName(index.id) &&
+            /^[a-f0-9]{64}$/.test(index.sha256) &&
+            index.sourceId === state.sourceId &&
+            index.coveredFrom === state.coveredFrom &&
+            integer(index.sequence) &&
+            index.sequence <= state.minSequence &&
+            integer(index.createdAt) &&
+            index.createdAt <= state.updatedAt &&
+            ["expiresAt", "guildCount", "acceptanceCount", "size"].every((k) => integer(index[k]));
+          if (!retiredIndex) fail("invalid_index");
+          // The authenticated GID-free fence survives the interrupted payload/index retirement.
+          unlinkSync(indexPath);
+          syncDirectory(directory);
+        }
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
       for (const prior of previous) preserve(current, prior, now, retirementEvidence);
+      for (const prior of legacy)
+        for (const old of prior.entries) {
+          const next = current.proof.guilds.find((e) => e.guildId === old.guildId);
+          if (!next) fail("proof_shrink");
+          try {
+            compareGuildDeletion(old, next);
+          } catch {
+            fail("conflicting_deletion");
+          }
+        }
       const path = join(directory, fileName(current.meta.id)),
         replay = previous.some((p) => p.meta.sha256 === current.meta.sha256);
       current = admit();
       if (!replay) writeAtomic(directory, path, bytes);
       try {
         current = admit();
+        commitDeletionState({
+          directory,
+          key: master,
+          now: clock(),
+          incoming: current.meta,
+          retirementEvidence,
+        });
       } catch (error) {
         if (!replay) {
           regularFile(path);
@@ -501,6 +656,9 @@ export async function importLatestDeletionProof(options) {
     }
     // Lock acquisition/release are asynchronous; neither may carry a decision past its deadline.
     return { ...result, ...admit() };
+  } catch (error) {
+    if (error instanceof BackupProofError) throw error;
+    fail(error.code ?? "operator_block");
   } finally {
     master.fill(0);
   }

@@ -23,6 +23,7 @@ import {
   assessDeletionLedgerRetention,
   retireSourceDeletionLedgers,
   deletionLedgerMaxAgeMs,
+  pruneImportedDeletionLedgers,
   BackupLedgerError,
 } from "../scripts/backup-ledger.mjs";
 
@@ -275,16 +276,15 @@ test("new source snapshots cannot roll back known deletions or silently drop the
   );
   const eligible = entry().purgedAt + deletionLedgerMaxAgeMs,
     last = await sealLatestDeletionLedger({ ...f, now: eligible });
-  const retained = await importLatestDeletionLedger({
-    ...f,
-    ...last,
-    now: eligible,
-    maxAgeMs: 60000,
-    retirementEvidence: evidence(eligible),
-  });
-  assert.deepEqual(
-    retained.entries.map((row) => row.guildId),
-    [guildB],
+  await assert.rejects(
+    importLatestDeletionLedger({
+      ...f,
+      ...last,
+      now: eligible,
+      maxAgeMs: 60000,
+      retirementEvidence: evidence(eligible),
+    }),
+    fails("source_requires_v2"),
   );
   assert.equal(existsSync(imported.path), false);
 });
@@ -363,146 +363,141 @@ test("35-day retirement needs fresh complete inventories of every known place, i
   assert.equal(assessDeletionLedgerRetention({ entries: [row], now, ...old }).state, "eligible");
 });
 
-test("explicit source retirement removes only eligible exact records after every fresh location proves old copies absent", async (t) => {
+test("hard35 removes verified legacy source decisions even with an offline PC, and leaves a signed blocker", async (t) => {
   const f = fixture(t),
     old = entry(),
     now = old.purgedAt + deletionLedgerMaxAgeMs,
     young = entry(guildB, now - 1000);
   f.save(old);
   f.save(young);
-  const blockedEvidence = evidence(now);
-  blockedEvidence.locations[1].unknown = 1;
-  const blocked = await retireSourceDeletionLedgers({ ...f, now, ...blockedEvidence });
-  assert.equal(blocked.state, "operator_block");
-  assert.equal(blocked.remainingCount, 2);
-  assert.equal(existsSync(join(f.source, `${guildA}.deleted.json`)), true);
-  const retired = await retireSourceDeletionLedgers({ ...f, now, ...evidence(now) });
-  assert.equal(retired.state, "retired");
-  assert.deepEqual(retired.retiredGuildIds, [guildA]);
-  assert.equal(retired.remainingCount, 1);
+  const unavailable = evidence(now);
+  unavailable.locations[1].unknown = 1;
+  const result = await retireSourceDeletionLedgers({ ...f, now, ...unavailable });
+  assert.equal(result.state, "operator_block");
+  assert.equal(result.retiredCount, 1);
+  assert.equal(result.remainingCount, 1);
   assert.equal(existsSync(join(f.source, `${guildA}.deleted.json`)), false);
   assert.deepEqual(JSON.parse(readFileSync(join(f.source, `${guildB}.deleted.json`))), young);
-  assert.deepEqual(
-    verifyLatestDeletionLedger({ ...retired.latest, key: f.key, now, maxAgeMs: 60000 }).entries,
-    [young],
-  );
+  const gap = readFileSync(join(f.source, "source-gap.json"), "utf8");
+  assert.equal(gap.includes(guildA), false);
+  assert.equal(gap.includes(guildB), false);
+  await assert.rejects(sealLatestDeletionLedger({ ...f, now }), fails("source_retention_gap"));
   const retry = await retireSourceDeletionLedgers({ ...f, now, ...evidence(now) });
-  assert.equal(retry.state, "keep");
-  assert.deepEqual(retry.retiredGuildIds, []);
+  assert.equal(retry.state, "operator_block");
+  assert.equal(retry.retiredCount, 0);
+  assert.equal(readFileSync(join(f.source, "source-gap.json"), "utf8"), gap);
 });
 
-test("retirement cannot bypass the writer fence, restore quarantine, freshness or known pre-deletion copies", async (t) => {
-  const f = fixture(t),
-    old = entry(),
-    now = old.purgedAt + deletionLedgerMaxAgeMs;
-  f.save(old);
-  const release = await acquireDataRootLease(f.dataRoot);
-  try {
-    await assert.rejects(
-      retireSourceDeletionLedgers({ ...f, now, ...evidence(now) }),
-      fails("writer_active"),
-    );
-  } finally {
-    await release();
-  }
-  const present = evidence(now);
-  present.locations[0].copies = [{ id: "pre-delete-copy", createdAt: old.purgedAt }];
-  assert.equal(
-    (await retireSourceDeletionLedgers({ ...f, now, ...present })).state,
-    "operator_block",
-  );
-  assert.equal(
-    (
-      await retireSourceDeletionLedgers({
-        ...f,
-        now,
-        ...evidence(now),
-        maxLocationAgeMs: 35 * 86400000,
-      })
-    ).state,
-    "operator_block",
-  );
-  writeFileSync(join(f.dataRoot, "restore-quarantine.json"), "{invalid", { mode: 0o600 });
-  await assert.rejects(
-    retireSourceDeletionLedgers({ ...f, now, ...evidence(now) }),
-    fails("source_quarantined"),
-  );
-  assert.deepEqual(JSON.parse(readFileSync(join(f.source, `${guildA}.deleted.json`))), old);
-});
-
-test("source and PC keep deletion proof until a fresh complete operator inventory explicitly deconfigures its legacy guild", async (t) => {
+test("writer fence, quarantine and a missing key prevent source unlink before a durable authenticated gap", async (t) => {
   const f = fixture(t),
     old = entry(),
     now = old.purgedAt + deletionLedgerMaxAgeMs;
   f.save(old);
   const before = readFileSync(join(f.source, `${guildA}.deleted.json`)),
-    sealed = await sealLatestDeletionLedger({ ...f, now: now - 1 }),
-    imported = await importLatestDeletionLedger({ ...f, ...sealed, now, maxAgeMs: 60000 }),
-    index = readFileSync(imported.indexPath),
-    dropped = forge({ ...body([]), createdAt: now }, f.key),
-    safe = evidence(now).legacyClassification;
-  const classifications = [
+    release = await acquireDataRootLease(f.dataRoot);
+  try {
+    await assert.rejects(retireSourceDeletionLedgers({ ...f, now }), fails("writer_active"));
+  } finally {
+    await release();
+  }
+  writeFileSync(join(f.dataRoot, "restore-quarantine.json"), "{invalid", { mode: 0o600 });
+  await assert.rejects(retireSourceDeletionLedgers({ ...f, now }), fails("source_quarantined"));
+  rmSync(join(f.dataRoot, "restore-quarantine.json"));
+  await assert.rejects(retireSourceDeletionLedgers({ ...f, key: "", now }), fails("invalid_key"));
+  assert.deepEqual(readFileSync(join(f.source, `${guildA}.deleted.json`)), before);
+  const expired = await retireSourceDeletionLedgers({ ...f, now, ...evidence(now) });
+  assert.equal(expired.retiredCount, 1);
+  assert.equal(expired.state, "operator_block");
+});
+
+test("legacy offsite hard35 removes the expired encrypted proof while retaining only global antirollback and refusing v1 empty ACK", async (t) => {
+  const f = fixture(t),
+    old = entry(),
+    now = old.purgedAt + deletionLedgerMaxAgeMs;
+  f.save(old);
+  const sealed = await sealLatestDeletionLedger({ ...f, now: now - 1 }),
+    imported = await importLatestDeletionLedger({ ...f, ...sealed, now: now - 1, maxAgeMs: 60000 });
+  const result = await pruneImportedDeletionLedgers({ ...f, now });
+  assert.equal(result.removed, 1);
+  assert.equal(result.blocked, true);
+  assert.equal(existsSync(imported.path), false);
+  assert.equal(existsSync(imported.indexPath), false);
+  const state = readFileSync(join(f.directory, "deletion-watermark.json"), "utf8");
+  assert.equal(state.includes(guildA), false);
+  assert.throws(
+    () => verifyLatestDeletionLedger({ ...f, ...sealed, now, maxAgeMs: 60000 }),
+    fails("expired_decision"),
+  );
+  const dropped = forge({ ...body([]), createdAt: now }, f.key);
+  for (const retirementEvidence of [
     undefined,
-    { verifiedAt: now, complete: true, unknown: 0 },
-    { ...safe, complete: false },
-    { ...safe, unknown: 1 },
-    { ...safe, verifiedAt: now + 1 },
-    { ...safe, verifiedAt: now - 86400001 },
-    { ...safe, configuredLegacyGuildIds: [guildA, guildA] },
-    { ...safe, configuredLegacyGuildIds: ["not-a-guild"] },
-    { ...safe, configuredLegacyGuildIds: [guildA] },
-  ];
-  for (const legacyClassification of classifications) {
-    const input = evidence(now, { legacyClassification }),
-      assessment = assessDeletionLedgerRetention({ entries: [old], now, ...input });
-    assert.equal(assessment.state, "operator_block");
-    const blocked = await retireSourceDeletionLedgers({ ...f, now, ...input });
-    assert.equal(blocked.state, "operator_block");
-    assert.deepEqual(blocked.retiredGuildIds, []);
-    assert.deepEqual(readFileSync(join(f.source, `${guildA}.deleted.json`)), before);
+    evidence(now),
+    {
+      ...evidence(now),
+      canonicalInventory: { verifiedAt: now, complete: true, unknown: 0, untracked: 0 },
+    },
+  ])
     await assert.rejects(
       importLatestDeletionLedger({
         ...f,
         envelope: dropped,
         now,
         maxAgeMs: 60000,
-        retirementEvidence: input,
+        retirementEvidence,
       }),
-      fails("operator_block"),
+      fails("source_requires_v2"),
     );
-    assert.deepEqual(readFileSync(imported.indexPath), index);
-    assert.equal(existsSync(imported.path), true);
-  }
-  const referenced = assessDeletionLedgerRetention({
-    entries: [old],
-    now,
-    ...evidence(now, {
-      legacyClassification: { ...safe, configuredLegacyGuildIds: [guildA] },
-    }),
-  });
-  assert.equal(referenced.decisions[0].reason, "legacy_configuration_referenced");
-  // Exact one-day freshness and an unrelated configured guild do not invent a reference to this guild.
-  const complete = evidence(now, {
-    legacyClassification: {
-      ...safe,
-      verifiedAt: now - 86400000,
-      configuredLegacyGuildIds: [guildB],
-    },
-  });
-  const retired = await retireSourceDeletionLedgers({ ...f, now, ...complete });
-  assert.equal(retired.state, "retired");
-  assert.deepEqual(retired.retiredGuildIds, [guildA]);
-  const accepted = await importLatestDeletionLedger({
-    ...f,
-    ...retired.latest,
-    now,
-    maxAgeMs: 60000,
-    retirementEvidence: complete,
-  });
-  assert.equal(accepted.entries.length, 0);
-  assert.equal(existsSync(imported.path), false);
+  assert.equal(readFileSync(join(f.directory, "deletion-watermark.json"), "utf8"), state);
 });
 
+test("terminal pending pairs keep the first purge timestamp for their dedicated cleanup owner", async (t) => {
+  const f = fixture(t),
+    old = entry(),
+    now = old.purgedAt + deletionLedgerMaxAgeMs;
+  f.save(old);
+  const pending = {
+    format: 1,
+    guildId: guildA,
+    removedAt: old.removedAt,
+    phase: "registry_done",
+    public: true,
+    databasePath: join(f.dataRoot, "old.sqlite"),
+    databaseIdentity: { dev: "1", ino: "2" },
+    assetNames: [],
+  };
+  const path = join(f.source, `${guildA}.pending.json`);
+  writeFileSync(path, JSON.stringify(pending), { mode: 0o600 });
+  const result = await retireSourceDeletionLedgers({ ...f, now });
+  assert.equal(result.state, "operator_block");
+  assert.equal(result.reason, "terminal_pending_cleanup_required");
+  assert.equal(result.retiredCount, 0);
+  assert.deepEqual(JSON.parse(readFileSync(path)), pending);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.source, `${guildA}.deleted.json`))), old);
+});
+
+test("unverified gap presence blocks empty v1 seal, while an invalid signed gap cannot authorize any source unlink", async (t) => {
+  const f = fixture(t),
+    unsigned = join(f.source, "source-gap-unverified.json");
+  writeFileSync(unsigned, "{malformed", { mode: 0o600 });
+  await assert.rejects(
+    sealLatestDeletionLedger({ ...f, now: at }),
+    fails("unverified_retention_gap"),
+  );
+  const old = entry(),
+    now = old.purgedAt + deletionLedgerMaxAgeMs;
+  f.save(old);
+  writeFileSync(
+    join(f.source, "source-gap.json"),
+    JSON.stringify({ format: 1, body: {}, hmac: "a".repeat(64) }),
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    retireSourceDeletionLedgers({ ...f, now }),
+    (error) => error.code === "watermark_authentication_failed",
+  );
+  assert.deepEqual(JSON.parse(readFileSync(join(f.source, `${guildA}.deleted.json`))), old);
+  assert.equal(readFileSync(unsigned, "utf8"), "{malformed");
+});
 test("private path, link, unfinished-import and tampered-index guards never touch unrelated files", async (t) => {
   const f = fixture(t);
   f.save(entry());
@@ -515,7 +510,7 @@ test("private path, link, unfinished-import and tampered-index guards never touc
       now: at,
       maxAgeMs: 60000,
     }),
-    /public_html/,
+    fails("operator_block"),
   );
   mkdirSync(f.directory, { mode: 0o700 });
   const sentinel = join(f.directory, `.deletion-ledger-${randomUUID()}.tmp`);
@@ -568,7 +563,7 @@ test(
     chmodSync(f.directory, 0o777);
     await assert.rejects(
       importLatestDeletionLedger({ ...f, ...sealed, now: at, maxAgeMs: 60000 }),
-      /private|unrelated writers/,
+      fails("operator_block"),
     );
     assert.deepEqual(readdirSync(f.directory), []);
   },

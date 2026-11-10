@@ -156,7 +156,7 @@ test("format2 retains its historical requirements while format3 gates every back
     );
     writeFileSync(join(release, ".built"), sha);
     assert.equal(prepareRelease(directory, { ...manifest, runtimeFormat: 2 }, bytes), release);
-    assert.throws(() => assertUpdateRuntime(release), /require runtime format4/);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format5/);
     assertRuntimePackage(release, { format: 2 });
     assert.throws(() => assertRuntimePackage(release, { format: 3 }), /uninstall-retention/);
     writeFileSync(join(release, "dist/storage/uninstall-retention.js"), "format3");
@@ -167,7 +167,7 @@ test("format2 retains its historical requirements while format3 gates every back
       join(release, "build.json"),
       JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24, runtimeFormat: 3 }),
     );
-    assert.throws(() => assertUpdateRuntime(release), /require runtime format4/);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format5/);
     for (const name of [
       "backup-catalog",
       "backup-collector",
@@ -206,13 +206,34 @@ test("format2 retains its historical requirements while format3 gates every back
       writeFileSync(path, "format4");
     }
     writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 4 }));
-    assertUpdateRuntime(release);
+    assertRuntimePackage(release, { format: 4 });
+    assert.throws(() => assertUpdateRuntime(release), /format5/);
     for (const name of format4) {
       const path = join(release, name);
       unlinkSync(path);
-      assert.throws(() => assertRuntimePackage(release), /Missing runtime file/);
+      assert.throws(() => assertRuntimePackage(release, { format: 4 }), /Missing runtime file/);
       assertRuntimePackage(release, { format: 3 });
       writeFileSync(path, "format4");
+    }
+    const format5 = [
+      "scripts/backup-deletion-state.mjs",
+      "scripts/rules-deletion-lifecycle.mjs",
+      "dist/storage/rules-deletion-lifecycle.js",
+    ];
+    for (const name of format5) {
+      const path = join(release, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "format5");
+    }
+    writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 5 }));
+    assertUpdateRuntime(release);
+    for (const name of format5) {
+      const path = join(release, name);
+      unlinkSync(path);
+      assert.throws(() => assertRuntimePackage(release), /Missing runtime file/);
+      assert.throws(() => assertUpdateRuntime(release), /Missing runtime file/);
+      assertRuntimePackage(release, { format: 4 });
+      writeFileSync(path, "format5");
     }
   } finally {
     assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
@@ -230,7 +251,7 @@ test(
       const output = join(directory, "output");
       createPackage(process.cwd(), output, sha, "123");
       const metadata = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
-      assert.equal(metadata.runtimeFormat, 4);
+      assert.equal(metadata.runtimeFormat, 5);
       const release = prepareRelease(directory, metadata, readFileSync(join(output, archiveName)));
       assert.ok(existsSync(join(release, "dist", "bot", "main.js")));
       assert.ok(existsSync(join(release, "node_modules", "discord.js", "package.json")));
@@ -255,7 +276,7 @@ test("deployment rejects mismatched revisions, workflow runs, platforms, corrupt
     { platform: "win32" },
     { architecture: "arm64" },
     { nodeMajor: 26 },
-    { runtimeFormat: 5 },
+    { runtimeFormat: 6 },
     { size: 100000000 },
     { sha256: "bad" },
     { archive: "../file" },

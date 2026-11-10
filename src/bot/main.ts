@@ -8,7 +8,8 @@ import {
   PermissionFlagsBits as P,
   REST,
 } from "discord.js";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,7 +27,8 @@ import { BotContext } from "./context.js";
 import { AttachmentFilter } from "./attachments.js";
 import { discordRoomService, roomCommand } from "./rooms.js";
 import { submitReport } from "./reports.js";
-import { errorCode, noMentions } from "../shared/utils.js";
+import { errorCode, noMentions, SerialQueue } from "../shared/utils.js";
+import { regularFile } from "../storage/recovery/files.js";
 import { lintContent } from "../content.js";
 import { isManagedPinNotice } from "../shared/pin-notices.js";
 import { settingsInteraction } from "./settings-panel.js";
@@ -77,12 +79,19 @@ import {
   drainRulesDeletionOutbox,
   pruneRulesDeletionJournal,
 } from "../storage/rules-deletion-journal.js";
+import {
+  openRulesDeletionLifecycle,
+  rulesDeletionInstallationKey,
+  type RulesDeletionLifecycle,
+} from "../storage/rules-deletion-lifecycle.js";
 import type { MusicRehearsalOperator } from "./music-rehearsal-operator.js";
 import {
   GuildUninstallRetention,
   readUninstallMarker,
   recordGuildMembership,
   type PurgeOutcome,
+  type RetentionInstallation,
+  unverifiedRulesDeletionGapFile,
 } from "../storage/uninstall-retention.js";
 interface GuildRuntime {
   context: BotContext;
@@ -126,6 +135,7 @@ async function main(): Promise<void> {
   );
   const stores = new Map<string, Store>();
   const guildReleases = new Map<string, () => Promise<void>>();
+  const guildLeasePaths = new Map<string, string>();
   const openingStores = new Map<string, Promise<void>>();
   const releases: (() => Promise<void>)[] = [];
   const client = new Client({
@@ -182,15 +192,249 @@ async function main(): Promise<void> {
   let integrationDatabase: DatabaseSync | undefined;
   let twitchIngress: TwitchIngress | undefined;
   let audioRehearsal: MusicRehearsalOperator | null = null;
+  const deletionQueue = new SerialQueue();
+  let deletionLifecycle: RulesDeletionLifecycle | undefined;
   const epoch = (guildId: string) => guildEpochs.get(guildId) ?? 0;
   const bumpEpoch = (guildId: string) => guildEpochs.set(guildId, epoch(guildId) + 1);
-  async function openStore(installation: GuildInstallation): Promise<void> {
+  function rulesSourceError(code: string): Error & { code: string } {
+    return Object.assign(Error(code), { code });
+  }
+  function sourceExists(file: string): boolean {
+    try {
+      lstatSync(file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  }
+  function rulesJournalMode(): "legacy" | "format1" | "format2" {
+    const file = join(dataRoot, "rules-acceptance-deletions", "journal.json"),
+      policy = sourceExists(join(dataRoot, "uninstall-retention", "source-policy.json"));
+    if (!sourceExists(file)) {
+      if (policy) throw rulesSourceError("source_unavailable");
+      return "legacy";
+    }
+    if (regularFile(file) > 3 * 1024 * 1024) throw rulesSourceError("journal_quota");
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    if (value.format === 2) return "format2";
+    if (value.format === 1 && !policy) return "format1";
+    throw rulesSourceError("journal_upgrade_required");
+  }
+  function canonicalRulesInstallations(): GuildInstallation[] {
+    // Configuration and the durable registry are authoritative; neither Stores nor Gateway cache is inventory.
+    const configured =
+      publicInstallations && !process.env.GUILDS_PATH && !process.env.DISCORD_GUILD_ID
+        ? []
+        : loadInstallations();
+    const known = new Map(configured.map((row) => [row.guildId, row]));
+    const file = join(publicDirectory, "installations.json");
+    if (sourceExists(file)) {
+      if (regularFile(file) > 1024 * 1024) throw rulesSourceError("invalid_inventory");
+      const rows: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (!Array.isArray(rows) || rows.length > 1000) throw rulesSourceError("invalid_inventory");
+      const seen = new Set<string>();
+      for (const row of rows) {
+        if (
+          !row ||
+          typeof row.guildId !== "string" ||
+          !/^\d{17,20}$/.test(row.guildId) ||
+          typeof row.ownerId !== "string" ||
+          !/^\d{17,20}$/.test(row.ownerId) ||
+          seen.has(row.guildId)
+        )
+          throw rulesSourceError("invalid_inventory");
+        seen.add(row.guildId);
+        const previous = known.get(row.guildId);
+        if (previous) {
+          if (previous.ownerId !== row.ownerId) throw rulesSourceError("invalid_inventory");
+        } else
+          known.set(row.guildId, {
+            guildId: row.guildId,
+            ownerId: row.ownerId,
+            configPath: "",
+            databasePath: join(publicDirectory, row.guildId, "gildiusz.sqlite"),
+            public: true,
+          });
+      }
+    }
+    return [...known.values()];
+  }
+  function rulesLifecycle(): RulesDeletionLifecycle {
+    return (deletionLifecycle ??= openRulesDeletionLifecycle({
+      dataRoot,
+      readCanonicalInstallations: canonicalRulesInstallations,
+      ownership: {
+        assertHeld() {
+          if (!ownsDataRoot || stopping) throw rulesSourceError("writer_active");
+        },
+        assertGuildLease(guildId, file) {
+          if (!guildReleases.has(guildId) || guildLeasePaths.get(guildId) !== resolve(file))
+            throw rulesSourceError("guild_lease_required");
+        },
+        assertQuiescent() {
+          if (connected || initializing || controlTasks.size)
+            throw rulesSourceError("quiescence_required");
+        },
+      },
+    }));
+  }
+  function assertLegacyRulesDatabase(installation: Pick<GuildInstallation, "databasePath">): void {
+    regularFile(installation.databasePath);
+    const db = new DatabaseSync(installation.databasePath, { readOnly: true });
+    try {
+      if (
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources'").get() &&
+        db.prepare("SELECT 1 FROM resources WHERE key=?").get(rulesDeletionInstallationKey)
+      )
+        throw rulesSourceError("source_unavailable");
+    } finally {
+      db.close();
+    }
+  }
+  async function beforeStoreOpen(
+    installation: GuildInstallation,
+    pristine: boolean,
+  ): Promise<void> {
+    const mode = rulesJournalMode();
+    if (mode !== "format2") {
+      if (pristine) throw rulesSourceError("journal_upgrade_required");
+      assertLegacyRulesDatabase(installation);
+      return;
+    }
+    await deletionQueue.run(async () => {
+      const scope = await rulesLifecycle().classifyBeforeOpen(installation);
+      if (
+        scope.state === "retiring" ||
+        (!pristine && !["active", "admitting"].includes(scope.state))
+      )
+        throw rulesSourceError("installation_not_admitted");
+      if (
+        uninstallRetention?.status(installation.guildId) &&
+        !uninstallRetention.status(installation.guildId)!.reopenable
+      )
+        throw rulesSourceError("retirement_pending");
+    });
+  }
+  async function deferPublicRulesReservation(installation: GuildInstallation): Promise<boolean> {
+    if (!installation.public || rulesJournalMode() !== "format2") return false;
+    const state = await deletionQueue.run(() => rulesLifecycle().classifyBeforeOpen(installation));
+    if (!["untracked", "retired"].includes(state.state)) return false;
+    // The durable row is a reservation, not proof of pristine data or current Discord authority.
+    // A fresh owner/ManageGuild request can retry it; startup must never auto-admit its database.
+    registry.remove(installation.guildId);
+    configs.delete(installation.guildId);
+    const index = installations.findIndex((entry) => entry.guildId === installation.guildId);
+    if (index >= 0) installations.splice(index, 1);
+    return true;
+  }
+  async function assertRulesInstallationReady(installation: GuildInstallation): Promise<void> {
+    if (rulesJournalMode() !== "format2") {
+      assertLegacyRulesDatabase(installation);
+      return;
+    }
+    await deletionQueue.run(async () => {
+      const scope = await rulesLifecycle().classifyBeforeOpen(installation);
+      if (scope.state !== "active") throw rulesSourceError("installation_not_admitted");
+      const store = stores.get(installation.guildId);
+      if (!store) throw rulesSourceError("source_unavailable");
+      await rulesLifecycle().admitPristine({
+        guildId: installation.guildId,
+        store,
+        operationId: randomUUID(),
+        checkFence: () => !stopping && !purgingGuilds.has(installation.guildId),
+      });
+    });
+  }
+  async function rulesPurgeBridge(
+    installation: RetentionInstallation,
+    confirm: boolean,
+  ): Promise<void> {
+    const mode = rulesJournalMode();
+    if (mode === "format1") {
+      if (sourceExists(installation.databasePath)) assertLegacyRulesDatabase(installation);
+      return;
+    }
+    if (mode === "legacy") throw rulesSourceError("source_uninitialized");
+    await deletionQueue.run(async () => {
+      const port = rulesLifecycle(),
+        scope = await port.classifyBeforeOpen(installation);
+      if (!scope.epoch) throw rulesSourceError("installation_not_admitted");
+      const request = {
+        guildId: installation.guildId,
+        expectedEpoch: scope.epoch,
+        operationId: scope.operationId ?? randomUUID(),
+      };
+      if (confirm) await port.confirmRetired(request);
+      else await port.prepareRetirement(request);
+    });
+  }
+  async function repairRulesSources(sources: readonly [string, Store][]) {
+    return deletionQueue.run(async () => {
+      const port = rulesLifecycle();
+      await port.recoverPending({
+        checkFence: (guildId) => !stopping && !purgingGuilds.has(guildId),
+      });
+      const view = await port.snapshot();
+      const active = view.active.map(({ guildId }) => {
+        const store = sources.find(([id]) => id === guildId)?.[1];
+        if (!store) throw rulesSourceError("source_unavailable");
+        return { guildId, jobs: new JobStore(store.db) };
+      });
+      const drained = await port.drainActiveOutbox({ stores: active });
+      const current = await port.snapshot();
+      return { pending: drained.pending, complete: current.complete, blockers: current.blockers };
+    });
+  }
+  async function finishCommittedUninstalls(): Promise<void> {
+    if (!uninstallRetention) return;
+    const pending = uninstallRetention.pendingInstallations();
+    if (pending.length > 1000) throw rulesSourceError("journal_quota");
+    for (const installation of pending) {
+      if (stopping) return;
+      if (uninstallRetention.status(installation.guildId)?.phase === "prepared") continue;
+      const task = uninstallRetention.purge(installation, stores.get(installation.guildId), {
+        // Committed housekeeping never asks for new Discord authority or performs a new API lookup.
+        freshProof: async () => ({
+          state: "unknown",
+          observedAt: Date.now(),
+          source: "discord-rest",
+        }),
+        checkFence: () => !stopping,
+        withClosedGuild,
+      });
+      // The purge drains this guild's activity itself; tracking it there would wait on its own Promise.
+      track(task);
+      const result = await task;
+      if (result.state === "purged") {
+        const guildId = installation.guildId;
+        stores.delete(guildId);
+        configs.delete(guildId);
+        const index = installations.findIndex((entry) => entry.guildId === guildId);
+        if (index >= 0) installations.splice(index, 1);
+        registry.remove(guildId);
+        await guildReleases.get(guildId)?.();
+        guildReleases.delete(guildId);
+        guildLeasePaths.delete(guildId);
+        purgingGuilds.delete(guildId);
+        changing.delete(guildId);
+      }
+    }
+  }
+  async function openStore(installation: GuildInstallation, pristine = false): Promise<void> {
     if (stores.has(installation.guildId)) return;
     const pending = openingStores.get(installation.guildId);
     if (pending) return pending;
     const work = (async () => {
+      await beforeStoreOpen(installation, pristine);
+      const retained = guildReleases.get(installation.guildId);
+      if (
+        retained &&
+        guildLeasePaths.get(installation.guildId) !== resolve(installation.databasePath)
+      )
+        throw rulesSourceError("guild_lease_required");
       const release =
-        guildReleases.get(installation.guildId) ?? (await acquireLock(installation.databasePath));
+        retained ?? (await acquireLock(installation.databasePath, { createTarget: pristine }));
       try {
         if (stopping) throw Object.assign(Error("Startup stopped."), { code: "stopping" });
         stores.set(
@@ -198,9 +442,11 @@ async function main(): Promise<void> {
           new Store(installation.databasePath, installation.guildId),
         );
         guildReleases.set(installation.guildId, release);
+        guildLeasePaths.set(installation.guildId, resolve(installation.databasePath));
       } catch (error) {
         await release();
         guildReleases.delete(installation.guildId);
+        guildLeasePaths.delete(installation.guildId);
         throw error;
       }
     })().finally(() => openingStores.delete(installation.guildId));
@@ -219,17 +465,23 @@ async function main(): Promise<void> {
       return;
     }
     let installation = installations.find((entry) => entry.guildId === guildId);
+    let fallback = false;
     if (!installation) {
       const configured = legacy.find((entry) => entry.guildId === guildId);
       if (configured) {
         installation = configured;
-        installations.push(configured);
-        configs.set(guildId, loadConfig(configured.configPath));
+        fallback = true;
       }
     }
     if (!installation) return;
     await openStore(installation);
+    await assertRulesInstallationReady(installation);
     if (stopping || epoch(guildId) !== started || uninstalled.has(guildId)) return;
+    if (fallback) {
+      const config = loadConfig(installation.configPath);
+      installations.push(installation);
+      configs.set(guildId, config);
+    }
     const store = stores.get(guildId)!;
     recordGuildMembership(store, guildId, {
       state: "present",
@@ -286,12 +538,12 @@ async function main(): Promise<void> {
         guildId,
         await acquireLock(installation.databasePath, { createTarget: false }),
       );
+      guildLeasePaths.set(guildId, resolve(installation.databasePath));
     }
     const outcome = await work();
     if (outcome.store === "reopen") {
       const installation = installations.find((entry) => entry.guildId === guildId);
-      if (installation && !stores.has(guildId))
-        stores.set(guildId, new Store(installation.databasePath, guildId));
+      if (installation && !stores.has(guildId)) await openStore(installation);
       purgingGuilds.delete(guildId);
       changing.delete(guildId);
       jobRunner.resumeGuild(guildId);
@@ -359,15 +611,11 @@ async function main(): Promise<void> {
         if (index >= 0) installations.splice(index, 1);
         await guildReleases.get(guildId)?.();
         guildReleases.delete(guildId);
+        guildLeasePaths.delete(guildId);
         purgingGuilds.delete(guildId);
         changing.delete(guildId);
         jobRunner.resumeGuild(guildId);
-        if (
-          !uninstalled.has(guildId) &&
-          client.guilds.cache.has(guildId) &&
-          legacy.some((entry) => entry.guildId === guildId)
-        )
-          await presentInstallation(guildId);
+        // A return after a committed wipe needs explicit pristine enrollment, never legacy auto-create.
       }
       if (result.state === "pending" || result.state === "deferred") {
         const warning = `${result.state}:${result.phase ?? "preflight"}`;
@@ -397,7 +645,10 @@ async function main(): Promise<void> {
       path,
       JSON.stringify({
         ready,
-        degraded: guilds.some((guild) => !guild.ready) || retentionWarnings.size > 0,
+        degraded:
+          guilds.some((guild) => !guild.ready) ||
+          retentionWarnings.size > 0 ||
+          deletionProofState === "blocked",
         retentionWarnings: [...retentionWarnings].map(([guildId, state]) => ({ guildId, state })),
         rulesDeletionProof: { state: deletionProofState, code: deletionProofCode },
         guilds,
@@ -441,6 +692,8 @@ async function main(): Promise<void> {
     { onError: (code, jobId) => console.error(`Job ${jobId}: ${code}`) },
   );
   async function createRuntime(installation: GuildInstallation): Promise<GuildRuntime> {
+    const started = epoch(installation.guildId);
+    await assertRulesInstallationReady(installation);
     const config = configs.get(installation.guildId)!;
     const store = stores.get(installation.guildId)!;
     const environment = { ...credentials, ...installation };
@@ -450,6 +703,12 @@ async function main(): Promise<void> {
     await guild.channels.fetch();
     const me = await guild.members.fetchMe();
     if (me.permissions.has(P.Administrator)) throw new Error("Remove Administrator from the bot.");
+    if (
+      stopping ||
+      epoch(installation.guildId) !== started ||
+      uninstalled.has(installation.guildId)
+    )
+      throw rulesSourceError("operation_obsolete");
     const context = new BotContext(client, guild, store, config, environment, !installation.public);
     let assets: AnnouncementAssetStore | undefined;
     if (process.env.GILDIUSZ_BETA_MODULES === "1") {
@@ -638,13 +897,41 @@ async function main(): Promise<void> {
     if (!installation) {
       if (process.env.PUBLIC_INSTALLS !== "1" || !publicInstallations || !authorization.guild)
         throw new ControlError(404, "not_configured", "Ten serwer nie ma jeszcze konfiguracji.");
-      installation = publicInstallations.add(guildId, authorization.guild.ownerId);
-      await openStore(installation);
-      configs.set(guildId, publicConfig());
-      installations.push(installation);
-      runtime = await createRuntime(installation);
-      registry.register(installation);
-      registry.replace(guildId, runtime);
+      if (rulesJournalMode() !== "format2")
+        throw new ControlError(
+          503,
+          "source_not_ready",
+          "Dodawanie serwerów jest teraz niedostępne.",
+        );
+      if (uninstallRetention?.status(guildId) && !uninstallRetention.cancelPrepared(guildId))
+        throw new ControlError(409, "busy", "Trwa usuwanie poprzednich danych tego serwera.");
+      changing.add(guildId);
+      bumpEpoch(guildId);
+      const started = epoch(guildId);
+      try {
+        installation = publicInstallations.add(guildId, authorization.guild.ownerId);
+        await openStore(installation, true);
+        await deletionQueue.run(async () => {
+          const port = rulesLifecycle(),
+            scope = await port.classifyBeforeOpen(installation!);
+          await port.admitPristine({
+            guildId,
+            store: stores.get(guildId)!,
+            operationId: scope.operationId ?? randomUUID(),
+            checkFence: () =>
+              !stopping && epoch(guildId) === started && !purgingGuilds.has(guildId),
+          });
+        });
+        if (stopping || epoch(guildId) !== started) throw rulesSourceError("operation_obsolete");
+        configs.set(guildId, publicConfig());
+        if (!installations.some((entry) => entry.guildId === guildId))
+          installations.push(installation);
+        runtime = await createRuntime(installation);
+        registry.register(installation);
+        registry.replace(guildId, runtime);
+      } finally {
+        changing.delete(guildId);
+      }
     }
     if (!runtime)
       throw new ControlError(503, "not_ready", "Bot uruchamia ten serwer. Spróbuj za chwilę.");
@@ -742,25 +1029,46 @@ async function main(): Promise<void> {
 
   async function maintainRulesDeletionJournal(sources: readonly [string, Store][]): Promise<void> {
     try {
-      if (!existsSync(join(dataRoot, "rules-acceptance-deletions", "journal.json"))) {
-        deletionProofState = "uninitialized";
-        deletionProofCode = "source_uninitialized";
+      const metadata = uninstallRetention?.pruneTerminalMetadata(),
+        metadataBlocked = (metadata?.blocked ?? 0) > 0;
+      const mode = rulesJournalMode();
+      if (mode === "legacy") {
+        if (sources.some(([, store]) => store.resource(rulesDeletionInstallationKey)))
+          throw rulesSourceError("source_unavailable");
+        const blocked =
+          metadataBlocked ||
+          sourceExists(join(dataRoot, "uninstall-retention", unverifiedRulesDeletionGapFile));
+        deletionProofState = blocked ? "blocked" : "uninitialized";
+        deletionProofCode = blocked ? "unverified_retention_gap" : "source_uninitialized";
         return;
       }
       // UUID expiry must continue even if a source DB has gone away or the Gateway is down.
-      await pruneRulesDeletionJournal({ dataRoot });
+      if (mode === "format2") await deletionQueue.run(() => rulesLifecycle().pruneExpired());
+      else await pruneRulesDeletionJournal({ dataRoot });
       if (openingStores.size || changing.size) {
         deletionProofState = "blocked";
         deletionProofCode = "inventory_changing";
         return;
       }
       // A changed inventory fails closed; it must never reset coverage or omit prior decisions.
-      const result = await drainRulesDeletionOutbox({
-        dataRoot,
-        stores: sources.map(([guildId, store]) => ({ guildId, jobs: new JobStore(store.db) })),
-      });
-      deletionProofState = result.pending ? "blocked" : "ready";
-      deletionProofCode = result.pending ? "source_incomplete" : null;
+      const result =
+        mode === "format2"
+          ? await repairRulesSources(sources)
+          : await drainRulesDeletionOutbox({
+              dataRoot,
+              stores: sources.map(([guildId, store]) => ({
+                guildId,
+                jobs: new JobStore(store.db),
+              })),
+            });
+      const complete =
+        !metadataBlocked && !result.pending && (!("complete" in result) || result.complete);
+      deletionProofState = complete ? "ready" : "blocked";
+      deletionProofCode = complete
+        ? null
+        : metadataBlocked
+          ? "terminal_metadata_blocked"
+          : "source_incomplete";
       if (result.pending) deletionProofAt = Date.now() + 5000;
     } catch (error) {
       deletionProofState = "blocked";
@@ -920,6 +1228,7 @@ async function main(): Promise<void> {
         await jobRunner.stop();
         await Promise.all([...inFlight, ...controlTasks]);
         await Promise.allSettled([...openingStores.values()]);
+        await deletionQueue.drain();
         await Promise.all(
           registry.values().map(async (runtime) => {
             await runtime.filter.drain();
@@ -1296,37 +1605,64 @@ async function main(): Promise<void> {
         )
           ? undefined
           : null),
+      rulesDeletion: {
+        prepareRetirement: (installation) => rulesPurgeBridge(installation, false),
+        confirmRetired: (installation) => rulesPurgeBridge(installation, true),
+      },
     });
-    for (const installation of [...installations]) {
-      const pending = uninstallRetention.status(installation.guildId);
-      if (pending && !pending.reopenable) {
-        purgingGuilds.add(installation.guildId);
-        changing.add(installation.guildId);
-        registry.remove(installation.guildId);
-        continue;
-      }
-      if (
-        !existsSync(installation.databasePath) &&
-        uninstallRetention.deletionLedger(installation.guildId)
-      ) {
-        registry.remove(installation.guildId);
-        const index = installations.findIndex((entry) => entry === installation);
-        if (index >= 0) installations.splice(index, 1);
-        configs.delete(installation.guildId);
-        const replacement = publicInstallations
-          ?.values()
-          .find((entry) => entry.guildId === installation.guildId);
-        if (replacement && replacement.databasePath !== installation.databasePath) {
-          installations.push(replacement);
-          configs.set(replacement.guildId, publicConfig());
-          await openStore(replacement);
-          registry.register(replacement);
-        }
-        continue;
-      }
-      await openStore(installation);
+    let rulesStartupError: unknown;
+    try {
+      uninstallRetention.pruneTerminalMetadata();
+      const mode = rulesJournalMode();
+      if (mode === "format2") await deletionQueue.run(() => rulesLifecycle().pruneExpired());
+      else if (mode === "format1") await pruneRulesDeletionJournal({ dataRoot });
+    } catch (error) {
+      rulesStartupError = error;
+      deletionProofState = "blocked";
+      deletionProofCode = errorCode(error);
     }
-    if (process.env.GILDIUSZ_BETA_MODULES === "1") {
+    for (const installation of [...installations]) {
+      if (rulesStartupError) {
+        registry.remove(installation.guildId);
+        continue;
+      }
+      try {
+        const pending = uninstallRetention.status(installation.guildId);
+        if (pending && !pending.reopenable) {
+          purgingGuilds.add(installation.guildId);
+          changing.add(installation.guildId);
+          registry.remove(installation.guildId);
+          continue;
+        }
+        if (await deferPublicRulesReservation(installation)) continue;
+        if (
+          !existsSync(installation.databasePath) &&
+          uninstallRetention.deletionLedger(installation.guildId)
+        ) {
+          registry.remove(installation.guildId);
+          const index = installations.findIndex((entry) => entry === installation);
+          if (index >= 0) installations.splice(index, 1);
+          configs.delete(installation.guildId);
+          const replacement = publicInstallations
+            ?.values()
+            .find((entry) => entry.guildId === installation.guildId);
+          if (replacement && replacement.databasePath !== installation.databasePath) {
+            installations.push(replacement);
+            configs.set(replacement.guildId, publicConfig());
+            await openStore(replacement);
+            registry.register(replacement);
+          }
+          continue;
+        }
+        await openStore(installation);
+      } catch (error) {
+        rulesStartupError = error;
+        deletionProofState = "blocked";
+        deletionProofCode = errorCode(error);
+        registry.remove(installation.guildId);
+      }
+    }
+    if (!rulesStartupError && process.env.GILDIUSZ_BETA_MODULES === "1") {
       let integrationRelease: (() => Promise<void>) | undefined;
       try {
         const integration = twitchConfiguration(path);
@@ -1408,7 +1744,18 @@ async function main(): Promise<void> {
         console.error(`Integration data retention unavailable: ${errorCode(error)}`);
       }
     }
-    await client.login(credentials.token);
+    // A missing proof source may block activation, but never rolls back a committed privacy wipe.
+    await finishCommittedUninstalls();
+    if (rulesStartupError) throw rulesStartupError;
+    if (rulesJournalMode() === "format2") {
+      const proof = await repairRulesSources([...stores]);
+      deletionProofState = proof.complete && !proof.pending ? "ready" : "blocked";
+      deletionProofCode = proof.complete && !proof.pending ? null : "source_incomplete";
+      for (const installation of installations) {
+        if (stores.has(installation.guildId)) await assertRulesInstallationReady(installation);
+      }
+    }
+    if (!stopping) await client.login(credentials.token);
   } catch (error) {
     await stop();
     throw error;

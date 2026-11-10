@@ -10,6 +10,7 @@ import {
   rmSync,
   writeFileSync,
   unlinkSync,
+  existsSync,
   linkSync,
   symlinkSync,
 } from "node:fs";
@@ -32,6 +33,10 @@ import {
   drainRulesDeletionOutbox,
   pruneRulesDeletionJournal,
 } from "../dist/storage/rules-deletion-journal.js";
+import {
+  openRulesDeletionLifecycle,
+  upgradeRulesDeletionLifecycle,
+} from "../dist/storage/rules-deletion-lifecycle.js";
 import { acquireDataRootLease } from "../dist/storage/recovery/lease.js";
 import { acquireLock } from "../dist/storage/lock.js";
 import {
@@ -81,10 +86,42 @@ function fixture(t) {
     init() {
       return initializeRulesDeletionJournal({ dataRoot, installations, now: f.now });
     },
-    drain(extra = {}) {
-      return drainRulesDeletionOutbox({ dataRoot, stores: f.jobs(), now: f.now, ...extra });
+    async drain(extra = {}) {
+      if (f.journal().format !== 2)
+        return drainRulesDeletionOutbox({ dataRoot, stores: f.jobs(), now: f.now, ...extra });
+      const release = await acquireDataRootLease(dataRoot),
+        held = new Map();
+      let owned = true;
+      try {
+        for (const i of installations)
+          held.set(i.guildId, await acquireLock(i.databasePath, { createTarget: false }));
+        const port = openRulesDeletionLifecycle({
+          dataRoot,
+          clock: () => f.now,
+          readCanonicalInstallations: () => installations,
+          ownership: {
+            assertHeld() {
+              assert.equal(owned, true);
+            },
+            assertGuildLease(guildId) {
+              assert.equal(held.has(guildId), true);
+            },
+            assertQuiescent() {
+              assert.equal(owned, true);
+            },
+          },
+        });
+        return await port.drainActiveOutbox({ stores: f.jobs(), ...extra });
+      } finally {
+        owned = false;
+        for (const stop of held.values()) await stop();
+        await release();
+      }
     },
-    seal(extra = {}) {
+    async seal(extra = {}) {
+      const path = join(dataRoot, "rules-acceptance-deletions", "journal.json");
+      if (existsSync(path) && f.journal().format === 1)
+        await upgradeRulesDeletionLifecycle({ dataRoot, installations, now: f.now });
       return sealLatestDeletionProof({
         dataRoot,
         installations,
@@ -105,6 +142,19 @@ function fixture(t) {
         key,
         now: f.now,
         maxAgeMs: 60000,
+        retirementEvidence: {
+          knownLocationIds: ["host", "pc"],
+          maxLocationAgeMs: 60000,
+          canonicalInventory: { verifiedAt: f.now, complete: true, unknown: 0, untracked: 0 },
+          locations: ["host", "pc"].map((id) => ({
+            id,
+            verifiedAt: f.now,
+            complete: true,
+            unknown: 0,
+            inProgress: 0,
+            copies: [],
+          })),
+        },
         ...extra,
       });
     },
@@ -272,7 +322,7 @@ test("missing journal, inventory omission, wrong guild, active root/perDB writer
     await release();
   }
   await f.init();
-  await assert.rejects(f.seal({ installations: [f.installations[0]] }), code("inventory_changed"));
+  await assert.rejects(f.seal({ installations: [f.installations[0]] }), code("source_incomplete"));
   const dbRelease = await acquireLock(f.installations[1].databasePath, { createTarget: false });
   try {
     await assert.rejects(f.seal(), code("writer_active"));
@@ -281,7 +331,7 @@ test("missing journal, inventory omission, wrong guild, active root/perDB writer
   }
   const db = f.stores[0].db;
   db.prepare("INSERT INTO server_rules_deletion_state VALUES(?,0,0,NULL)").run(B);
-  await assert.rejects(f.seal(), code("guild_mismatch"));
+  await assert.rejects(f.seal(), code("source_incomplete"));
   db.prepare("DELETE FROM server_rules_deletion_state WHERE guild_id=?").run(B);
   writeFileSync(join(f.dataRoot, "restore-quarantine.json"), "{}");
   await assert.rejects(f.seal(), /quarantined/);
@@ -371,6 +421,7 @@ test("v2 verifies freshness/challenge/source/sequence and rejects tamper, wrong 
   f.add();
   await f.drain();
   const challenge = randomUUID(),
+    v1 = await sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now: f.now }),
     sealed = await f.seal({ challenge });
   const verify = (envelope, extra = {}) =>
     f.verify(envelope, {
@@ -408,7 +459,10 @@ test("v2 verifies freshness/challenge/source/sequence and rejects tamper, wrong 
     (b) => (b.complete = false),
   ])
     assert.throws(() => verify(forge(sealed.envelope, f.key, change)), code("invalid_proof"));
-  const v1 = await sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now: f.now });
+  await assert.rejects(
+    sealLatestDeletionLedger({ dataRoot: f.dataRoot, key: f.key, now: f.now }),
+    code("source_requires_v2"),
+  );
   assert.throws(() => verify(v1.envelope), code("invalid_envelope"));
   assert.throws(
     () =>
@@ -528,7 +582,7 @@ test("missing source entries and uncommitted SQLite work cannot be ACKed or decl
     journal = f.journal();
   journal.entries = [];
   writeFileSync(path, JSON.stringify(journal));
-  await assert.rejects(f.seal(), code("source_gap"));
+  await assert.rejects(f.seal(), code("source_incomplete"));
   f.stores[0].db.exec("BEGIN IMMEDIATE");
   try {
     await assert.rejects(f.drain(), code("uncommitted_source"));
@@ -554,7 +608,7 @@ test("journal and import reject hardlinks and source path escape", async (t) => 
   await f.import(sealed.envelope);
   const p = join(f.directory, "offsite", `deletion-proof-${sealed.meta.id}.gldproof`);
   linkSync(p, other);
-  await assert.rejects(f.import(sealed.envelope), /unlinked files/);
+  await assert.rejects(f.import(sealed.envelope), code("operator_block"));
 });
 
 test("crashed plaintext journal staging files are removed under lock but unknown files and linked staging files are preserved", async (t) => {
@@ -609,6 +663,7 @@ test(
     const {JobStore}=await import(${JSON.stringify(new URL("../dist/core/jobs/store.js", import.meta.url).href)});
     const {recordRulesDeletion,rulesDeletionState}=await import(${JSON.stringify(new URL("../dist/modules/server-rules/deletion-outbox.js", import.meta.url).href)});
     const {initializeRulesDeletionJournal,drainRulesDeletionOutbox}=await import(${JSON.stringify(new URL("../dist/storage/rules-deletion-journal.js", import.meta.url).href)});
+    const {upgradeRulesDeletionLifecycle}=await import(${JSON.stringify(new URL("../dist/storage/rules-deletion-lifecycle.js", import.meta.url).href)});
     const {sealLatestDeletionProof,importLatestDeletionProof}=await import(${JSON.stringify(new URL("../scripts/backup-proof.mjs", import.meta.url).href)});
     const installations=${JSON.stringify(f.installations)},root=${JSON.stringify(f.dataRoot)},now=${f.now},stores=installations.map(i=>new Store(i.databasePath,i.guildId));
     try {
@@ -621,6 +676,7 @@ test(
         assert.ok(globalThis.__proofSyncs.includes(join(root,'rules-acceptance-deletions')));
         assert.ok(globalThis.__proofSyncs.includes(root));
       }});
+      await upgradeRulesDeletionLifecycle({dataRoot:root,installations,now});
       const key=randomBytes(32),sealed=await sealLatestDeletionProof({dataRoot:root,installations,key,now,notBefore:now,challenge:randomUUID()});
       const parent=${JSON.stringify(f.directory)},directory=join(parent,'new-parent','new-offsite');globalThis.__proofSyncs=[];
       await importLatestDeletionProof({directory,envelope:sealed.envelope,key,now,maxAgeMs:60000});

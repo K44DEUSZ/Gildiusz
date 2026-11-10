@@ -443,7 +443,11 @@ export async function drainRulesDeletionOutbox(options: {
     journal.updatedAt = now;
     write(root, journal);
     options.checkpoint?.("journal_durable");
-    for (const batch of batches) acknowledgeRulesDeletions(batch.db, batch.entries, now);
+    for (const batch of batches) {
+      const ackNow = deletionInteger(options.now ?? Date.now());
+      if (ackNow < now) fail("clock_rollback");
+      acknowledgeRulesDeletions(batch.db, batch.entries, ackNow);
+    }
     return {
       written,
       acknowledged,

@@ -17,6 +17,7 @@ import {
 } from "../scripts/backup-scheduler.mjs";
 import { sealLatestDeletionLedger } from "../scripts/backup-ledger.mjs";
 import { backupFixture } from "./backup-fixture.mjs";
+import { backupV2Fixture } from "./backup-v2-fixture.mjs";
 
 test("daily scheduling uses UTC date, coalesces repeated ticks and never queues a missed-day backlog", () => {
   const now = Date.parse("2026-11-10T00:00:00Z");
@@ -195,7 +196,7 @@ test("before-upgrade registration authenticates exact snapshot, target and fresh
 });
 
 test("the real child CLI reads only fixture private env and returns minimal checkpoint identity before healthy acknowledgement", async (t) => {
-  const f = await backupFixture(t),
+  const f = await backupV2Fixture(t),
     upgradeId = randomUUID(),
     targetRevision = "b".repeat(40);
   const capture = join(f.catalog.captures, `${upgradeId}.gldbak`);

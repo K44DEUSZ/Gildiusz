@@ -17,6 +17,8 @@ import { privateDirectory, regularFile, syncDirectory } from "./recovery/files.j
 
 export const guildUninstallRetentionMs = 30 * 86400000;
 export const uninstallResourceKey = "retention.guild-uninstalled";
+export const unverifiedRulesDeletionGapFile = "source-gap-unverified.json";
+const terminalRetentionMs = 35 * 86400000;
 const proofLifetime = 30000;
 const snowflake = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9]{17,20}$/.test(value);
@@ -172,6 +174,10 @@ export interface GuildUninstallRetentionOptions {
   registry?: { remove(guildId: string): boolean; validateRemoval?(): void };
   clock?: () => number;
   onStage?: (phase: Phase) => void;
+  rulesDeletion?: {
+    prepareRetirement(installation: RetentionInstallation): Promise<void>;
+    confirmRetired(installation: RetentionInstallation): Promise<void>;
+  };
 }
 const assetName = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.(png|jpg|webp)$/;
 function absent(path: string): boolean {
@@ -214,6 +220,7 @@ export class GuildUninstallRetention {
   readonly #databaseRoots: readonly string[];
   readonly #clock: () => number;
   readonly #active = new Set<string>();
+  #metadataCursor = 0;
   constructor(private readonly options: GuildUninstallRetentionOptions) {
     if (!isAbsolute(options.dataRoot))
       throw new Error("Uninstall retention needs an absolute data root.");
@@ -244,11 +251,12 @@ export class GuildUninstallRetention {
       });
       renameSync(temporary, path);
       syncDirectory(this.#directory);
+      syncDirectory(dirname(this.#directory));
     } finally {
       rmSync(temporary, { force: true });
     }
   }
-  #read(guildId: string): PurgeJournal | null {
+  #read(guildId: string, terminalMetadata = false): PurgeJournal | null {
     const path = this.#path(guildId);
     if (absent(path)) return null;
     if (regularFile(path) > 128 * 1024) throw new Error("Invalid retention journal size.");
@@ -268,7 +276,22 @@ export class GuildUninstallRetention {
       value.assetNames.some((name) => !assetName.test(name))
     )
       throw new Error("Invalid retention journal.");
-    this.#databasePath(value.databasePath);
+    if (terminalMetadata) {
+      if (value.phase !== "registry_done") return null;
+      if (
+        Object.keys(value).sort().join(",") !==
+          "assetNames,databaseIdentity,databasePath,format,guildId,phase,public,removedAt" ||
+        Object.keys(value.databaseIdentity).sort().join(",") !== "dev,ino" ||
+        typeof value.databasePath !== "string" ||
+        value.databasePath.length > 1024 ||
+        value.databasePath.includes("\0") ||
+        !isAbsolute(value.databasePath)
+      )
+        throw new Error("Invalid terminal retention metadata.");
+      safeRemovalFile(path);
+      if (process.platform !== "win32" && (lstatSync(path).mode & 0o077) !== 0)
+        throw new Error("Terminal retention metadata must be private.");
+    } else this.#databasePath(value.databasePath);
     return value;
   }
   #databasePath(path: string): string {
@@ -327,6 +350,107 @@ export class GuildUninstallRetention {
   }
   deletionLedger(guildId: string): DeletionLedger | null {
     return readDeletionLedger(resolve(this.#directory, ".."), guildId);
+  }
+  #blockProof(unsafeBefore: number): void {
+    privateDirectory(this.#directory);
+    const now = this.#clock();
+    if (!timestamp(unsafeBefore) || !timestamp(now) || unsafeBefore > now)
+      throw new Error("Invalid retention gap clock.");
+    const path = join(this.#directory, unverifiedRulesDeletionGapFile),
+      temporary = path + `.${randomUUID()}.tmp`;
+    let blockedSince = now;
+    if (!absent(path)) {
+      if (regularFile(path) > 4096) throw new Error("Invalid retention gap marker.");
+      const previous = JSON.parse(readFileSync(path, "utf8"));
+      if (
+        previous.format !== 1 ||
+        previous.kind !== "gildiusz-retention-source-gap-unverified" ||
+        previous.reason !== "lifecycle_unavailable" ||
+        !timestamp(previous.blockedSince) ||
+        !timestamp(previous.unsafeBefore) ||
+        Object.keys(previous).sort().join(",") !== "blockedSince,format,kind,reason,unsafeBefore"
+      )
+        throw new Error("Invalid retention gap marker.");
+      blockedSince = Math.min(blockedSince, previous.blockedSince);
+      unsafeBefore = Math.max(unsafeBefore, previous.unsafeBefore);
+    }
+    try {
+      writeFileSync(
+        temporary,
+        JSON.stringify({
+          format: 1,
+          kind: "gildiusz-retention-source-gap-unverified",
+          blockedSince,
+          unsafeBefore,
+          reason: "lifecycle_unavailable",
+        }) + "\n",
+        { flag: "wx", mode: 0o600, flush: true },
+      );
+      renameSync(temporary, path);
+      syncDirectory(this.#directory);
+      syncDirectory(dirname(this.#directory));
+    } finally {
+      rmSync(temporary, { force: true });
+    }
+  }
+  /** Caller holds the data-root lease. No live guild or open database is needed. */
+  pruneTerminalMetadata(limit = 20): { removed: number; blocked: number } {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+      throw new Error("Invalid retention metadata limit.");
+    privateDirectory(this.#directory);
+    const temporary = readdirSync(this.#directory)
+      .filter((name) =>
+        /^(?:[0-9]{17,20}\.(?:pending|deleted)\.json|source-gap-unverified\.json)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/.test(
+          name,
+        ),
+      )
+      .slice(0, 64);
+    // Only unpromoted files of our atomic writer are removable; their final record is authoritative.
+    for (const name of temporary) {
+      const file = join(this.#directory, name);
+      safeRemovalFile(file);
+      unlinkSync(file);
+    }
+    if (temporary.length) syncDirectory(this.#directory);
+    const guilds = this.pendingGuilds().sort(),
+      now = this.#clock();
+    if (!timestamp(now)) throw new Error("Invalid retention clock.");
+    let removed = 0,
+      blocked = 0;
+    for (let offset = 0; offset < Math.min(limit, guilds.length); offset++) {
+      const guildId = guilds[(this.#metadataCursor + offset) % guilds.length];
+      if (this.#active.has(guildId)) continue;
+      let journal: PurgeJournal | null, proof: DeletionLedger | null;
+      try {
+        journal = this.#read(guildId, true);
+        if (!journal) continue;
+        proof = this.deletionLedger(guildId);
+        if (proof) {
+          const path = this.#path(guildId, "deleted");
+          safeRemovalFile(path);
+          if (process.platform !== "win32" && (lstatSync(path).mode & 0o077) !== 0)
+            throw new Error("Terminal deletion metadata must be private.");
+        }
+      } catch {
+        blocked++;
+        continue;
+      }
+      if (!proof || proof.removedAt !== journal.removedAt) {
+        blocked++;
+        continue;
+      }
+      if (now < proof.purgedAt || now - proof.purgedAt < terminalRetentionMs) continue;
+      this.#blockProof(proof.purgedAt);
+      // This expires only our old records. It neither inspects the old DB path nor claims a current wipe.
+      // Keep the first purge time until the pending bridge itself has disappeared durably.
+      unlinkSync(this.#path(guildId));
+      syncDirectory(this.#directory);
+      unlinkSync(this.#path(guildId, "deleted"));
+      syncDirectory(this.#directory);
+      removed++;
+    }
+    if (guilds.length) this.#metadataCursor = (this.#metadataCursor + limit) % guilds.length;
+    return { removed, blocked };
   }
   cancelPrepared(guildId: string): boolean {
     const journal = this.#read(guildId);
@@ -438,6 +562,16 @@ export class GuildUninstallRetention {
             this.options.onStage?.("committed");
           }
           // After commit, a rejoin waits for this old-data wipe before a fresh installation.
+          if (this.options.rulesDeletion) {
+            try {
+              await this.options.rulesDeletion.prepareRetirement(installation);
+            } catch {
+              const prior = this.deletionLedger(guildId);
+              this.#blockProof(
+                prior?.removedAt === journal!.removedAt ? prior.purgedAt : this.#clock(),
+              );
+            }
+          }
           if (journal!.phase === "committed") {
             if (!absent(path) && !sameIdentity(identity(path), journal!.databaseIdentity))
               throw new Error("Uninstall database file changed.");
@@ -481,6 +615,14 @@ export class GuildUninstallRetention {
             { format: 1, guildId, removedAt: journal!.removedAt, purgedAt, outcome: "purged" },
             "deleted",
           );
+          if (this.options.rulesDeletion) {
+            try {
+              await this.options.rulesDeletion.confirmRetired(installation);
+            } catch (error) {
+              this.#blockProof(purgedAt);
+              throw error;
+            }
+          }
           unlinkSync(this.#path(guildId));
           syncDirectory(this.#directory);
           return { state: "purged", store: "closed" };

@@ -53,6 +53,9 @@ function storeBindings(acquireLock, Store) {
     stores: new Map(),
     openingStores: new Map(),
     guildReleases: new Map(),
+    guildLeasePaths: new Map(),
+    beforeStoreOpen: async () => {},
+    resolve: (path) => path,
     acquireLock,
     Store,
   };
@@ -112,6 +115,7 @@ test("actual shutdown waits for pending Store opens and audio cleanup before des
         events.push("audio_stopped");
       },
     },
+    deletionQueue: { drain: async () => {} },
     registry: { values: () => [] },
     client: {
       removeAllListeners() {},
@@ -177,6 +181,7 @@ test("concurrent initialization shares one lease and one Store constructor", asy
     runtime = instantiate(["openStore"], bindings);
   const first = runtime.openStore(installation),
     second = runtime.openStore(installation);
+  await Promise.resolve();
   assert.equal(locks, 1);
   lease.resolve(async () => {
     released++;
@@ -215,6 +220,7 @@ function membershipBindings() {
     retentionSchedule: { forget() {} },
     guildReleases: new Map(),
     retentionWarnings: new Map(),
+    guildLeasePaths: new Map(),
     client: { isReady: () => true, guilds: { cache: { has: () => true } } },
     epoch: () => epoch,
     publicationRest: {},
@@ -229,6 +235,7 @@ function membershipBindings() {
     readUninstallMarker() {},
     jobRunner: { resumeGuild() {} },
     loadConfig: () => ({}),
+    assertRulesInstallationReady: async () => {},
     openStore: async (entry) => {
       opened++;
       stores.set(entry.guildId, {});
@@ -253,7 +260,7 @@ function membershipBindings() {
   };
 }
 
-test("a legacy rejoin during committed cleanup starts a fresh installation after the old lease is released", async () => {
+test("a legacy rejoin during committed cleanup never recreates purged data after the old lease is released", async () => {
   const finish = deferred(),
     state = membershipBindings(),
     order = [];
@@ -283,12 +290,11 @@ test("a legacy rejoin during committed cleanup starts a fresh installation after
   assert.deepEqual(order, []);
   finish.resolve({ state: "purged", store: "closed" });
   await sweep;
-  assert.deepEqual(order, ["old_lease_released", "fresh_store_opened"]);
-  assert.equal(state.bindings.installations.length, 1);
-  assert.equal(state.bindings.installations[0], installation);
-  assert.equal(state.bindings.stores.has(guildId), true);
-  assert.equal(state.marks, 1);
-  assert.equal(state.registered, 1);
+  assert.deepEqual(order, ["old_lease_released"]);
+  assert.equal(state.bindings.installations.length, 0);
+  assert.equal(state.bindings.stores.has(guildId), false);
+  assert.equal(state.marks, 0);
+  assert.equal(state.registered, 0);
   assert.equal(pendingJournal, false);
 });
 

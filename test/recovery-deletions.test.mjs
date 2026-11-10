@@ -11,6 +11,8 @@ import {
   rmSync,
   writeFileSync,
   linkSync,
+  lstatSync,
+  unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -31,6 +33,10 @@ import {
   initializeRulesDeletionJournal,
   drainRulesDeletionOutbox,
 } from "../dist/storage/rules-deletion-journal.js";
+import {
+  openRulesDeletionLifecycle,
+  upgradeRulesDeletionLifecycle,
+} from "../dist/storage/rules-deletion-lifecycle.js";
 import { sealLatestDeletionProof } from "../scripts/backup-proof.mjs";
 import { reconcileRestoredDeletionData } from "../scripts/recovery-deletions.mjs";
 import { recoveryCommand } from "../scripts/recovery.mjs";
@@ -223,6 +229,14 @@ async function fixture(t, options = {}) {
     stores: stores.map((s, i) => ({ guildId: installations[i].guildId, jobs: new JobStore(s.db) })),
     now,
   });
+  const journalPath = join(dataRoot, "rules-acceptance-deletions", "journal.json"),
+    originalJournal = JSON.parse(readFileSync(journalPath, "utf8"));
+  await upgradeRulesDeletionLifecycle({ dataRoot, installations, now });
+  const upgradedJournal = JSON.parse(readFileSync(journalPath, "utf8"));
+  for (const field of ["sourceId", "createdAt", "coveredFrom"])
+    assert.equal(upgradedJournal[field], originalJournal[field]);
+  assert.deepEqual(upgradedJournal.entries, originalJournal.entries);
+  assert.ok(originalJournal.coveredFrom <= manifest.createdAt);
   const sealed = await sealLatestDeletionProof({
     dataRoot,
     installations,
@@ -231,6 +245,8 @@ async function fixture(t, options = {}) {
     notBefore: now,
     challenge,
   });
+  assert.equal(sealed.meta.sourceId, originalJournal.sourceId);
+  assert.equal(sealed.meta.coveredFrom, originalJournal.coveredFrom);
   await restoreSnapshot({ archivePath, targetRoot: target, key, now });
   const f = {
     directory,
@@ -478,22 +494,81 @@ test("a cache key or grant pointing at a different live acceptance blocks before
 });
 test("a whole-guild deletion is a separate blocker and does not perform a partial rules cleanup", async (t) => {
   const f = await fixture(t);
-  mkdirSync(join(f.dataRoot, "uninstall-retention"), { mode: 0o700 });
-  writeFileSync(
-    join(f.dataRoot, "uninstall-retention", A + ".deleted.json"),
-    JSON.stringify({
-      format: 1,
-      guildId: A,
-      removedAt: f.manifest.createdAt,
-      purgedAt: f.now,
-      outcome: "purged",
-    }),
-    { mode: 0o600 },
-  );
+  const release = await acquireDataRootLease(f.dataRoot),
+    held = new Map(),
+    databasePath = f.installations[0].databasePath;
+  let owned = true,
+    activeInstallations = f.installations;
+  try {
+    for (const i of f.installations)
+      held.set(i.guildId, await acquireLock(i.databasePath, { createTarget: false }));
+    const port = openRulesDeletionLifecycle({
+      dataRoot: f.dataRoot,
+      clock: () => f.now,
+      readCanonicalInstallations: () => activeInstallations,
+      ownership: {
+        assertHeld() {
+          assert.equal(owned, true);
+        },
+        assertGuildLease(guildId) {
+          assert.equal(held.has(guildId), true);
+        },
+        assertQuiescent() {
+          assert.equal(owned, true);
+        },
+      },
+    });
+    const journal = JSON.parse(
+        readFileSync(join(f.dataRoot, "rules-acceptance-deletions", "journal.json")),
+      ),
+      expectedEpoch = journal.active.find((entry) => entry.guildId === A).epoch,
+      operationId = randomUUID(),
+      stat = lstatSync(databasePath, { bigint: true }),
+      pendingPath = join(f.dataRoot, "uninstall-retention", A + ".pending.json"),
+      pending = {
+        format: 1,
+        guildId: A,
+        removedAt: f.manifest.createdAt,
+        phase: "committed",
+        public: false,
+        databasePath,
+        databaseIdentity: { dev: String(stat.dev), ino: String(stat.ino) },
+        assetNames: [],
+      };
+    writeFileSync(pendingPath, JSON.stringify(pending), { mode: 0o600 });
+    f.stores[0].close();
+    await port.prepareRetirement({ guildId: A, expectedEpoch, operationId });
+    for (const suffix of ["-wal", "-shm", ""])
+      try {
+        unlinkSync(databasePath + suffix);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    pending.phase = "registry_done";
+    writeFileSync(pendingPath, JSON.stringify(pending));
+    writeFileSync(
+      join(f.dataRoot, "uninstall-retention", A + ".deleted.json"),
+      JSON.stringify({
+        format: 1,
+        guildId: A,
+        removedAt: f.manifest.createdAt,
+        purgedAt: f.now,
+        outcome: "purged",
+      }),
+      { mode: 0o600 },
+    );
+    activeInstallations = f.installations.filter((i) => i.guildId !== A);
+    await port.confirmRetired({ guildId: A, expectedEpoch, operationId });
+    unlinkSync(pendingPath);
+  } finally {
+    owned = false;
+    for (const stop of held.values()) await stop();
+    await release();
+  }
   const challenge = randomUUID(),
     sealed = await sealLatestDeletionProof({
       dataRoot: f.dataRoot,
-      installations: f.installations,
+      installations: activeInstallations,
       key: f.key,
       now: f.now,
       notBefore: f.now,
