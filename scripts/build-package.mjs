@@ -9,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -20,6 +20,7 @@ import {
   validateRuntimeTree,
   assertRuntimePackage,
   smokeRuntime,
+  retiredAudioFiles,
 } from "./runtime-package.mjs";
 
 export const archiveName = "gildiusz-linux-x64.tar.gz";
@@ -33,7 +34,8 @@ export function validateBuild(manifest, sha, runId) {
     manifest.platform !== "linux" ||
     manifest.architecture !== "x64" ||
     manifest.nodeMajor !== 24 ||
-    (manifest.runtimeFormat !== undefined && ![1, 2, 3, 4, 5].includes(manifest.runtimeFormat)) ||
+    (manifest.runtimeFormat !== undefined &&
+      ![1, 2, 3, 4, 5, 6].includes(manifest.runtimeFormat)) ||
     manifest.archive !== archiveName ||
     !/^[a-f0-9]{64}$/.test(manifest.sha256 ?? "") ||
     !Number.isSafeInteger(manifest.size) ||
@@ -61,7 +63,14 @@ export function prepareRuntimePackage(root, staging, { offline = false } = {}) {
   if (readdirSync(staging).length) throw Error("Runtime staging must be empty.");
   for (const name of runtimeSources) {
     validateRuntimeTree(join(root, name), { prefix: name });
-    cpSync(join(root, name), join(staging, name), { recursive: true });
+    cpSync(join(root, name), join(staging, name), {
+      recursive: true,
+      // tsc can leave outputs from deleted source files in an existing checkout.
+      filter: (path) => {
+        const name = relative(root, path).split(sep).join("/");
+        return !retiredAudioFiles.some((retired) => name === retired || name === `${retired}.map`);
+      },
+    });
   }
   execFileSync(
     process.execPath,
@@ -101,7 +110,7 @@ export function createPackage(root, output, revision, workflowRun) {
       platform: "linux",
       architecture: "x64",
       nodeMajor: 24,
-      runtimeFormat: 5,
+      runtimeFormat: 6,
     };
     writeFileSync(join(staging, "build.json"), JSON.stringify(metadata) + "\n");
     validateRuntimeTree(staging);

@@ -521,9 +521,11 @@ function backupCheckpoint(root, release, command, args, input) {
 }
 
 export function assertUpdateRuntime(release) {
-  if (readJson(join(release, "build.json"))?.runtimeFormat !== 5)
-    throw Error("New updates require runtime format5 with verified deletion lifecycle ports.");
-  assertRuntimePackage(release, { format: 5 });
+  if (readJson(join(release, "build.json"))?.runtimeFormat !== 6)
+    throw Error(
+      "New updates require runtime format6 with verified deletion lifecycle ports and no audio runtime.",
+    );
+  assertRuntimePackage(release, { format: 6 });
 }
 
 export async function install(root, sha, checked) {

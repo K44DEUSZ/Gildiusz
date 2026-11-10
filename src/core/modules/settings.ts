@@ -152,14 +152,16 @@ export function parseModuleSettings(input: unknown): ModuleSettings {
     newModules.some((key) => !Object.hasOwn(enabled, key) || typeof enabled[key] !== "boolean")
   )
     throw new ControlError(400, "module_settings", "Wskaż funkcje serwera.");
+  roles("djRoleIds");
   return {
     revision: value.revision as number,
     timeZone: value.timeZone,
     organizerRoleIds: roles("organizerRoleIds"),
     caseModeratorRoleIds: roles("caseModeratorRoleIds"),
     announcementManagerRoleIds: roles("announcementManagerRoleIds"),
-    djRoleIds: roles("djRoleIds"),
-    allowMemberMusic: value.allowMemberMusic,
+    // Reserved by contracts 0.9; the withdrawn module cannot retain active policy.
+    djRoleIds: [],
+    allowMemberMusic: false,
     cases: Object.hasOwn(value, "cases") ? parseCaseSettings(value.cases) : defaultCaseSettings(),
     enabled: Object.fromEntries(newModules.map((key) => [key, enabled[key]])) as Record<
       NewModule,
@@ -182,11 +184,14 @@ export class ModuleSettingsStore {
     const row = this.db
       .prepare("SELECT revision,body FROM guild_module_settings WHERE guild_id=?")
       .get(this.guildId);
-    if (row)
-      return parseModuleSettings({
+    if (row) {
+      const value = parseModuleSettings({
         ...JSON.parse(String(row.body)),
         revision: Number(row.revision),
       });
+      value.enabled.music = false;
+      return value;
+    }
     return {
       revision: 0,
       timeZone: "Europe/Warsaw",
@@ -194,7 +199,7 @@ export class ModuleSettingsStore {
       caseModeratorRoleIds: [],
       announcementManagerRoleIds: [],
       djRoleIds: [],
-      allowMemberMusic: true,
+      allowMemberMusic: false,
       cases: defaultCaseSettings(),
       enabled: {
         meetings: false,
@@ -214,6 +219,8 @@ export class ModuleSettingsStore {
         "Nie udało się potwierdzić osoby zmieniającej ustawienia.",
       );
     const value = parseModuleSettings(input);
+    if (value.enabled.music)
+      throw new ControlError(409, "module_unavailable", "Ta funkcja nie jest dostępna.");
     return transaction(this.db, () => {
       if (value.revision !== this.read().revision)
         throw new ControlError(

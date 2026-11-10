@@ -158,8 +158,27 @@ test("role lists reject duplicates, sparse arrays, wrong IDs and excessive membe
       rejects(() => parseModuleSettings({ ...baseline, [field]: values }), "roles");
   assert.deepEqual(
     parseModuleSettings({ ...baseline, organizerRoleIds: [role], djRoleIds: [role] }).djRoleIds,
-    [role],
+    [],
   );
+});
+
+test("legacy music preferences cannot reactivate playback or retain DJ access", (t) => {
+  const f = fixture(t),
+    legacy = f.settings.read();
+  legacy.enabled.music = true;
+  legacy.allowMemberMusic = true;
+  legacy.djRoleIds = [role];
+  f.db
+    .prepare("INSERT INTO guild_module_settings VALUES (?,?,?,?,?)")
+    .run(guild, 4, JSON.stringify(legacy), actor, 10000);
+  const current = f.settings.read();
+  assert.equal(current.revision, 4);
+  assert.equal(current.enabled.music, false);
+  assert.equal(current.allowMemberMusic, false);
+  assert.deepEqual(current.djRoleIds, []);
+  rejects(() => f.settings.save(legacy, actor), "module_unavailable");
+  assert.equal(f.settings.read().revision, 4);
+  assert.equal(f.settings.save(current, actor).revision, 5);
 });
 
 test("timezone validation requires a supported named IANA zone rather than an offset or host default", (t) => {

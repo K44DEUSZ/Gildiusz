@@ -30,6 +30,7 @@ import {
   assertRuntimePackage,
   validateRuntimeTree,
   smokeRuntime,
+  retiredAudioFiles,
 } from "../scripts/runtime-package.mjs";
 
 const bytes = Buffer.from("production archive"),
@@ -70,6 +71,10 @@ test(
         ".gildiusz-web",
       ])
         assert.equal(existsSync(join(directory, name)), false);
+      for (const name of retiredAudioFiles) {
+        assert.equal(existsSync(join(directory, name)), false, name);
+        assert.equal(existsSync(join(directory, name + ".map")), false, name);
+      }
       unlinkSync(join(directory, "dist/modules/announcement-assets/decode-worker.js"));
       assert.throws(() => assertRuntimePackage(directory));
     } finally {
@@ -156,7 +161,7 @@ test("format2 retains its historical requirements while format3 gates every back
     );
     writeFileSync(join(release, ".built"), sha);
     assert.equal(prepareRelease(directory, { ...manifest, runtimeFormat: 2 }, bytes), release);
-    assert.throws(() => assertUpdateRuntime(release), /require runtime format5/);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format6/);
     assertRuntimePackage(release, { format: 2 });
     assert.throws(() => assertRuntimePackage(release, { format: 3 }), /uninstall-retention/);
     writeFileSync(join(release, "dist/storage/uninstall-retention.js"), "format3");
@@ -167,7 +172,7 @@ test("format2 retains its historical requirements while format3 gates every back
       join(release, "build.json"),
       JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24, runtimeFormat: 3 }),
     );
-    assert.throws(() => assertUpdateRuntime(release), /require runtime format5/);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format6/);
     for (const name of [
       "backup-catalog",
       "backup-collector",
@@ -207,7 +212,7 @@ test("format2 retains its historical requirements while format3 gates every back
     }
     writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 4 }));
     assertRuntimePackage(release, { format: 4 });
-    assert.throws(() => assertUpdateRuntime(release), /format5/);
+    assert.throws(() => assertUpdateRuntime(release), /format6/);
     for (const name of format4) {
       const path = join(release, name);
       unlinkSync(path);
@@ -226,14 +231,25 @@ test("format2 retains its historical requirements while format3 gates every back
       writeFileSync(path, "format5");
     }
     writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 5 }));
-    assertUpdateRuntime(release);
+    assertRuntimePackage(release, { format: 5 });
+    assert.throws(() => assertUpdateRuntime(release), /format6/);
     for (const name of format5) {
       const path = join(release, name);
       unlinkSync(path);
-      assert.throws(() => assertRuntimePackage(release), /Missing runtime file/);
-      assert.throws(() => assertUpdateRuntime(release), /Missing runtime file/);
+      assert.throws(() => assertRuntimePackage(release, { format: 5 }), /Missing runtime file/);
       assertRuntimePackage(release, { format: 4 });
       writeFileSync(path, "format5");
+    }
+    writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 6 }));
+    assert.throws(() => assertUpdateRuntime(release), /Withdrawn audio file/);
+    for (const name of retiredAudioFiles) unlinkSync(join(release, name));
+    assertUpdateRuntime(release);
+    assert.throws(() => assertRuntimePackage(release, { format: 5 }), /Missing runtime file/);
+    for (const name of format5) {
+      const path = join(release, name);
+      unlinkSync(path);
+      assert.throws(() => assertUpdateRuntime(release), /Missing runtime file/);
+      writeFileSync(path, "format6");
     }
   } finally {
     assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
@@ -251,7 +267,7 @@ test(
       const output = join(directory, "output");
       createPackage(process.cwd(), output, sha, "123");
       const metadata = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
-      assert.equal(metadata.runtimeFormat, 5);
+      assert.equal(metadata.runtimeFormat, 6);
       const release = prepareRelease(directory, metadata, readFileSync(join(output, archiveName)));
       assert.ok(existsSync(join(release, "dist", "bot", "main.js")));
       assert.ok(existsSync(join(release, "node_modules", "discord.js", "package.json")));
@@ -276,7 +292,7 @@ test("deployment rejects mismatched revisions, workflow runs, platforms, corrupt
     { platform: "win32" },
     { architecture: "arm64" },
     { nodeMajor: 26 },
-    { runtimeFormat: 6 },
+    { runtimeFormat: 7 },
     { size: 100000000 },
     { sha256: "bad" },
     { archive: "../file" },

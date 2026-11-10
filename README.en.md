@@ -19,7 +19,7 @@ The owner or a member with **Manage Server** can configure the bot. Use `/ustawi
 
 This is an early version. The website and panel are developed separately; the shared public service is being prepared. This repository contains the bot source for self-hosting.
 
-The `test` branch includes work on meetings, reports with conversation history, suggestions, scheduled announcements, Twitch integration and server rules acceptance with a member role. These features still require acceptance testing before release in the shared service. Music, activity points and ranks are planned.
+The `test` branch includes work on meetings, reports with conversation history, suggestions, scheduled announcements, Twitch integration and server rules acceptance with a member role. These features still require acceptance testing before release in the shared service. Activity points and ranks are planned.
 
 <details>
 <summary>Run your own instance</summary>

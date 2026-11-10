@@ -15,10 +15,8 @@ const author = "200000000000000001",
   moderator = "200000000000000003";
 const organizerRole = "300000000000000001",
   staffRole = "300000000000000002",
-  announcementRole = "300000000000000003",
-  djRole = "300000000000000004";
-const channel = "400000000000000001",
-  otherChannel = "400000000000000002";
+  announcementRole = "300000000000000003";
+const channel = "400000000000000001";
 const facts = (userId = visitor, patch = {}) => ({
   guildId: guild,
   userId,
@@ -36,8 +34,6 @@ const policy = {
   organizerRoleIds: [organizerRole],
   caseModeratorRoleIds: [staffRole],
   announcementManagerRoleIds: [announcementRole],
-  djRoleIds: [djRole],
-  allowMemberMusic: true,
 };
 const meeting = { guildId: guild, ownerId: author, visibility: "public", state: "open" };
 const privateCase = {
@@ -53,7 +49,6 @@ const suggestion = {
   visibility: "public",
   votingEnabled: true,
 };
-const music = { guildId: guild, ownerId: author, voiceChannelId: channel, state: "playing" };
 
 test("server rules configuration and acceptance history require a current guild administrator", () => {
   const actions = [
@@ -68,7 +63,7 @@ test("server rules configuration and acceptance history require a current guild 
     assert.equal(
       canPerform(
         action,
-        facts(moderator, { roleIds: [staffRole, announcementRole, organizerRole, djRole] }),
+        facts(moderator, { roleIds: [staffRole, announcementRole, organizerRole] }),
         policy,
       ),
       false,
@@ -102,7 +97,7 @@ test("unknown operations, malformed facts and missing bound objects fail closed"
   assert.equal(
     permissionDecision("settings.save", facts(visitor, { manageGuild: true }), {
       ...policy,
-      djRoleIds: "everyone",
+      organizerRoleIds: "everyone",
     }).code,
     "invalid_policy",
   );
@@ -111,7 +106,6 @@ test("unknown operations, malformed facts and missing bound objects fail closed"
     "cases.read",
     "cases.note",
     "announcements.update",
-    "music.stop",
     "jobs.retry",
   ])
     assert.equal(
@@ -128,7 +122,6 @@ test("a valid object identifier or elevated role never crosses guild boundaries"
     "meetings.cancel",
     "announcements.update",
     "jobs.retry",
-    "music.stop",
   ])
     assert.equal(
       permissionDecision(action, admin, policy, { ...privateCase, guildId: otherGuild }).code,
@@ -143,20 +136,17 @@ test("a valid object identifier or elevated role never crosses guild boundaries"
 test("pending, timed-out and bot accounts cannot operate modules even with management flags", () => {
   for (const patch of [{ pending: true }, { timedOut: true }, { isBot: true }]) {
     const member = facts(visitor, { manageGuild: true, voiceChannelId: channel, ...patch });
-    for (const action of [
-      "settings.save",
-      "meetings.create",
-      "cases.read",
-      "announcements.create",
-      "music.vote",
-    ])
-      assert.equal(permissionDecision(action, member, policy, music).code, "ineligible_member");
+    for (const action of ["settings.save", "meetings.create", "cases.read", "announcements.create"])
+      assert.equal(
+        permissionDecision(action, member, policy, privateCase).code,
+        "ineligible_member",
+      );
   }
 });
 
 test("configuration, integrations and raw job diagnostics are restricted to current server managers", () => {
   const specialist = facts(visitor, {
-    roleIds: [organizerRole, staffRole, announcementRole, djRole],
+    roleIds: [organizerRole, staffRole, announcementRole],
   });
   for (const action of [
     "settings.read",
@@ -296,61 +286,22 @@ test("revoked operational roles remove access; authorship alone does not preserv
   assert.equal(canPerform("cases.read", facts(moderator), policy, privateCase), false);
 });
 
-test("ordinary playback cannot move or replace a session in another channel, even implicitly for an administrator", () => {
-  assert.equal(canPerform("music.play", facts(visitor, { voiceChannelId: channel }), policy), true);
-  assert.equal(canPerform("music.play", facts(), policy), false);
-  assert.equal(
-    canPerform("music.join", facts(visitor, { voiceChannelId: channel }), {
-      ...policy,
-      allowMemberMusic: false,
-    }),
-    false,
-  );
-  for (const member of [
-    facts(visitor, { voiceChannelId: otherChannel }),
-    facts(author, { manageGuild: true, voiceChannelId: otherChannel }),
+test("withdrawn playback operations have no permission path even for a guild owner", () => {
+  for (const action of [
+    "read",
+    "play",
+    "join",
+    "queue",
+    "vote",
+    "pause",
+    "resume",
+    "skip",
+    "stop",
+    "move",
   ])
     assert.equal(
-      permissionDecision("music.play", member, policy, music).code,
-      "different_voice_channel",
-    );
-  assert.equal(
-    canPerform("music.play", facts(visitor, { voiceChannelId: channel }), policy, music),
-    true,
-  );
-});
-
-test("music votes require a current human in the active channel while destructive controls require host or DJ", () => {
-  assert.equal(
-    canPerform("music.vote", facts(visitor, { voiceChannelId: channel }), policy, music),
-    true,
-  );
-  for (const member of [
-    facts(visitor),
-    facts(visitor, { manageGuild: true, voiceChannelId: otherChannel }),
-    facts(visitor, { voiceChannelId: channel, isBot: true }),
-  ])
-    assert.equal(canPerform("music.vote", member, policy, music), false);
-  for (const action of ["music.pause", "music.resume", "music.skip", "music.stop", "music.move"]) {
-    assert.equal(
-      canPerform(action, facts(visitor, { voiceChannelId: channel }), policy, music),
-      false,
-    );
-    assert.equal(canPerform(action, facts(author), policy, music), true);
-    assert.equal(canPerform(action, facts(visitor, { roleIds: [djRole] }), policy, music), true);
-    assert.equal(canPerform(action, facts(visitor, { manageGuild: true }), policy, music), true);
-  }
-  assert.equal(
-    canPerform("music.stop", facts(author), policy, { ...music, voiceChannelId: undefined }),
-    false,
-  );
-  for (const state of ["completed", "stopped", undefined])
-    assert.equal(
-      canPerform("music.vote", facts(visitor, { voiceChannelId: channel }), policy, {
-        ...music,
-        state,
-      }),
-      false,
+      permissionDecision(`music.${action}`, facts(author, { owner: true }), policy).code,
+      "unknown_action",
     );
 });
 
@@ -361,12 +312,7 @@ test("requirePermission provides a typed rejection and every declared action has
   );
   assert.doesNotThrow(() => requirePermission("cases.read", facts(author), policy, privateCase));
   const admin = facts(author, { owner: true, voiceChannelId: channel });
-  const objects = { ...music, ...suggestion, participantIds: [author], state: "open" };
+  const objects = { ...suggestion, participantIds: [author], state: "open" };
   for (const action of moduleActions)
-    assert.equal(
-      permissionDecision(action, admin, policy, action.startsWith("music.") ? music : objects)
-        .allowed,
-      true,
-      action,
-    );
+    assert.equal(permissionDecision(action, admin, policy, objects).allowed, true, action);
 });

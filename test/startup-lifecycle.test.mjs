@@ -88,9 +88,9 @@ test("a stopped startup releases a late-acquired lease without constructing or r
   assert.equal(bindings.guildReleases.size, 0);
 });
 
-test("actual shutdown waits for pending Store opens and audio cleanup before destroying the client and releasing the data-root lease", async () => {
+test("actual shutdown waits for pending Store opens and deletion queue cleanup before destroying the client and releasing the data-root lease", async () => {
   const lease = deferred(),
-    audio = deferred(),
+    deletion = deferred(),
     events = [];
   let writes = 0,
     finished = false;
@@ -108,14 +108,13 @@ test("actual shutdown waits for pending Store opens and audio cleanup before des
     twitch: undefined,
     twitchIngress: undefined,
     integrationDatabase: undefined,
-    audioRehearsal: {
-      stop: async () => {
-        events.push("audio_stop_started");
-        await audio.promise;
-        events.push("audio_stopped");
+    deletionQueue: {
+      drain: async () => {
+        events.push("deletion_drain_started");
+        await deletion.promise;
+        events.push("deletion_drained");
       },
     },
-    deletionQueue: { drain: async () => {} },
     registry: { values: () => [] },
     client: {
       removeAllListeners() {},
@@ -149,14 +148,14 @@ test("actual shutdown waits for pending Store opens and audio cleanup before des
   await rejected;
   await new Promise(setImmediate);
   assert.equal(finished, false);
-  assert.deepEqual(events, ["guild_lease_released", "audio_stop_started"]);
-  audio.resolve();
+  assert.deepEqual(events, ["guild_lease_released", "deletion_drain_started"]);
+  deletion.resolve();
   await shutdown;
   assert.equal(writes, 0);
   assert.deepEqual(events, [
     "guild_lease_released",
-    "audio_stop_started",
-    "audio_stopped",
+    "deletion_drain_started",
+    "deletion_drained",
     "destroy",
     "data_root_released",
   ]);

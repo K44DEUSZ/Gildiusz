@@ -84,7 +84,6 @@ import {
   rulesDeletionInstallationKey,
   type RulesDeletionLifecycle,
 } from "../storage/rules-deletion-lifecycle.js";
-import type { MusicRehearsalOperator } from "./music-rehearsal-operator.js";
 import {
   GuildUninstallRetention,
   readUninstallMarker,
@@ -191,7 +190,6 @@ async function main(): Promise<void> {
   let twitch: TwitchRuntime | undefined;
   let integrationDatabase: DatabaseSync | undefined;
   let twitchIngress: TwitchIngress | undefined;
-  let audioRehearsal: MusicRehearsalOperator | null = null;
   const deletionQueue = new SerialQueue();
   let deletionLifecycle: RulesDeletionLifecycle | undefined;
   const epoch = (guildId: string) => guildEpochs.get(guildId) ?? 0;
@@ -1239,15 +1237,11 @@ async function main(): Promise<void> {
         );
       } finally {
         controlServer?.close();
-        try {
-          await audioRehearsal?.stop();
-        } finally {
-          await client.destroy();
-          for (const store of stores.values()) store.close();
-          for (const release of guildReleases.values()) await release();
-          integrationDatabase?.close();
-          for (const release of releases.reverse()) await release();
-        }
+        await client.destroy();
+        for (const store of stores.values()) store.close();
+        for (const release of guildReleases.values()) await release();
+        integrationDatabase?.close();
+        for (const release of releases.reverse()) await release();
       }
     })();
     return shutdown;
@@ -1299,19 +1293,6 @@ async function main(): Promise<void> {
           registry.remove(installation.guildId);
         } else {
           await presentInstallation(installation.guildId);
-        }
-      }
-      if (process.env.GILDIUSZ_AUDIO_REHEARSAL === "1" && !stopping) {
-        const { createMusicRehearsalOperator } = await import("./music-rehearsal-operator.js");
-        if (!stopping) {
-          const rehearsal = await createMusicRehearsalOperator(client, {
-            enabled: true,
-            expectedApplicationId: credentials.clientId,
-            dataRoot,
-            configPath: process.env.GILDIUSZ_AUDIO_REHEARSAL_CONFIG,
-          });
-          if (stopping) await rehearsal?.stop();
-          else audioRehearsal = rehearsal;
         }
       }
       if (stopping) return;

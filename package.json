@@ -17,11 +17,8 @@
     "start": "node --env-file-if-exists=.env dist/bot/main.js"
   },
   "dependencies": {
-    "@discordjs/voice": "0.19.2",
     "@js-temporal/polyfill": "0.5.1",
-    "@noble/ciphers": "2.4.0",
     "@silvia-odwyer/photon-node": "0.3.4",
-    "@snazzah/davey": "0.1.12",
     "discord.js": "14.28.1",
     "image-size": "2.1.0",
     "proper-lockfile": "4.1.2"

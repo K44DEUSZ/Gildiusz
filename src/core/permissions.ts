@@ -15,8 +15,6 @@ export interface ModulePolicy {
   organizerRoleIds?: readonly string[];
   caseModeratorRoleIds?: readonly string[];
   announcementManagerRoleIds?: readonly string[];
-  djRoleIds?: readonly string[];
-  allowMemberMusic?: boolean;
 }
 
 export interface BoundObject {
@@ -85,16 +83,6 @@ export const moduleActions = [
   "announcements.resume",
   "announcements.cancel",
   "announcements.remove",
-  "music.read",
-  "music.play",
-  "music.join",
-  "music.queue",
-  "music.vote",
-  "music.pause",
-  "music.resume",
-  "music.skip",
-  "music.stop",
-  "music.move",
 ] as const;
 export type ModuleAction = (typeof moduleActions)[number];
 export type PermissionCode =
@@ -155,13 +143,6 @@ const ownedActions = new Set<string>([
   "announcements.resume",
   "announcements.cancel",
   "announcements.remove",
-  "music.queue",
-  "music.vote",
-  "music.pause",
-  "music.resume",
-  "music.skip",
-  "music.stop",
-  "music.move",
 ]);
 
 // Adapters supply current facts refreshed from Discord, never roles or flags from request bodies.
@@ -186,13 +167,9 @@ export function permissionDecision(
   if (
     !policy ||
     !id(policy.guildId) ||
-    [
-      policy.organizerRoleIds,
-      policy.caseModeratorRoleIds,
-      policy.announcementManagerRoleIds,
-      policy.djRoleIds,
-    ].some((value) => value !== undefined && !ids(value)) ||
-    (policy.allowMemberMusic !== undefined && typeof policy.allowMemberMusic !== "boolean")
+    [policy.organizerRoleIds, policy.caseModeratorRoleIds, policy.announcementManagerRoleIds].some(
+      (value) => value !== undefined && !ids(value),
+    )
   )
     return deny("invalid_policy");
   if (member.guildId !== policy.guildId || (object && object.guildId !== policy.guildId))
@@ -215,7 +192,6 @@ export function permissionDecision(
   const organizer = admin || hasRole(policy.organizerRoleIds);
   const staff = admin || hasRole(policy.caseModeratorRoleIds);
   const announcer = admin || hasRole(policy.announcementManagerRoleIds);
-  const dj = admin || hasRole(policy.djRoleIds);
   const own = object?.ownerId === member.userId;
 
   if (action === "capabilities.read") return allow;
@@ -282,22 +258,6 @@ export function permissionDecision(
 
   if (action.startsWith("announcements.")) return announcer ? allow : deny("forbidden");
 
-  if (action === "music.read") return allow;
-  if (object && (!id(object.voiceChannelId) || !id(object.ownerId))) return deny("invalid_object");
-  const sameChannel = Boolean(object && member.voiceChannelId === object.voiceChannelId);
-  if (action === "music.play" || action === "music.join") {
-    if (!member.voiceChannelId) return deny("voice_required");
-    if (object && !sameChannel) return deny("different_voice_channel");
-    return dj || policy.allowMemberMusic === true ? allow : deny("forbidden");
-  }
-  if (action === "music.vote") {
-    if (!["playing", "paused"].includes(object?.state ?? "")) return deny("closed");
-    return sameChannel ? allow : deny("different_voice_channel");
-  }
-  if (action === "music.queue")
-    return dj || (sameChannel && policy.allowMemberMusic === true) ? allow : deny("forbidden");
-  if (["music.pause", "music.resume", "music.skip", "music.stop", "music.move"].includes(action))
-    return own || dj ? allow : deny("forbidden");
   return deny("unknown_action");
 }
 

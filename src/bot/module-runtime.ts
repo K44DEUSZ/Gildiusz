@@ -214,6 +214,7 @@ export class ModuleRuntime {
       states.cases = this.community.status("cases");
     }
     const capabilities = buildCapabilities(states, implemented);
+    capabilities.modules = capabilities.modules.filter((module) => module.key !== "music");
     if (this.beta && this.integrations)
       capabilities.modules = capabilities.modules.map((module) =>
         module.key === "integrations"

@@ -304,6 +304,10 @@ test("synthetic resources enable integrated local domains while future modules s
   assert.equal(first.moduleSettings.enabled.cases, true);
   assert.equal(first.moduleSettings.enabled.music, false);
   assert.equal(
+    first.capabilities.modules.some((module) => module.key === "music"),
+    false,
+  );
+  assert.equal(
     first.capabilities.modules.find((module) => module.key === "announcements").status,
     "enabled",
   );

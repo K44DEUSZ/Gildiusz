@@ -782,7 +782,7 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
   }
   function capabilities(runtime: Runtime) {
     const settings = runtime.settings.read();
-    return buildCapabilities(
+    const result = buildCapabilities(
       {
         announcements: settings.enabled.announcements ? "enabled" : "available",
         meetings: settings.enabled.meetings ? "enabled" : "available",
@@ -795,6 +795,8 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
       },
       ["rooms", "reactions", "files", "reports", "announcements", "meetings", "cases", "rules"],
     );
+    result.modules = result.modules.filter((module) => module.key !== "music");
+    return result;
   }
   function permissions(runtime: Runtime): string[] {
     const settings = runtime.settings.read();

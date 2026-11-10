@@ -21,7 +21,7 @@ Uczestnicy korzystają z `/pokoj` i `/zglos`. Role do samodzielnego wyboru musz�
 
 Gildiusz jest we wczesnej wersji. Strona i panel są rozwijane oddzielnie, a publiczne uruchomienie wspólnej usługi jest w przygotowaniu. W tym repozytorium znajduje się kod bota do własnego uruchomienia.
 
-Na gałęzi `test` sprawdzamy spotkania, zgłoszenia z historią i pomysły, ogłoszenia na termin, integrację Twitch oraz akceptację regulaminu z rolą członka. Udostępnienie tych funkcji we wspólnej usłudze wymaga jeszcze odbioru. Muzyka oraz aktywność i rangi są planowane.
+Na gałęzi `test` sprawdzamy spotkania, zgłoszenia z historią i pomysły, ogłoszenia na termin, integrację Twitch oraz akceptację regulaminu z rolą członka. Udostępnienie tych funkcji we wspólnej usłudze wymaga jeszcze odbioru. Aktywność i rangi są planowane.
 
 <details>
 <summary>Uruchom własną instancję</summary>

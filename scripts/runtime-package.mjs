@@ -104,15 +104,8 @@ export const requiredRuntimeFilesV3 = [
   "scripts/backup-ledger.mjs",
   "scripts/backup-scheduler.mjs",
 ];
-export const requiredRuntimeFilesV4 = [
-  ...requiredRuntimeFilesV3,
-  "scripts/backup-proof.mjs",
-  "scripts/recovery-deletions.mjs",
-  "dist/storage/rules-deletion-journal.js",
-  "dist/modules/server-rules/deletion-schema.js",
-  "dist/modules/server-rules/deletion-outbox.js",
-  "dist/storage/recovery/age.js",
-  "dist/storage/recovery/deletions.js",
+// Preserve validation of old releases without shipping their withdrawn audio feature.
+export const retiredAudioFiles = [
   "dist/bot/music-rehearsal-voice.js",
   "dist/bot/music-rehearsal-operator.js",
   "dist/bot/music-rehearsal-operator-files.js",
@@ -125,14 +118,28 @@ export const requiredRuntimeFilesV4 = [
   "node_modules/@snazzah/davey/package.json",
   "node_modules/@noble/ciphers/package.json",
 ];
-export const requiredRuntimeFiles = [
+export const requiredRuntimeFilesV4 = [
+  ...requiredRuntimeFilesV3,
+  "scripts/backup-proof.mjs",
+  "scripts/recovery-deletions.mjs",
+  "dist/storage/rules-deletion-journal.js",
+  "dist/modules/server-rules/deletion-schema.js",
+  "dist/modules/server-rules/deletion-outbox.js",
+  "dist/storage/recovery/age.js",
+  "dist/storage/recovery/deletions.js",
+  ...retiredAudioFiles,
+];
+export const requiredRuntimeFilesV5 = [
   ...requiredRuntimeFilesV4,
   "scripts/backup-deletion-state.mjs",
   "scripts/rules-deletion-lifecycle.mjs",
   "dist/storage/rules-deletion-lifecycle.js",
 ];
-export function assertRuntimePackage(directory, { format = 5 } = {}) {
-  if (![1, 2, 3, 4, 5].includes(format)) throw Error("Unsupported runtime package format.");
+export const requiredRuntimeFiles = requiredRuntimeFilesV5.filter(
+  (name) => !retiredAudioFiles.includes(name),
+);
+export function assertRuntimePackage(directory, { format = 6 } = {}) {
+  if (![1, 2, 3, 4, 5, 6].includes(format)) throw Error("Unsupported runtime package format.");
   const files =
     format === 1
       ? ["dist/bot/main.js", "dist/cli.js", "node_modules/discord.js/package.json"]
@@ -142,7 +149,13 @@ export function assertRuntimePackage(directory, { format = 5 } = {}) {
           ? requiredRuntimeFilesV3
           : format === 4
             ? requiredRuntimeFilesV4
-            : requiredRuntimeFiles;
+            : format === 5
+              ? requiredRuntimeFilesV5
+              : requiredRuntimeFiles;
+  if (format === 6)
+    for (const name of retiredAudioFiles)
+      if (existsSync(join(directory, name)))
+        throw Error(`Withdrawn audio file in the runtime package: ${name}`);
   for (const name of files) {
     const path = join(directory, name);
     if (!existsSync(path)) throw Error(`Missing runtime file: ${name}`);
@@ -155,10 +168,9 @@ export function smokeRuntime(directory) {
   assertRuntimePackage(directory);
   // This exercises packaged JS -> worker -> local WASM without tokens, databases or Discord.
   const source =
-    'await import("./scripts/recovery-deletions.mjs");await import("./scripts/backup-deletion-state.mjs");await import("./scripts/rules-deletion-lifecycle.mjs");await import("./dist/storage/rules-deletion-lifecycle.js");await import("./dist/bot/music-rehearsal-operator.js");await import("./dist/bot/music-rehearsal-voice.js");await import("./dist/modules/music-rehearsal/service.js");' +
+    'await import("./scripts/recovery-deletions.mjs");await import("./scripts/backup-deletion-state.mjs");await import("./scripts/rules-deletion-lifecycle.mjs");await import("./dist/storage/rules-deletion-lifecycle.js");' +
     'const{planBackupRotation}=await import("./scripts/backup-catalog.mjs");const{planDailyBackup}=await import("./scripts/backup-scheduler.mjs");await import("./scripts/backup-collector.mjs");await import("./scripts/backup-ledger.mjs");if(planBackupRotation([],{now:0}).remove.length||!planDailyBackup([],0).due)throw Error("Unexpected packaged backup ports");' +
-    'import{validateImage}from"./dist/modules/announcement-assets/validate.js";const bytes=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP8AAP8FAAH/+lyI0QAAAABJRU5ErkJggg==","base64");const value=await validateImage(bytes,"image/png");if(value.width!==1||value.height!==1)throw Error("Unexpected packaged decoder result");' +
-    'await import("@discordjs/voice");const{default:Davey}=await import("@snazzah/davey");if(Davey.DAVE_PROTOCOL_VERSION<1)throw Error("Missing DAVE protocol");const session=new Davey.DAVESession(Davey.DAVE_PROTOCOL_VERSION,"100000000000000001","100000000000000002");try{if(!session.getSerializedKeyPackage().length)throw Error("Invalid native DAVE result");}finally{session.reset();}const{xchacha20poly1305}=await import("@noble/ciphers/chacha.js");const key=new Uint8Array(32),nonce=new Uint8Array(24),plain=Uint8Array.from([1,2,3]);const encrypted=xchacha20poly1305(key,nonce).encrypt(plain);if(xchacha20poly1305(key,nonce).decrypt(encrypted).join()!==plain.join())throw Error("Invalid XChaCha result");';
+    'import{validateImage}from"./dist/modules/announcement-assets/validate.js";const bytes=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP8AAP8FAAH/+lyI0QAAAABJRU5ErkJggg==","base64");const value=await validateImage(bytes,"image/png");if(value.width!==1||value.height!==1)throw Error("Unexpected packaged decoder result");';
   const environment = { NODE_ENV: "production", TZ: "Europe/Warsaw" };
   for (const key of ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"])
     if (process.env[key]) environment[key] = process.env[key];
@@ -172,5 +184,5 @@ export function smokeRuntime(directory) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   if (process.argv[2] !== "--smoke") throw Error("Use --smoke to verify the packaged runtime.");
   smokeRuntime(process.cwd());
-  console.log("Packaged worker, image decoder and voice dependencies verified.");
+  console.log("Packaged worker, recovery ports and image decoder verified.");
 }

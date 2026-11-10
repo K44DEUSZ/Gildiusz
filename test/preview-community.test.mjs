@@ -197,7 +197,11 @@ test("community capabilities expose real local domains, scoped settings and no f
         channel.id === view.moduleSettings.cases.suggestionChannelId && channel.kind === "text",
     ),
   );
-  for (const key of ["music", "twitch", "integrations"])
+  assert.equal(
+    view.modules.some((item) => item.key === "music"),
+    false,
+  );
+  for (const key of ["twitch", "integrations"])
     assert.equal(view.modules.find((item) => item.key === key).availability, "planned");
   for (const operation of [
     "meetings.preview",
