@@ -10,7 +10,9 @@ test("v2 offsite ACK binds the real archive to fresh authoritative coverage and 
   const f = await backupV2Fixture(t),
     sealed = await f.seal(),
     first = await collectArchive(f.request(sealed));
-  assert.equal(first.offsiteSuccess, true);
+  assert.equal(first.offsiteSuccess, false);
+  assert.equal(first.localVerificationSucceeded, true);
+  assert.equal(first.ledger.state, "verified");
   assert.equal(first.ledger.format, 2);
   assert.equal(first.ledger.sequence, sealed.meta.sequence);
   const path = join(f.catalog.root, "deletion-ledger", "deletion-watermark.json"),
@@ -26,7 +28,9 @@ test("v2 offsite ACK binds the real archive to fresh authoritative coverage and 
   assert.deepEqual(readFileSync(path), before);
   const replay = await collectArchive(f.request(sealed));
   assert.equal(replay.replayed, true);
-  assert.equal(replay.offsiteSuccess, true);
+  assert.equal(replay.offsiteSuccess, false);
+  assert.equal(replay.localVerificationSucceeded, true);
+  assert.equal(replay.ledger.state, "verified");
 });
 
 test("a live proof transport receives a new challenge and stale ciphertext or source loss cannot ACK", async (t) => {
@@ -41,7 +45,9 @@ test("a live proof transport receives a new challenge and stale ciphertext or so
     ...f.request(first),
     latestProof: async (context) => (await f.seal(context)).envelope,
   });
-  assert.equal(latest.offsiteSuccess, true);
+  assert.equal(latest.offsiteSuccess, false);
+  assert.equal(latest.localVerificationSucceeded, true);
+  assert.equal(latest.ledger.state, "verified");
   unlinkSync(join(f.dataRoot, "rules-acceptance-deletions", "journal.json"));
   await assert.rejects(
     collectArchive({
@@ -104,7 +110,9 @@ test("retirement evidence is explicit after TTL; complete fresh inventories allo
     ...f.request(newer),
     ledgerRetirementEvidence: async () => f.evidence(),
   });
-  assert.equal(result.offsiteSuccess, true);
+  assert.equal(result.offsiteSuccess, false);
+  assert.equal(result.localVerificationSucceeded, true);
+  assert.equal(result.ledger.state, "verified");
   assert.equal(result.ledger.sourceId, sealed.meta.sourceId);
   assert.ok(result.ledger.sequence > sealed.meta.sequence);
 });

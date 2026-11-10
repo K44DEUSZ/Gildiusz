@@ -15,6 +15,7 @@ import { createReadStream } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
+import { validateOffsiteTransfer } from "./backup-offsite.mjs";
 
 export const backupDayMs = 86400000;
 export const backupMaxAgeMs = 35 * backupDayMs;
@@ -130,6 +131,28 @@ function validateRecord(entry) {
           checkpoint.offsiteAck.upgradeId !== checkpoint.upgradeId ||
           checkpoint.offsiteAck.revision !== checkpoint.revision ||
           !timestamp(checkpoint.offsiteAck.verifiedAt)))
+    )
+      backupFailure("invalid_backup_catalog");
+    if (checkpoint.offsite !== undefined) {
+      const transfer = validateOffsiteTransfer(
+        checkpoint.offsite,
+        checkpoint.offsite?.proof?.createdAt,
+      );
+      if (
+        transfer.backup.id !== entry.id ||
+        transfer.backup.sha256 !== entry.sha256 ||
+        transfer.backup.createdAt !== entry.createdAt ||
+        transfer.backup.size !== entry.size ||
+        transfer.upgradeId !== checkpoint.upgradeId ||
+        transfer.targetRevision !== checkpoint.revision
+      )
+        backupFailure("invalid_backup_catalog");
+    }
+    if (
+      checkpoint.offsiteAck?.signedReceipt !== undefined &&
+      (typeof checkpoint.offsiteAck.signedReceipt !== "string" ||
+        checkpoint.offsiteAck.signedReceipt.length > 12000 ||
+        !/^[A-Za-z0-9_-]+$/.test(checkpoint.offsiteAck.signedReceipt))
     )
       backupFailure("invalid_backup_catalog");
   }
@@ -404,6 +427,44 @@ export class BackupCatalog {
       if (actual.sha256 !== entry.sha256 || actual.size !== entry.size)
         backupFailure("backup_hash_mismatch");
       entry.verifiedAt = this.clock();
+      if (entry.expiresAt <= entry.verifiedAt) backupFailure("backup_already_expired");
+      return { ...entry, locationId: catalog.locationId };
+    });
+  }
+  async bindOffsiteTransfer(id, transfer) {
+    transfer = validateOffsiteTransfer(transfer, this.clock());
+    return this.#locked(async (catalog, fence) => {
+      const entry = catalog.entries.find((row) => row.id === id);
+      if (
+        !entry?.checkpoint ||
+        transfer.sourceLocationId !== catalog.locationId ||
+        transfer.backup.id !== id ||
+        transfer.backup.sha256 !== entry.sha256 ||
+        transfer.backup.createdAt !== entry.createdAt ||
+        transfer.backup.size !== entry.size ||
+        transfer.upgradeId !== entry.checkpoint.upgradeId ||
+        transfer.targetRevision !== entry.checkpoint.revision
+      )
+        backupFailure("backup_checkpoint_conflict");
+      const previous = entry.checkpoint.offsite;
+      if (
+        previous &&
+        (previous.sourceLocationId !== transfer.sourceLocationId ||
+          previous.destinationLocationId !== transfer.destinationLocationId ||
+          previous.proof.sourceId !== transfer.proof.sourceId ||
+          previous.proof.coveredFrom !== transfer.proof.coveredFrom ||
+          transfer.proof.sequence < previous.proof.sequence ||
+          (previous.proof.sequence === transfer.proof.sequence &&
+            JSON.stringify(previous) !== JSON.stringify(transfer)))
+      )
+        backupFailure("backup_checkpoint_conflict");
+      const actual = await archiveIdentity(this.archivePath(id));
+      fence();
+      if (actual.sha256 !== entry.sha256 || actual.size !== entry.size)
+        backupFailure("backup_hash_mismatch");
+      validateOffsiteTransfer(transfer, this.clock());
+      if (JSON.stringify(previous) !== JSON.stringify(transfer)) entry.checkpoint.offsiteAck = null;
+      entry.checkpoint.offsite = transfer;
       return { ...entry, locationId: catalog.locationId };
     });
   }
@@ -423,12 +484,22 @@ export class BackupCatalog {
         ack.verifiedAt > this.clock()
       )
         backupFailure("backup_replication_conflict");
+      if (
+        entry.checkpoint.offsite &&
+        (ack.locationId !== entry.checkpoint.offsite.destinationLocationId ||
+          JSON.stringify(ack.transfer) !== JSON.stringify(entry.checkpoint.offsite) ||
+          typeof ack.signedReceipt !== "string" ||
+          ack.signedReceipt.length > 12000 ||
+          !/^[A-Za-z0-9_-]+$/.test(ack.signedReceipt))
+      )
+        backupFailure("backup_replication_conflict");
       entry.checkpoint.offsiteAck = {
         locationId: ack.locationId,
         verifiedAt: ack.verifiedAt,
         sha256: ack.sha256,
         upgradeId: ack.upgradeId,
         revision: ack.revision,
+        ...(entry.checkpoint.offsite ? { signedReceipt: ack.signedReceipt } : {}),
       };
       return entry;
     });

@@ -27,7 +27,8 @@ import {
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { parseEnv } from "node:util";
-import { privateDirectory, regularFile } from "../dist/storage/recovery/files.js";
+import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
+import { readOffsiteFile, writeOffsiteFile } from "./backup-offsite.mjs";
 
 export const repository = "https://github.com/K44DEUSZ/Gildiusz.git";
 export function expectedRepository(remote) {
@@ -524,7 +525,170 @@ export function deploymentPause(root) {
   };
 }
 
-function backupCheckpoint(root, release, command, args, input) {
+export function offsiteLocation(root) {
+  const value = JSON.parse(
+    readOffsiteFile(join(root, "shared", "offsite-location.json")).toString("utf8"),
+  );
+  if (
+    Object.keys(value).sort().join() !== "format,locationId" ||
+    value.format !== 1 ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.locationId)
+  )
+    throw Error("Pin the actual private PC backup catalogue before preparing an update.");
+  return value.locationId;
+}
+export function pendingUpgrade(root) {
+  const path = join(root, "shared", "pending-upgrade.json");
+  if (!existsSync(path)) return null;
+  const value = JSON.parse(readOffsiteFile(path).toString("utf8"));
+  if (
+    Object.keys(value).sort().join() !==
+      [
+        "format",
+        "revision",
+        "previous",
+        "upgradeId",
+        "pause",
+        "locationId",
+        "state",
+        "backupId",
+        "sha256",
+        "activatedAt",
+        "holdPause",
+      ]
+        .sort()
+        .join() ||
+    value.format !== 1 ||
+    typeof value.holdPause !== "boolean" ||
+    !/^[a-f0-9]{40}$/.test(value.revision) ||
+    (value.previous !== null && !/^[a-f0-9]{40}$/.test(value.previous)) ||
+    !/^[a-f0-9-]{36}$/.test(value.upgradeId) ||
+    !/^[a-f0-9-]{36}$/.test(value.locationId) ||
+    typeof value.pause !== "string" ||
+    !/^Deployment in progress [a-f0-9-]{36}\n$/.test(value.pause) ||
+    !["preparing", "awaiting_offsite", "activating", "failed"].includes(value.state) ||
+    (value.backupId !== null && !/^[a-f0-9-]{36}$/.test(value.backupId)) ||
+    (value.sha256 !== null && !/^[a-f0-9]{64}$/.test(value.sha256)) ||
+    (value.activatedAt !== null &&
+      (!Number.isSafeInteger(value.activatedAt) || value.activatedAt < 0))
+  )
+    throw Error("Pending update requires operator reconciliation.");
+  return value;
+}
+export function beginUpgrade(root, revision, previous, locationId, { adoptPause = false } = {}) {
+  if (
+    !/^[a-f0-9]{40}$/.test(revision) ||
+    (previous !== null && !/^[a-f0-9]{40}$/.test(previous)) ||
+    !/^[a-f0-9-]{36}$/.test(locationId) ||
+    typeof adoptPause !== "boolean"
+  )
+    throw Error("Invalid prepared update identity.");
+  if (pendingUpgrade(root)) throw Error("A prepared update already exists.");
+  if (adoptPause) {
+    readOffsiteFile(paths(root).pause); // Explicit operator-only adoption; never used by automatic updates.
+    writeOffsiteFile(paths(root).pause, Buffer.from(`Deployment in progress ${randomUUID()}\n`));
+  } else deploymentPause(root);
+  syncDirectory(join(root, "shared"));
+  const value = {
+    format: 1,
+    revision,
+    previous,
+    upgradeId: randomUUID(),
+    pause: readFileSync(paths(root).pause, "utf8"),
+    locationId,
+    state: "preparing",
+    backupId: null,
+    sha256: null,
+    activatedAt: null,
+    holdPause: adoptPause,
+  };
+  writeOffsiteFile(
+    join(root, "shared", "pending-upgrade.json"),
+    Buffer.from(JSON.stringify(value)),
+  );
+  return pendingUpgrade(root);
+}
+export function advanceUpgrade(root, expected, patch) {
+  if (JSON.stringify(pendingUpgrade(root)) !== JSON.stringify(expected))
+    throw Error("Prepared update changed; operator review required.");
+  const value = { ...expected, ...patch };
+  writeOffsiteFile(
+    join(root, "shared", "pending-upgrade.json"),
+    Buffer.from(JSON.stringify(value)),
+  );
+  return pendingUpgrade(root);
+}
+export function assertUpgradePause(root, pending) {
+  if (
+    JSON.stringify(pendingUpgrade(root)) !== JSON.stringify(pending) ||
+    offsiteLocation(root) !== pending.locationId ||
+    readOffsiteFile(paths(root).pause).toString("utf8") !== pending.pause
+  )
+    throw Error("Prepared update pause or PC identity changed; operator review required.");
+}
+export function acquireUpgradePause(root, pending) {
+  if (pending.holdPause || existsSync(paths(root).pause)) {
+    assertUpgradePause(root, pending);
+    return pending;
+  }
+  if (
+    JSON.stringify(pendingUpgrade(root)) !== JSON.stringify(pending) ||
+    offsiteLocation(root) !== pending.locationId
+  )
+    throw Error("Prepared update changed; operator review required.");
+  deploymentPause(root);
+  syncDirectory(join(root, "shared"));
+  return advanceUpgrade(root, pending, { pause: readFileSync(paths(root).pause, "utf8") });
+}
+export async function releaseAwaitingUpgrade(root, pending, resume) {
+  if (pending.holdPause) return false;
+  assertUpgradePause(root, pending);
+  if (
+    pending.state !== "awaiting_offsite" ||
+    !pending.previous ||
+    basename(realpathSync(paths(root).current)) !== pending.previous
+  )
+    throw Error("Only the unchanged previous release may resume while awaiting its PC receipt.");
+  rmSync(paths(root).pause);
+  syncDirectory(join(root, "shared"));
+  try {
+    await resume();
+  } catch (error) {
+    if (!existsSync(paths(root).pause))
+      writeFileSync(paths(root).pause, pending.pause, { mode: 0o600, flag: "wx", flush: true });
+    syncDirectory(join(root, "shared"));
+    throw error;
+  }
+  return true;
+}
+export async function authorizePreparedUpgrade(root, revision, verify) {
+  let pending = pendingUpgrade(root);
+  if (
+    !pending ||
+    pending.state !== "awaiting_offsite" ||
+    pending.revision !== revision ||
+    !pending.backupId ||
+    !pending.sha256
+  )
+    throw Error("The update is not prepared for activation.");
+  assertUpgradePause(root, pending);
+  const checked = await verify(pending);
+  assertUpgradePause(root, pending);
+  if (
+    checked?.offsiteSuccess !== true ||
+    checked.id !== pending.backupId ||
+    checked.sha256 !== pending.sha256 ||
+    checked.checkpoint?.upgradeId !== pending.upgradeId ||
+    checked.checkpoint?.revision !== revision ||
+    checked.checkpoint?.offsite?.destinationLocationId !== pending.locationId ||
+    !checked.checkpoint?.offsiteAck?.signedReceipt
+  )
+    throw Error("A verified matching PC receipt is required before activation.");
+  pending = advanceUpgrade(root, pending, { state: "activating", activatedAt: Date.now() });
+  return pending;
+}
+
+function backupCheckpoint(root, release, command, args, input, sourceDirectory = release) {
   try {
     return JSON.parse(
       execFileSync(
@@ -537,7 +701,7 @@ function backupCheckpoint(root, release, command, args, input) {
           ...args,
         ],
         {
-          cwd: release,
+          cwd: sourceDirectory,
           env: environment,
           encoding: "utf8",
           input: input ? JSON.stringify(input) : undefined,
@@ -560,7 +724,7 @@ export function assertUpdateRuntime(release) {
   assertRuntimePackage(release, { format: 6 });
 }
 
-export async function install(root, sha, checked) {
+export async function install(root, sha, checked, { adoptPause = false } = {}) {
   if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Expected a full commit SHA.");
   const workflow = checked ?? (await checkedWorkflow(sha));
   if (!workflow) throw Error("This revision has no successful main push checks.");
@@ -568,85 +732,176 @@ export async function install(root, sha, checked) {
   const release = await retrieveRelease(root, sha, workflow);
   deploymentState(root, release);
   const previous = existsSync(p.current) ? realpathSync(p.current) : null;
-  if (previous === release) return event(root, `already active ${sha}`);
+  if (previous === release && !pendingUpgrade(root)) return event(root, `already active ${sha}`);
   assertUpdateRuntime(release);
-  const upgradeId = randomUUID();
-  const outputPath = join(p.shared, "backups", "captures", `${upgradeId}.gldbak`);
-  // Validate the independent operator key before downtime; snapshot all bot data only once stopped.
-  let snapshot;
-  let checkpoint;
-  let unpause;
-  try {
-    snapshot = await stoppedSnapshot({
-      preflight: () =>
-        recovery(
-          root,
-          release,
-          "plan",
-          outputPath,
-          undefined,
-          previous ? basename(previous) : undefined,
-          previous || release,
-        ),
-      stop: async () => {
-        unpause = deploymentPause(root);
-        await stopSupervisor(root);
-      },
-      snapshot: () => {
-        const manifest = recovery(
-          root,
-          release,
-          "snapshot",
-          outputPath,
-          undefined,
-          previous ? basename(previous) : undefined,
-          previous || release,
-        );
-        checkpoint = backupCheckpoint(
-          root,
-          release,
-          "register-before-upgrade",
-          ["--archive", outputPath, "--target-revision", sha, "--upgrade-id", upgradeId],
-          manifest,
-        );
-        if (
-          checkpoint?.id !== manifest.id ||
-          checkpoint.checkpoint?.upgradeId !== upgradeId ||
-          checkpoint.checkpoint?.revision !== sha ||
-          !/^[a-f0-9]{64}$/.test(checkpoint.sha256)
-        )
-          throw Error("The backup checkpoint identity does not match the update.");
-        return manifest;
-      },
+  let pending = pendingUpgrade(root);
+  if (pending && adoptPause)
+    throw Error("The update is already prepared; import its receipt and use install to activate.");
+  if (!pending) {
+    const locationId = offsiteLocation(root);
+    if (!adoptPause && (!previous || !healthy(readJson(p.health))))
+      throw Error("Automatic preparation requires a healthy unchanged previous release.");
+    // Preflight credentials and scope before creating a durable, owned maintenance pause.
+    recovery(
+      root,
+      release,
+      "plan",
+      join(p.shared, "backups", "captures", "preflight.gldbak"),
+      undefined,
+      previous ? basename(previous) : undefined,
+      previous || release,
+    );
+    pending = beginUpgrade(root, sha, previous ? basename(previous) : null, locationId, {
+      adoptPause,
     });
+    try {
+      await stopSupervisor(root);
+      assertUpgradePause(root, pending);
+      const outputPath = join(p.shared, "backups", "captures", `${pending.upgradeId}.gldbak`);
+      const manifest = recovery(
+        root,
+        release,
+        "snapshot",
+        outputPath,
+        undefined,
+        previous ? basename(previous) : undefined,
+        previous || release,
+      );
+      const checkpoint = backupCheckpoint(
+        root,
+        release,
+        "register-before-upgrade",
+        [
+          "--archive",
+          outputPath,
+          "--target-revision",
+          sha,
+          "--upgrade-id",
+          pending.upgradeId,
+          "--pc-location",
+          locationId,
+          "--transfer-output",
+          join(p.shared, "offsite-transfer.json"),
+        ],
+        manifest,
+        previous || release,
+      );
+      if (
+        checkpoint.id !== manifest.id ||
+        checkpoint.state !== "awaiting_offsite" ||
+        checkpoint.offsiteSuccess !== false ||
+        checkpoint.checkpoint?.upgradeId !== pending.upgradeId ||
+        checkpoint.checkpoint?.revision !== sha ||
+        !/^[a-f0-9]{64}$/.test(checkpoint.sha256)
+      )
+        throw Error("The prepared backup identity does not match the update.");
+      assertUpgradePause(root, pending);
+      pending = advanceUpgrade(root, pending, {
+        state: "awaiting_offsite",
+        backupId: checkpoint.id,
+        sha256: checkpoint.sha256,
+      });
+      await releaseAwaitingUpgrade(root, pending, () => startSupervisor(root));
+      console.log(
+        JSON.stringify({
+          state: "awaiting_offsite",
+          id: pending.backupId,
+          sha256: pending.sha256,
+          revision: sha,
+        }),
+      );
+      return;
+    } catch (error) {
+      if (JSON.stringify(pendingUpgrade(root)) === JSON.stringify(pending))
+        advanceUpgrade(root, pending, { state: "failed" });
+      // Never remove a pause after an incomplete snapshot or ambiguous preparation.
+      throw error;
+    }
+  }
+  if (pending.revision !== sha || pending.previous !== (previous ? basename(previous) : null))
+    throw Error("A different or partially activated update requires operator reconciliation.");
+  if (pending.state !== "awaiting_offsite")
+    throw Error("The incomplete update requires operator reconciliation.");
+  // This is an availability hint only. A signed receipt and fresh source are verified in the child below.
+  if (
+    !pending.holdPause &&
+    !readJson(join(p.shared, "backups", "catalog.json"))?.entries?.find(
+      (row) => row.id === pending.backupId,
+    )?.checkpoint?.offsiteAck?.signedReceipt
+  ) {
+    if (existsSync(p.pause))
+      await releaseAwaitingUpgrade(root, pending, () => startSupervisor(root));
+    console.log(
+      JSON.stringify({
+        state: "awaiting_offsite",
+        id: pending.backupId,
+        sha256: pending.sha256,
+        revision: sha,
+      }),
+    );
+    return;
+  }
+  pending = acquireUpgradePause(root, pending);
+  await stopSupervisor(root);
+  try {
+    pending = await authorizePreparedUpgrade(root, sha, (stage) =>
+      backupCheckpoint(
+        root,
+        release,
+        "verify-checkpoint",
+        [
+          "--id",
+          stage.backupId,
+          "--target-revision",
+          sha,
+          "--upgrade-id",
+          stage.upgradeId,
+          "--pc-location",
+          stage.locationId,
+        ],
+        undefined,
+        previous || release,
+      ),
+    );
   } catch (error) {
-    if (unpause) unpause();
-    if (previous && !existsSync(p.pause)) background(root, "supervise", "supervisor.lock");
+    if (JSON.stringify(pendingUpgrade(root)) === JSON.stringify(pending))
+      await releaseAwaitingUpgrade(root, pending, () => startSupervisor(root));
     throw error;
   }
   const activated = Date.now();
   // Restart the supervisor as well, so updates to hosting code take effect with the release.
+  assertUpgradePause(root, pending);
   pointTo(root, release);
   // A scheduler may have started a paused supervisor while the snapshot was being taken.
   await stopSupervisor(root);
-  unpause();
+  assertUpgradePause(root, pending);
+  rmSync(p.pause);
+  syncDirectory(p.shared);
   event(root, `activating ${sha}`);
   background(root, "supervise", "supervisor.lock");
   if (await waitReady(root, sha, activated)) {
     try {
       backupCheckpoint(root, release, "mark-healthy", [
         "--id",
-        checkpoint.id,
+        pending.backupId,
         "--sha256",
-        checkpoint.sha256,
+        pending.sha256,
         "--target-revision",
         sha,
         "--upgrade-id",
-        upgradeId,
+        pending.upgradeId,
       ]);
     } catch {
       event(root, "backup health acknowledgement failed; checkpoint retained for operator review");
+      throw Error(
+        "The healthy release requires operator reconciliation of its retained checkpoint.",
+      );
     }
+    if (JSON.stringify(pendingUpgrade(root)) !== JSON.stringify(pending))
+      throw Error("Prepared update changed after activation.");
+    rmSync(join(p.shared, "pending-upgrade.json"));
+    rmSync(join(p.shared, "offsite-transfer.json"));
+    syncDirectory(p.shared);
     rmSync(join(p.shared, "failed-revision"), { force: true });
     event(root, `activation healthy ${sha}`);
     try {
@@ -659,41 +914,12 @@ export async function install(root, sha, checked) {
     return;
   }
   writeFileSync(join(p.shared, "failed-revision"), sha, { mode: 0o600 });
-  const rollbackUnpause = deploymentPause(root);
+  if (!existsSync(p.pause))
+    writeFileSync(p.pause, pending.pause, { mode: 0o600, flag: "wx", flush: true });
   await stopSupervisor(root);
-  let compatible = false;
-  if (previous) {
-    try {
-      compatible =
-        recovery(
-          root,
-          release,
-          "compatible",
-          outputPath,
-          snapshot,
-          previous ? basename(previous) : undefined,
-          previous || release,
-        ).compatible === true;
-    } catch {
-      compatible = false;
-    }
-  }
-  if (previous && compatible) {
-    const reverted = Date.now();
-    pointTo(root, previous);
-    rollbackUnpause();
-    event(root, `rollback to ${basename(previous)}`);
-    background(root, "supervise", "supervisor.lock");
-    const recovered = await waitReady(root, basename(previous), reverted);
-    event(root, `rollback healthy=${recovered}`);
-  } else {
-    writeFileSync(
-      p.pause,
-      "Activation failed. Schema compatibility is unconfirmed; operator review is required.\n",
-      { mode: 0o600 },
-    );
-    event(root, "activation paused; code-only rollback denied, encrypted snapshot retained");
-  }
+  advanceUpgrade(root, pending, { state: "failed" });
+  syncDirectory(p.shared);
+  event(root, "activation paused; prepared checkpoint retained for operator reconciliation");
   throw Error("New release did not become healthy; inspect private hosting logs.");
 }
 
@@ -730,7 +956,7 @@ async function main() {
   ])
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (command === "supervise") return supervise(root);
-  if (command === "install") {
+  if (["install", "prepare-paused", "import-offsite-ack"].includes(command)) {
     return console.log(
       run(
         "flock",
@@ -740,7 +966,11 @@ async function main() {
           join(p.shared, "deploy.lock"),
           process.execPath,
           fileURLToPath(import.meta.url),
-          "install-locked",
+          command === "import-offsite-ack"
+            ? "import-offsite-ack-locked"
+            : command === "prepare-paused"
+              ? "prepare-paused-locked"
+              : "install-locked",
           root,
           sha,
         ],
@@ -749,6 +979,52 @@ async function main() {
     );
   }
   if (command === "install-locked") return install(root, sha);
+  if (command === "prepare-paused-locked")
+    return install(root, sha, undefined, { adoptPause: true });
+  if (command === "import-offsite-ack-locked") {
+    let pending = pendingUpgrade(root);
+    if (!pending || pending.state !== "awaiting_offsite" || !sha)
+      throw Error("No prepared checkpoint awaits a PC receipt.");
+    pending = acquireUpgradePause(root, pending);
+    await stopSupervisor(root);
+    const release = join(root, "releases", pending.revision);
+    assertUpdateRuntime(release);
+    let checked;
+    try {
+      checked = backupCheckpoint(
+        root,
+        release,
+        "import-offsite-ack",
+        [
+          "--id",
+          pending.backupId,
+          "--target-revision",
+          pending.revision,
+          "--upgrade-id",
+          pending.upgradeId,
+          "--pc-location",
+          pending.locationId,
+          "--receipt",
+          resolve(sha),
+        ],
+        undefined,
+        pending.previous ? join(root, "releases", pending.previous) : release,
+      );
+      assertUpgradePause(root, pending);
+    } finally {
+      if (JSON.stringify(pendingUpgrade(root)) === JSON.stringify(pending))
+        await releaseAwaitingUpgrade(root, pending, () => startSupervisor(root));
+    }
+    console.log(
+      JSON.stringify({
+        state: "offsite_verified",
+        id: checked.id,
+        sha256: checked.sha256,
+        offsiteSuccess: checked.offsiteSuccess,
+      }),
+    );
+    return;
+  }
   if (command === "update") return update(root);
   if (command === "cleanup") {
     if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Specify the rollback release SHA.");
@@ -804,10 +1080,19 @@ async function main() {
         ...readJson(p.state),
         health: readJson(p.health),
         healthy: healthy(readJson(p.health)),
+        pendingUpgrade: pendingUpgrade(root)
+          ? {
+              state: pendingUpgrade(root).state,
+              revision: pendingUpgrade(root).revision,
+              backupId: pendingUpgrade(root).backupId,
+            }
+          : null,
       }),
     );
     return;
   }
+  if (["pause", "resume"].includes(command) && pendingUpgrade(root))
+    throw Error("A prepared update owns the pause; reconcile or activate it explicitly.");
   if (command === "pause") writeFileSync(p.pause, "Paused by operator.\n", { mode: 0o600 });
   else if (command === "resume") rmSync(p.pause, { force: true });
   else if (command === "restart") writeFileSync(p.restart, String(Date.now()), { mode: 0o600 });

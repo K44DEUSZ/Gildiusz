@@ -6,10 +6,21 @@ import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredSnapshot, recoveryCommand, recoveryCredentials } from "./recovery.mjs";
 import { deploymentPause, startSupervisor, stopSupervisor } from "./hosting.mjs";
-import { sealLatestDeletionProof } from "./backup-proof.mjs";
+import { sealLatestDeletionProof, verifyLatestDeletionProof } from "./backup-proof.mjs";
 import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
 import { archiveIdentity, BackupCatalog, backupFailure, backupDayMs } from "./backup-catalog.mjs";
-import { collectArchive, pruneCollectedDeletionProofs } from "./backup-collector.mjs";
+import {
+  collectArchive,
+  pruneCollectedDeletionProofs,
+  verifyTransferProof,
+} from "./backup-collector.mjs";
+import {
+  validateOffsiteTransfer,
+  verifyOffsiteAck,
+  readOffsiteFile,
+  writeOffsiteFile,
+} from "./backup-offsite.mjs";
+import { readDeletionState } from "./backup-deletion-state.mjs";
 
 export function planDailyBackup(entries, now = Date.now()) {
   if (!Number.isSafeInteger(now) || now < 0) backupFailure("invalid_backup_clock");
@@ -132,6 +143,181 @@ export async function registerBeforeUpgrade({
     checkpoint: { upgradeId, revision: targetRevision, healthyAt: null, offsiteAck: null },
     signal,
   });
+}
+
+export async function prepareBeforeUpgrade(options) {
+  const {
+    catalog,
+    key,
+    forbiddenKeys = [],
+    latestProof,
+    proofRequirements,
+    destinationLocationId,
+  } = options;
+  const value = verifyLatestDeletionProof({
+    envelope: latestProof,
+    key,
+    forbiddenKeys,
+    now: catalog.clock(),
+    maxAgeMs: 86400000,
+    ...proofRequirements,
+  });
+  const result = await registerBeforeUpgrade(options);
+  const transfer = validateOffsiteTransfer(
+    {
+      format: 1,
+      kind: "gildiusz-offsite-transfer",
+      backup: Object.fromEntries(
+        ["id", "createdAt", "size", "sha256"].map((k) => [k, result.entry[k]]),
+      ),
+      upgradeId: options.upgradeId,
+      targetRevision: options.targetRevision,
+      sourceLocationId: result.entry.locationId,
+      destinationLocationId,
+      proof: {
+        ...Object.fromEntries(
+          ["id", "sha256", "sourceId", "sequence", "createdAt", "expiresAt", "coveredFrom"].map(
+            (k) => [k, value.meta[k]],
+          ),
+        ),
+        challenge: proofRequirements.challenge,
+        notBefore: proofRequirements.notBefore,
+      },
+    },
+    catalog.clock(),
+  );
+  verifyTransferProof({
+    transfer,
+    envelope: latestProof,
+    key,
+    forbiddenKeys,
+    now: catalog.clock(),
+  });
+  const entry = await catalog.bindOffsiteTransfer(result.entry.id, transfer);
+  return {
+    state: "awaiting_offsite",
+    entry,
+    transfer,
+    localVerificationSucceeded: true,
+    offsiteSuccess: false,
+  };
+}
+
+async function checkpointSource({
+  catalog,
+  id,
+  upgradeId,
+  targetRevision,
+  destinationLocationId,
+  key,
+  forbiddenKeys = [],
+  sourceSnapshot,
+}) {
+  const state = await catalog.read(),
+    entry = state.entries.find((row) => row.id === id);
+  const transfer = validateOffsiteTransfer(entry?.checkpoint?.offsite, catalog.clock());
+  if (
+    transfer.upgradeId !== upgradeId ||
+    transfer.targetRevision !== targetRevision ||
+    transfer.destinationLocationId !== destinationLocationId ||
+    transfer.sourceLocationId !== state.locationId
+  )
+    backupFailure("backup_checkpoint_conflict");
+  const proof = readOffsiteFile(
+    join(catalog.root, "deletion-ledger", `deletion-proof-${transfer.proof.id}.gldproof`),
+    4 * 1024 * 1024,
+  );
+  verifyTransferProof({ transfer, envelope: proof, key, forbiddenKeys, now: catalog.clock() });
+  const watermark = readDeletionState({
+    directory: join(catalog.root, "deletion-ledger"),
+    key,
+    forbiddenKeys,
+    now: catalog.clock(),
+  });
+  if (
+    !watermark ||
+    watermark.globalGap ||
+    watermark.sourceId !== transfer.proof.sourceId ||
+    watermark.minSequence !== transfer.proof.sequence ||
+    watermark.head?.sha256 !== transfer.proof.sha256
+  )
+    backupFailure("offsite_proof_mismatch");
+  if (typeof sourceSnapshot !== "function") backupFailure("offsite_source_verification_required");
+  const checkSource = async () => {
+    const source = await sourceSnapshot();
+    if (
+      !source?.complete ||
+      source.blockers?.length ||
+      source.sourceId !== transfer.proof.sourceId ||
+      source.sequence !== transfer.proof.sequence ||
+      source.coveredFrom !== transfer.proof.coveredFrom
+    )
+      backupFailure("offsite_source_changed");
+  };
+  await checkSource();
+  if ((await catalog.confirmArchive(transfer.backup)).locationId !== transfer.sourceLocationId)
+    backupFailure("offsite_location_mismatch");
+  await checkSource();
+  const finalWatermark = readDeletionState({
+    directory: join(catalog.root, "deletion-ledger"),
+    key,
+    forbiddenKeys,
+    now: catalog.clock(),
+  });
+  if (
+    finalWatermark?.globalGap ||
+    finalWatermark?.sourceId !== transfer.proof.sourceId ||
+    finalWatermark?.minSequence !== transfer.proof.sequence ||
+    finalWatermark?.head?.sha256 !== transfer.proof.sha256
+  )
+    backupFailure("offsite_proof_mismatch");
+  verifyTransferProof({
+    transfer,
+    envelope: readOffsiteFile(
+      join(catalog.root, "deletion-ledger", `deletion-proof-${transfer.proof.id}.gldproof`),
+      4 * 1024 * 1024,
+    ),
+    key,
+    forbiddenKeys,
+    now: catalog.clock(),
+  });
+  validateOffsiteTransfer(transfer, catalog.clock());
+  return { entry, transfer };
+}
+
+export async function importOffsiteAck(options) {
+  const envelope = Buffer.from(options.envelope);
+  const { entry, transfer } = await checkpointSource(options);
+  const verified = verifyOffsiteAck({
+    envelope,
+    transfer,
+    key: options.key,
+    forbiddenKeys: options.forbiddenKeys,
+    now: options.catalog.clock(),
+  });
+  await options.catalog.acknowledgeOffsite(entry.id, {
+    ...transfer.backup,
+    locationId: transfer.destinationLocationId,
+    verifiedAt: verified.verifiedAt,
+    upgradeId: transfer.upgradeId,
+    revision: transfer.targetRevision,
+    transfer,
+    signedReceipt: envelope.toString("base64url"),
+  });
+  return verifyUpgradeCheckpoint(options);
+}
+
+export async function verifyUpgradeCheckpoint(options) {
+  const { entry, transfer } = await checkpointSource(options);
+  if (!entry.checkpoint.offsiteAck?.signedReceipt) backupFailure("offsite_ack_required");
+  verifyOffsiteAck({
+    envelope: Buffer.from(entry.checkpoint.offsiteAck.signedReceipt, "base64url"),
+    transfer,
+    key: options.key,
+    forbiddenKeys: options.forbiddenKeys,
+    now: options.catalog.clock(),
+  });
+  return { id: entry.id, sha256: entry.sha256, checkpoint: entry.checkpoint, offsiteSuccess: true };
 }
 
 export function hostingLifecycle(root, assertFence = () => {}) {
@@ -286,6 +472,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         "rotate",
         "run-daily",
         "register-before-upgrade",
+        "import-offsite-ack",
+        "verify-checkpoint",
         "mark-healthy",
       ].includes(command) ||
       !root
@@ -294,16 +482,31 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const options = {};
     for (let index = 0; index < args.length; index += 2) {
       if (
-        !["--archive", "--target-revision", "--upgrade-id", "--id", "--sha256"].includes(
-          args[index],
-        ) ||
+        ![
+          "--archive",
+          "--target-revision",
+          "--upgrade-id",
+          "--id",
+          "--sha256",
+          "--pc-location",
+          "--transfer-output",
+          "--receipt",
+        ].includes(args[index]) ||
         !args[index + 1] ||
         options[args[index]]
       )
         backupFailure("invalid_backup_options");
       options[args[index]] = args[index + 1];
     }
-    if (!["register-before-upgrade", "mark-healthy"].includes(command) && args.length)
+    if (
+      ![
+        "register-before-upgrade",
+        "mark-healthy",
+        "import-offsite-ack",
+        "verify-checkpoint",
+      ].includes(command) &&
+      args.length
+    )
       backupFailure("invalid_backup_options");
     const catalog = new BackupCatalog({ root: resolve(root) });
     let result;
@@ -312,7 +515,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     else if (command === "rotate")
       result = await catalog.applyRotation(await catalog.planRotation());
     else if (command === "register-before-upgrade") {
-      if (!options["--archive"] || !options["--target-revision"] || !options["--upgrade-id"])
+      if (
+        !options["--archive"] ||
+        !options["--target-revision"] ||
+        !options["--upgrade-id"] ||
+        !options["--pc-location"] ||
+        !options["--transfer-output"]
+      )
         backupFailure("invalid_backup_options");
       const manifest = inputManifest();
       const archivePath = resolve(options["--archive"]);
@@ -327,12 +536,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         notBefore,
         challenge,
       });
-      result = await registerBeforeUpgrade({
+      result = await prepareBeforeUpgrade({
         catalog,
         archivePath,
         manifest,
         upgradeId: options["--upgrade-id"],
         targetRevision: options["--target-revision"],
+        destinationLocationId: options["--pc-location"],
         ...recoveryCredentials(process.env),
         latestProof: ledger.envelope,
         proofRequirements: {
@@ -342,7 +552,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
           challenge,
         },
       });
-      if (!result.offsiteSuccess) backupFailure("ledger_sync_required");
+      writeOffsiteFile(
+        resolve(options["--transfer-output"]),
+        Buffer.from(JSON.stringify(result.transfer)),
+      );
       rmSync(archivePath);
       syncDirectory(catalog.captures);
       console.log(
@@ -350,8 +563,45 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
           id: result.entry.id,
           sha256: result.entry.sha256,
           checkpoint: result.entry.checkpoint,
+          state: "awaiting_offsite",
+          localVerificationSucceeded: true,
+          offsiteSuccess: false,
         }),
       );
+      result = null;
+    } else if (["import-offsite-ack", "verify-checkpoint"].includes(command)) {
+      if (
+        !options["--id"] ||
+        !options["--target-revision"] ||
+        !options["--upgrade-id"] ||
+        !options["--pc-location"] ||
+        (command === "import-offsite-ack" && !options["--receipt"])
+      )
+        backupFailure("invalid_backup_options");
+      const configuration = configuredSnapshot(catalog.archivePath(options["--id"]), process.env);
+      const { snapshotRulesDeletionLifecycle } =
+        await import("../dist/storage/rules-deletion-lifecycle.js");
+      const input = {
+        catalog,
+        id: options["--id"],
+        upgradeId: options["--upgrade-id"],
+        targetRevision: options["--target-revision"],
+        destinationLocationId: options["--pc-location"],
+        ...recoveryCredentials(process.env),
+        sourceSnapshot: () =>
+          snapshotRulesDeletionLifecycle({
+            dataRoot: configuration.dataRoot,
+            installations: configuration.guilds,
+          }),
+      };
+      const checked =
+        command === "import-offsite-ack"
+          ? await importOffsiteAck({
+              ...input,
+              envelope: readOffsiteFile(resolve(options["--receipt"])),
+            })
+          : await verifyUpgradeCheckpoint(input);
+      console.log(JSON.stringify(checked));
       result = null;
     } else if (command === "mark-healthy") {
       result = await catalog.markUpgradeHealthy(options["--id"], {

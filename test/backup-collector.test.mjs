@@ -24,7 +24,9 @@ function request(f, extra = {}) {
 test("a real encrypted SQLite snapshot is acknowledged only after restore dry-run and durable exclusive promotion", async (t) => {
   const f = await backupFixture(t);
   const result = await collectArchive(request(f));
-  assert.equal(result.offsiteSuccess, true);
+  assert.equal(result.offsiteSuccess, false);
+  assert.equal(result.localVerificationSucceeded, true);
+  assert.equal(result.ledger.state, "verified");
   assert.equal(result.entry.id, f.manifest.id);
   assert.deepEqual(
     readFileSync(f.catalog.archivePath(f.manifest.id)),
@@ -77,7 +79,9 @@ test("fresh ledger transport is explicit: a verified archive alone cannot claim 
   assert.equal(result.ledger.state, "ledger_sync_required");
   const completed = await collectArchive(request(f, { latestLedger: async () => f.latestLedger }));
   assert.equal(completed.replayed, true);
-  assert.equal(completed.offsiteSuccess, true);
+  assert.equal(completed.offsiteSuccess, false);
+  assert.equal(completed.localVerificationSucceeded, true);
+  assert.equal(completed.ledger.state, "verified");
 });
 test("injected streams are bounded, aborted and isolated; no default network fetch exists", async (t) => {
   const f = await backupFixture(t);
@@ -96,7 +100,9 @@ test("injected streams are bounded, aborted and isolated; no default network fet
       })();
     },
   });
-  assert.equal(result.offsiteSuccess, true);
+  assert.equal(result.offsiteSuccess, false);
+  assert.equal(result.localVerificationSucceeded, true);
+  assert.equal(result.ledger.state, "verified");
   assert.equal(requested, 1);
   const other = new BackupCatalog({ root: join(f.root, "other") });
   const controller = new globalThis.AbortController();

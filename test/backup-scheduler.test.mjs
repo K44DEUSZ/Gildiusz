@@ -231,6 +231,10 @@ test("the real child CLI reads only fixture private env and returns minimal chec
       targetRevision,
       "--upgrade-id",
       upgradeId,
+      "--pc-location",
+      randomUUID(),
+      "--transfer-output",
+      join(f.root, "transfer.json"),
     ],
     {
       env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot },
@@ -242,7 +246,17 @@ test("the real child CLI reads only fixture private env and returns minimal chec
   );
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
-  assert.deepEqual(Object.keys(summary).sort(), ["checkpoint", "id", "sha256"]);
+  assert.deepEqual(Object.keys(summary).sort(), [
+    "checkpoint",
+    "id",
+    "localVerificationSucceeded",
+    "offsiteSuccess",
+    "sha256",
+    "state",
+  ]);
+  assert.equal(summary.state, "awaiting_offsite");
+  assert.equal(summary.localVerificationSucceeded, true);
+  assert.equal(summary.offsiteSuccess, false);
   assert.equal(summary.id, f.manifest.id);
   assert.ok(!result.stdout.includes(values.BACKUP_ENCRYPTION_KEY));
   assert.ok(!result.stdout.includes(values.DISCORD_GUILD_ID));

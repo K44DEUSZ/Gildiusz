@@ -240,12 +240,18 @@ test("format2 retains its historical requirements while format3 gates every back
       assertRuntimePackage(release, { format: 4 });
       writeFileSync(path, "format5");
     }
+    const format6 = ["scripts/prepare-legacy-source.mjs", "scripts/backup-offsite.mjs"];
+    for (const name of format6) {
+      const path = join(release, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "format6");
+    }
     writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 6 }));
     assert.throws(() => assertUpdateRuntime(release), /Withdrawn audio file/);
     for (const name of retiredAudioFiles) unlinkSync(join(release, name));
     assertUpdateRuntime(release);
     assert.throws(() => assertRuntimePackage(release, { format: 5 }), /Missing runtime file/);
-    for (const name of format5) {
+    for (const name of [...format5, ...format6]) {
       const path = join(release, name);
       unlinkSync(path);
       assert.throws(() => assertUpdateRuntime(release), /Missing runtime file/);

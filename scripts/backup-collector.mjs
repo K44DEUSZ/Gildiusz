@@ -30,6 +30,13 @@ import {
 } from "./backup-proof.mjs";
 import { readDeletionState } from "./backup-deletion-state.mjs";
 import { recoveryCredentials } from "./recovery.mjs";
+import {
+  validateOffsiteTransfer,
+  offsiteProofRequirements,
+  sealOffsiteAck,
+  readOffsiteFile,
+  writeOffsiteFile,
+} from "./backup-offsite.mjs";
 
 function validateExpected(value, now) {
   if (
@@ -366,7 +373,8 @@ async function collectWithinDeadline({
     return {
       entry: confirmed,
       ledger,
-      offsiteSuccess: ledger.state === "verified",
+      localVerificationSucceeded: true,
+      offsiteSuccess: false,
       replayed: true,
     };
   }
@@ -441,7 +449,13 @@ async function collectWithinDeadline({
     aborted(signal);
     validateExpected(expected, catalog.clock());
     ledger.assertCurrent();
-    return { entry, ledger, offsiteSuccess: ledger.state === "verified", replayed: false };
+    return {
+      entry,
+      ledger,
+      localVerificationSucceeded: true,
+      offsiteSuccess: false,
+      replayed: false,
+    };
   } catch (error) {
     // Keep only this encrypted partial + durable transfer record for explicit reconciliation.
     // Rotation never treats a failed, incomplete or ambiguously promoted transfer as a verified copy.
@@ -453,6 +467,94 @@ async function collectWithinDeadline({
       operationId: transfer.operationId,
       promoted,
     });
+  }
+}
+
+export function verifyTransferProof({
+  transfer,
+  envelope,
+  key,
+  forbiddenKeys = [],
+  now = Date.now(),
+}) {
+  transfer = validateOffsiteTransfer(transfer, now);
+  const value = verifyLatestDeletionProof({
+    envelope,
+    key,
+    forbiddenKeys,
+    now,
+    ...offsiteProofRequirements(transfer),
+  });
+  for (const field of [
+    "id",
+    "sha256",
+    "sourceId",
+    "sequence",
+    "createdAt",
+    "expiresAt",
+    "coveredFrom",
+  ])
+    if (value.meta[field] !== transfer.proof[field]) backupFailure("offsite_proof_mismatch");
+  return value;
+}
+
+/** The operator pins this independently bootstrapped PC catalogue before requesting the transfer. */
+export async function collectForOffsiteAck({
+  catalog,
+  transfer,
+  envelope,
+  key,
+  forbiddenKeys = [],
+  existingArchivePath,
+  signal,
+}) {
+  transfer = validateOffsiteTransfer(transfer, catalog.clock());
+  envelope = Buffer.from(envelope);
+  const master = key instanceof Uint8Array ? Buffer.from(key) : key;
+  try {
+    const location = await catalog.read();
+    if (
+      location.locationId !== transfer.destinationLocationId ||
+      location.locationId === transfer.sourceLocationId
+    )
+      backupFailure("offsite_location_mismatch");
+    verifyTransferProof({ transfer, envelope, key: master, forbiddenKeys, now: catalog.clock() });
+    const result = await collectArchive({
+      catalog,
+      expected: transfer.backup,
+      existingArchivePath,
+      key: master,
+      forbiddenKeys,
+      latestProof: envelope,
+      proofRequirements: offsiteProofRequirements(transfer),
+      signal,
+    });
+    if (result.ledger.state !== "verified") backupFailure("proof_sync_required");
+    const confirmed = await catalog.confirmArchive(transfer.backup);
+    if (signal?.aborted) backupFailure("backup_transfer_aborted");
+    if (confirmed.locationId !== transfer.destinationLocationId)
+      backupFailure("offsite_location_mismatch");
+    result.ledger.assertCurrent();
+    verifyTransferProof({
+      transfer,
+      envelope: readOffsiteFile(
+        join(catalog.root, "deletion-ledger", `deletion-proof-${transfer.proof.id}.gldproof`),
+        4 * 1024 * 1024,
+      ),
+      key: master,
+      forbiddenKeys,
+      now: catalog.clock(),
+    });
+    const ack = sealOffsiteAck({
+      transfer,
+      verifiedAt: confirmed.verifiedAt,
+      key: master,
+      forbiddenKeys,
+      now: catalog.clock(),
+    });
+    return { ...result, entry: confirmed, ack };
+  } finally {
+    if (master instanceof Uint8Array) master.fill(0);
   }
 }
 
@@ -469,6 +571,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
           "--ledger",
           "--proof",
           "--proof-requirements",
+          "--receipt-output",
         ].includes(args[i]) ||
         !args[i + 1] ||
         options[args[i]]
@@ -476,7 +579,40 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         backupFailure("invalid_backup_options");
       options[args[i]] = args[i + 1];
     }
-    if (command === "prune-deletions") {
+    if (command === "init-offsite") {
+      if (
+        process.platform !== "win32" ||
+        Object.keys(options).length !== 1 ||
+        !options["--catalog"]
+      )
+        backupFailure("offsite_pc_initialization_required");
+      const state = await new BackupCatalog({ root: resolve(options["--catalog"]) }).read();
+      console.log(JSON.stringify({ locationId: state.locationId }));
+    } else if (command === "collect-offsite") {
+      if (
+        process.platform !== "win32" ||
+        Object.keys(options).sort().join() !==
+          ["--archive", "--catalog", "--metadata", "--proof", "--receipt-output"].sort().join()
+      )
+        backupFailure("invalid_offsite_options");
+      const result = await collectForOffsiteAck({
+        catalog: new BackupCatalog({ root: resolve(options["--catalog"]) }),
+        transfer: JSON.parse(readOffsiteFile(resolve(options["--metadata"])).toString("utf8")),
+        envelope: readOffsiteFile(resolve(options["--proof"]), 4 * 1024 * 1024),
+        existingArchivePath: resolve(options["--archive"]),
+        ...recoveryCredentials(process.env),
+      });
+      writeOffsiteFile(resolve(options["--receipt-output"]), result.ack);
+      console.log(
+        JSON.stringify({
+          backupId: result.entry.id,
+          localVerificationSucceeded: true,
+          offsiteSuccess: false,
+          receiptWritten: true,
+          locationId: result.entry.locationId,
+        }),
+      );
+    } else if (command === "prune-deletions") {
       if (Object.keys(options).length !== 1 || !options["--catalog"])
         backupFailure("invalid_backup_options");
       const result = await pruneCollectedDeletionProofs({
@@ -487,6 +623,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     } else {
       if (
         command !== "collect" ||
+        options["--receipt-output"] ||
         !options["--catalog"] ||
         !options["--archive"] ||
         !options["--metadata"] ||
@@ -517,6 +654,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         JSON.stringify({
           backupId: result.entry.id,
           verified: true,
+          localVerificationSucceeded: result.localVerificationSucceeded,
           offsiteSuccess: result.offsiteSuccess,
           ledger: result.ledger.state,
         }),
