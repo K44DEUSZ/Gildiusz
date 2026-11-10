@@ -6,13 +6,22 @@ import {
   MessageFlags,
   ApplicationFlagsBitField,
   PermissionFlagsBits as P,
+  REST,
 } from "discord.js";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { loadConfig, loadCredentials } from "../config.js";
 import { Store } from "../storage/store.js";
 import { acquireLock } from "../storage/lock.js";
+import {
+  acquireDataRootLease,
+  assertRestoreStartupAllowed,
+  currentRecoverySchemaPolicy,
+  schemaOf,
+  verifySchema,
+} from "../storage/recovery/index.js";
 import { BotContext } from "./context.js";
 import { AttachmentFilter } from "./attachments.js";
 import { discordRoomService, roomCommand } from "./rooms.js";
@@ -28,7 +37,19 @@ import { GuildRegistry } from "./guild-registry.js";
 import { PublicInstallations } from "../control/installations.js";
 import { publicConfig } from "../control/configuration.js";
 import { startControlServer } from "../control/server.js";
-import { ControlError, type ControlSnapshot } from "../control/contracts.js";
+import {
+  ControlError,
+  parseControlPath,
+  parseVersionedRequest,
+  versionedResponse,
+  controlOperations,
+  type ControlSnapshot,
+} from "../control/contracts.js";
+import { JobRunner } from "../core/jobs/runner.js";
+import { JobStore } from "../core/jobs/store.js";
+import { pruneDomainData } from "../storage/domain-retention.js";
+import { ModuleRuntime } from "./module-runtime.js";
+import { memberFacts, freshMember } from "./module-permissions.js";
 import {
   authorizeControl,
   controlResources,
@@ -39,8 +60,27 @@ import {
   selectionChoices,
 } from "./control.js";
 import { commands } from "./commands.js";
+import { announcementInteraction } from "./announcement-commands.js";
+import { communityInteraction } from "./community-commands.js";
+import { MeetingMembership } from "./meeting-membership.js";
+import { TwitchRuntime } from "./twitch-runtime.js";
+import { twitchConfiguration } from "./twitch-config.js";
+import { createTwitchIngress, type TwitchIngress } from "../modules/twitch/server.js";
+import { ModuleSettingsStore } from "../core/modules/settings.js";
+import { AnnouncementAssetStore } from "../modules/announcement-assets/store.js";
+import { freshBotGuildPresence } from "./guild-presence.js";
+import { GuildActivity } from "./guild-activity.js";
+import { RetentionSchedule } from "./retention-schedule.js";
+import {
+  GuildUninstallRetention,
+  readUninstallMarker,
+  recordGuildMembership,
+  type PurgeOutcome,
+} from "../storage/uninstall-retention.js";
 interface GuildRuntime {
   context: BotContext;
+  modules: ModuleRuntime;
+  membership: MeetingMembership;
   filter: AttachmentFilter;
   rooms: ReturnType<typeof discordRoomService> | null;
   retentionAt: number;
@@ -49,14 +89,20 @@ interface GuildRuntime {
 }
 
 async function main(): Promise<void> {
+  const path = healthPath(),
+    dataRoot = dirname(path);
+  assertRestoreStartupAllowed(dataRoot);
   const credentials = loadCredentials();
+  const memberEvents = process.env.GILDIUSZ_MEMBER_EVENTS === "1";
+  const publicDirectory = resolve(process.env.CONTROL_DATA_DIR || join(dataRoot, "public-guilds"));
   const publicInstallations =
-    process.env.PUBLIC_INSTALLS === "1"
-      ? new PublicInstallations(
-          process.env.CONTROL_DATA_DIR || join(dirname(healthPath()), "public-guilds"),
-        )
+    process.env.PUBLIC_INSTALLS === "1" || existsSync(join(publicDirectory, "installations.json"))
+      ? new PublicInstallations(publicDirectory)
       : undefined;
-  const legacy = loadInstallations();
+  const legacy =
+    publicInstallations && !process.env.GUILDS_PATH && !process.env.DISCORD_GUILD_ID
+      ? []
+      : loadInstallations();
   const installations = [
     ...legacy,
     ...(publicInstallations
@@ -72,6 +118,8 @@ async function main(): Promise<void> {
     }),
   );
   const stores = new Map<string, Store>();
+  const guildReleases = new Map<string, () => Promise<void>>();
+  const openingStores = new Map<string, Promise<void>>();
   const releases: (() => Promise<void>)[] = [];
   const client = new Client({
     intents: [
@@ -80,31 +128,256 @@ async function main(): Promise<void> {
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.GuildMessageReactions,
       GatewayIntentBits.MessageContent,
+      ...(memberEvents ? [GatewayIntentBits.GuildMembers] : []),
     ],
-    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
+    partials: [
+      Partials.Message,
+      Partials.Channel,
+      Partials.Reaction,
+      Partials.User,
+      ...(memberEvents ? [Partials.GuildMember] : []),
+    ],
     allowedMentions: noMentions,
     rest: { retries: 0, timeout: 15000 },
   });
+  const publicationRest = new REST({
+    retries: 0,
+    timeout: 15000,
+    rejectOnRateLimit: () => true,
+  }).setToken(credentials.token);
   const registry = new GuildRegistry<GuildRuntime>(installations);
   let stopping = false,
     ticking = false,
     initializing = false,
-    connected = false;
+    connected = false,
+    ownsDataRoot = false;
   const inFlight = new Set<Promise<unknown>>();
+  const guildActivity = new GuildActivity();
   const controlTasks = new Set<Promise<unknown>>();
   const changing = new Set<string>();
+  const uninstalled = new Set<string>();
+  const guildEpochs = new Map<string, number>();
+  const purgingGuilds = new Set<string>();
+  let uninstallRetention: GuildUninstallRetention | undefined;
+  let uninstallSweepAt = 0;
+  let uninstallSweeping = false;
+  let uninstallCursor = 0;
+  const retentionSchedule = new RetentionSchedule();
+  const localRetentionBusy = new Set<string>();
+  const closingRuntimes = new Map<string, GuildRuntime>();
+  const retentionWarnings = new Map<string, string>();
   let controlServer: Server | undefined;
-  function track(task: Promise<unknown>): void {
+  let twitch: TwitchRuntime | undefined;
+  let integrationDatabase: DatabaseSync | undefined;
+  let twitchIngress: TwitchIngress | undefined;
+  const epoch = (guildId: string) => guildEpochs.get(guildId) ?? 0;
+  const bumpEpoch = (guildId: string) => guildEpochs.set(guildId, epoch(guildId) + 1);
+  async function openStore(installation: GuildInstallation): Promise<void> {
+    if (stores.has(installation.guildId)) return;
+    const pending = openingStores.get(installation.guildId);
+    if (pending) return pending;
+    const work = (async () => {
+      const release =
+        guildReleases.get(installation.guildId) ?? (await acquireLock(installation.databasePath));
+      try {
+        if (stopping) throw Object.assign(Error("Startup stopped."), { code: "stopping" });
+        stores.set(
+          installation.guildId,
+          new Store(installation.databasePath, installation.guildId),
+        );
+        guildReleases.set(installation.guildId, release);
+      } catch (error) {
+        await release();
+        guildReleases.delete(installation.guildId);
+        throw error;
+      }
+    })().finally(() => openingStores.delete(installation.guildId));
+    openingStores.set(installation.guildId, work);
+    await work;
+  }
+  async function presentInstallation(guildId: string): Promise<void> {
+    if (stopping) return;
+    const started = epoch(guildId);
+    uninstalled.delete(guildId);
+    // A closed Store belongs to the purge callback until it returns; a join only changes its fence.
+    if (purgingGuilds.has(guildId)) return;
+    if (uninstallRetention && !uninstallRetention.cancelPrepared(guildId)) {
+      purgingGuilds.add(guildId);
+      changing.add(guildId);
+      return;
+    }
+    let installation = installations.find((entry) => entry.guildId === guildId);
+    if (!installation) {
+      const configured = legacy.find((entry) => entry.guildId === guildId);
+      if (configured) {
+        installation = configured;
+        installations.push(configured);
+        configs.set(guildId, loadConfig(configured.configPath));
+      }
+    }
+    if (!installation) return;
+    await openStore(installation);
+    if (stopping || epoch(guildId) !== started || uninstalled.has(guildId)) return;
+    const store = stores.get(guildId)!;
+    recordGuildMembership(store, guildId, {
+      state: "present",
+      source: "gateway-join",
+      observedAt: Date.now(),
+    });
+    purgingGuilds.delete(guildId);
+    changing.delete(guildId);
+    jobRunner.resumeGuild(guildId);
+    registry.register(installation);
+  }
+  async function withClosedGuild(
+    guildId: string,
+    work: () => Promise<PurgeOutcome>,
+  ): Promise<PurgeOutcome | undefined> {
+    if (stopping || initializing || controlTasks.size) return;
+    changing.add(guildId);
+    purgingGuilds.add(guildId);
+    const runtime = registry.get(guildId) ?? closingRuntimes.get(guildId);
+    if (runtime) closingRuntimes.set(guildId, runtime);
+    registry.remove(guildId);
+    if (!(await jobRunner.suspendGuild(guildId))) return;
+    if (!(await guildActivity.drain(guildId))) return;
+    if (runtime) {
+      const drained = await new Promise<boolean>((resolve) => {
+        const deadline = setTimeout(() => resolve(false), 5000);
+        void Promise.all([
+          runtime.membership.stop(),
+          runtime.filter.drain(),
+          runtime.rooms?.queue.drain(),
+          runtime.roleSelection?.queue.drain(),
+        ]).then(
+          () => {
+            clearTimeout(deadline);
+            resolve(true);
+          },
+          () => {
+            clearTimeout(deadline);
+            resolve(false);
+          },
+        );
+      });
+      if (!drained) return;
+      closingRuntimes.delete(guildId);
+    }
+    stores.get(guildId)?.close();
+    stores.delete(guildId);
+    if (!guildReleases.has(guildId)) {
+      const installation =
+        installations.find((entry) => entry.guildId === guildId) ??
+        uninstallRetention?.pendingInstallations().find((entry) => entry.guildId === guildId);
+      if (!installation) throw Error("Missing retention installation.");
+      guildReleases.set(
+        guildId,
+        await acquireLock(installation.databasePath, { createTarget: false }),
+      );
+    }
+    const outcome = await work();
+    if (outcome.store === "reopen") {
+      const installation = installations.find((entry) => entry.guildId === guildId);
+      if (installation && !stores.has(guildId))
+        stores.set(guildId, new Store(installation.databasePath, guildId));
+      purgingGuilds.delete(guildId);
+      changing.delete(guildId);
+      jobRunner.resumeGuild(guildId);
+      if (installation && !uninstalled.has(guildId) && client.guilds.cache.has(guildId))
+        await presentInstallation(guildId);
+    }
+    return outcome;
+  }
+  async function sweepUninstalled(): Promise<void> {
+    if (!uninstallRetention || stopping || !connected || !client.isReady()) return;
+    const candidates = new Map(
+      [
+        ...installations.filter((entry) => uninstalled.has(entry.guildId)),
+        ...uninstallRetention.pendingInstallations(),
+      ].map((entry) => [entry.guildId, entry]),
+    );
+    const entries = [...candidates.values()];
+    for (let offset = 0; offset < Math.min(5, entries.length); offset++) {
+      const installation = entries[(uninstallCursor + offset) % entries.length];
+      const guildId = installation.guildId,
+        started = epoch(guildId);
+      const freshProof = () => freshBotGuildPresence(publicationRest, guildId);
+      const checkFence = () => !stopping && client.isReady() && epoch(guildId) === started;
+      const store = stores.get(guildId);
+      if (store && !uninstallRetention.status(guildId)) {
+        const proof = await freshProof();
+        if (!checkFence()) continue;
+        recordGuildMembership(store, guildId, proof);
+        if (proof.state === "present") {
+          uninstalled.delete(guildId);
+          changing.delete(guildId);
+          purgingGuilds.delete(guildId);
+          jobRunner.resumeGuild(guildId);
+          const full = installations.find((entry) => entry.guildId === guildId);
+          if (full) registry.register(full);
+          continue;
+        }
+        if (!readUninstallMarker(store, guildId)) continue;
+      }
+      const result = await uninstallRetention.purge(installation, store, {
+        freshProof,
+        checkFence,
+        withClosedGuild,
+      });
+      if (result.state === "rejoined") {
+        uninstalled.delete(guildId);
+        purgingGuilds.delete(guildId);
+        changing.delete(guildId);
+        jobRunner.resumeGuild(guildId);
+        const full = installations.find((entry) => entry.guildId === guildId);
+        if (full && stores.has(guildId)) {
+          recordGuildMembership(stores.get(guildId)!, guildId, {
+            state: "present",
+            source: "gateway-join",
+            observedAt: Date.now(),
+          });
+          registry.register(full);
+        }
+      }
+      if (result.state === "purged") {
+        stores.delete(guildId);
+        configs.delete(guildId);
+        retentionSchedule.forget(guildId);
+        const index = installations.findIndex((entry) => entry.guildId === guildId);
+        if (index >= 0) installations.splice(index, 1);
+        await guildReleases.get(guildId)?.();
+        guildReleases.delete(guildId);
+        purgingGuilds.delete(guildId);
+        changing.delete(guildId);
+        jobRunner.resumeGuild(guildId);
+        if (
+          !uninstalled.has(guildId) &&
+          client.guilds.cache.has(guildId) &&
+          legacy.some((entry) => entry.guildId === guildId)
+        )
+          await presentInstallation(guildId);
+      }
+      if (result.state === "pending" || result.state === "deferred") {
+        const warning = `${result.state}:${result.phase ?? "preflight"}`;
+        if (retentionWarnings.get(guildId) !== warning)
+          console.error(`Uninstall retention incomplete: ${guildId}; ${warning}`);
+        retentionWarnings.set(guildId, warning);
+      } else retentionWarnings.delete(guildId);
+    }
+    if (entries.length) uninstallCursor = (uninstallCursor + 5) % entries.length;
+  }
+  function track(task: Promise<unknown>, guildId?: string | null): Promise<unknown> {
     const tracked = task
       .catch((error) => console.error(`Event failed: ${errorCode(error)}`))
       .finally(() => inFlight.delete(tracked));
     inFlight.add(tracked);
+    if (guildId) guildActivity.track(guildId, tracked);
+    return tracked;
   }
-  const path = healthPath();
-  mkdirSync(dirname(path), { recursive: true });
   const available = (runtime: GuildRuntime) =>
     runtime.context.guild.available && client.isReady() && client.ws.status === 0;
   function health() {
+    if (!ownsDataRoot) return;
     const guilds = registry.statuses(available);
     const ready =
       !stopping && connected && (guilds.length === 0 || guilds.some((guild) => guild.ready));
@@ -112,7 +385,8 @@ async function main(): Promise<void> {
       path,
       JSON.stringify({
         ready,
-        degraded: guilds.some((guild) => !guild.ready),
+        degraded: guilds.some((guild) => !guild.ready) || retentionWarnings.size > 0,
+        retentionWarnings: [...retentionWarnings].map(([guildId, state]) => ({ guildId, state })),
         guilds,
         updated: Date.now(),
       }) + "\n",
@@ -124,6 +398,35 @@ async function main(): Promise<void> {
       ? runtime
       : undefined;
   }
+  const jobRunner = new JobRunner(
+    () =>
+      registry.values().map((runtime) => ({
+        guildId: runtime.context.guild.id,
+        store: runtime.modules.jobs,
+        available: () => !stopping && !changing.has(runtime.context.guild.id) && available(runtime),
+      })),
+    async (job, execution) => {
+      const runtime = lookup(job.guildId);
+      if (!runtime)
+        return {
+          state: "retry",
+          at: Date.now() + 5000,
+          error: "guild_unavailable",
+          rateLimited: true,
+        };
+      if (job.type.startsWith("twitch."))
+        return twitch
+          ? twitch.execute(job, execution)
+          : {
+              state: "retry",
+              at: execution.now() + 60000,
+              error: "integration_unavailable",
+              rateLimited: true,
+            };
+      return runtime.modules.execute(job, execution);
+    },
+    { onError: (code, jobId) => console.error(`Job ${jobId}: ${code}`) },
+  );
   async function createRuntime(installation: GuildInstallation): Promise<GuildRuntime> {
     const config = configs.get(installation.guildId)!;
     const store = stores.get(installation.guildId)!;
@@ -135,8 +438,25 @@ async function main(): Promise<void> {
     const me = await guild.members.fetchMe();
     if (me.permissions.has(P.Administrator)) throw new Error("Remove Administrator from the bot.");
     const context = new BotContext(client, guild, store, config, environment, !installation.public);
+    let assets: AnnouncementAssetStore | undefined;
+    if (process.env.GILDIUSZ_BETA_MODULES === "1") {
+      try {
+        assets = new AnnouncementAssetStore(
+          store.db,
+          guild.id,
+          join(dirname(path), "announcement-assets"),
+        );
+      } catch (error) {
+        console.error(`Announcement images unavailable: ${guild.id}; ${errorCode(error)}`);
+      }
+    }
+    const modules = new ModuleRuntime(context, publicationRest, undefined, twitch, assets);
+    const membership = new MeetingMembership(modules.community, publicationRest);
+    modules.community.setMembershipCheck((userId) => membership.check(userId));
     const filter = new AttachmentFilter(context);
-    const rooms = context.control.rooms.categoryId ? discordRoomService(context) : null;
+    const rooms = context.control.rooms.categoryId
+      ? discordRoomService(context, publicationRest)
+      : null;
     await rooms?.reconcile();
     if (context.control.modules.reactions && store.resource("control.role-panel"))
       await finishRolePanel(context, rolePanel(context));
@@ -148,6 +468,8 @@ async function main(): Promise<void> {
     console.log(`Guild started: ${guild.id}`);
     return {
       context,
+      modules,
+      membership,
       filter,
       rooms,
       roleSelection,
@@ -183,6 +505,84 @@ async function main(): Promise<void> {
   async function controlRequest(path: string, body: unknown): Promise<unknown> {
     if (stopping)
       throw new ControlError(503, "stopping", "Bot jest ponownie uruchamiany. Spróbuj za chwilę.");
+    const route = parseControlPath(path);
+    if (!route) throw new ControlError(404, "not_found", "Nie znaleziono operacji.");
+    if (!route.legacy) {
+      const request = parseVersionedRequest(body, {
+        mutation: controlOperations[route.operation].mutation,
+      });
+      const payload =
+        request.payload && typeof request.payload === "object" && !Array.isArray(request.payload)
+          ? (request.payload as Record<string, unknown>)
+          : {};
+      if (route.operation === "guilds.list") {
+        const authorization = await authorizeControl(client, undefined, request);
+        const candidates = payload.guildIds;
+        if (
+          !Array.isArray(candidates) ||
+          candidates.length > 200 ||
+          candidates.some((id) => typeof id !== "string" || !/^\d{17,20}$/.test(id))
+        )
+          throw new ControlError(400, "guilds", "Nieprawidłowa lista serwerów.");
+        const guilds: string[] = [];
+        for (const id of new Set(candidates as string[])) {
+          const runtime = lookup(id);
+          const guild = client.guilds.cache.get(id);
+          if (!guild) continue;
+          try {
+            const { facts } = await freshMember(guild, authorization.actor);
+            if (
+              !facts.pending &&
+              !facts.timedOut &&
+              !facts.isBot &&
+              (runtime || facts.owner || facts.manageGuild)
+            )
+              guilds.push(id);
+          } catch (error) {
+            // Revoked membership omits this guild; an outage cannot look like lost access.
+            if (!(error instanceof ControlError && error.status === 403)) throw error;
+          }
+        }
+        return versionedResponse({ guilds });
+      }
+      if (route.operation === "settings.save" && payload.configuration !== undefined) {
+        const saved = await controlRequest(`/guilds/${route.guildId}/save`, {
+          actor: request.actor,
+          accessToken: request.accessToken,
+          configuration: payload.configuration,
+        });
+        return versionedResponse(saved);
+      }
+      const authorization = await authorizeControl(client, route.guildId, request, {
+        manage: false,
+      });
+      let runtime = lookup(route.guildId);
+      if (
+        !runtime &&
+        authorization.guild &&
+        authorization.member &&
+        (authorization.guild.ownerId === authorization.actor ||
+          authorization.member.permissions.has(P.ManageGuild))
+      ) {
+        await controlRequest(`/guilds/${route.guildId}`, {
+          actor: request.actor,
+          accessToken: request.accessToken,
+        });
+        runtime = lookup(route.guildId);
+      }
+      if (!runtime || !authorization.guild || !authorization.member)
+        throw new ControlError(503, "not_ready", "Bot uruchamia ten serwer. Spróbuj za chwilę.");
+      const data = await runtime.modules.request(
+        memberFacts(authorization.guild, authorization.member),
+        route.operation,
+        request.payload,
+        route.objectId,
+        request.requestId,
+      );
+      if (route.operation === "settings.read")
+        return versionedResponse({ ...(await snapshot(runtime)), ...(data as object) });
+      return versionedResponse(data);
+    }
     const guildId = path.split("/")[2];
     const authorization = await authorizeControl(client, guildId, body);
     if (!guildId) {
@@ -198,7 +598,7 @@ async function main(): Promise<void> {
         const guild = client.guilds.cache.get(id);
         if (!guild) continue;
         try {
-          const member = await guild.members.fetch({ user: authorization.actor, force: true });
+          const { member } = await freshMember(guild, authorization.actor);
           if (
             !member.pending &&
             !member.isCommunicationDisabled() &&
@@ -216,11 +616,10 @@ async function main(): Promise<void> {
     let runtime = lookup(guildId);
     let installation = installations.find((entry) => entry.guildId === guildId);
     if (!installation) {
-      if (!publicInstallations || !authorization.guild)
+      if (process.env.PUBLIC_INSTALLS !== "1" || !publicInstallations || !authorization.guild)
         throw new ControlError(404, "not_configured", "Ten serwer nie ma jeszcze konfiguracji.");
       installation = publicInstallations.add(guildId, authorization.guild.ownerId);
-      releases.push(await acquireLock(installation.databasePath));
-      stores.set(guildId, new Store(installation.databasePath, guildId));
+      await openStore(installation);
       configs.set(guildId, publicConfig());
       installations.push(installation);
       runtime = await createRuntime(installation);
@@ -325,7 +724,64 @@ async function main(): Promise<void> {
     if (stopping) return;
     // A slow guild API request must not suppress health signals or other guilds' maintenance.
     health();
+    // Local retention continues during a Gateway outage; it performs no Discord effects.
+    const retentionIds = [...stores.keys()].filter(
+      (id) => !changing.has(id) && !localRetentionBusy.has(id),
+    );
+    for (const guildId of retentionSchedule.take(
+      retentionIds,
+      Date.now(),
+      5 - localRetentionBusy.size,
+    )) {
+      const store = stores.get(guildId)!;
+      localRetentionBusy.add(guildId);
+      track(
+        (async () => {
+          try {
+            pruneDomainData(new JobStore(store.db), guildId);
+            const assetDirectory = join(dataRoot, "announcement-assets", guildId);
+            if (
+              existsSync(assetDirectory) ||
+              store.db.prepare("SELECT 1 FROM announcement_assets LIMIT 1").get()
+            ) {
+              const assets =
+                registry.get(guildId)?.modules.announcementAssets ??
+                new AnnouncementAssetStore(
+                  store.db,
+                  guildId,
+                  join(dataRoot, "announcement-assets"),
+                );
+              await assets.prune();
+            }
+          } catch (error) {
+            retentionSchedule.retry(guildId, Date.now());
+            console.error(`Data retention failed: ${guildId}; ${errorCode(error)}`);
+          } finally {
+            localRetentionBusy.delete(guildId);
+          }
+        })(),
+        guildId,
+      );
+    }
     if (!connected || !client.isReady()) return;
+    if (!uninstallSweeping && Date.now() >= uninstallSweepAt) {
+      uninstallSweeping = true;
+      uninstallSweepAt = Date.now() + 60000;
+      track(
+        sweepUninstalled().finally(() => {
+          uninstallSweeping = false;
+        }),
+      );
+    }
+    if (twitch) track(twitch.pump());
+    for (const runtime of registry.values()) {
+      try {
+        runtime.modules.sync();
+      } catch (error) {
+        console.error(`Module sync failed: ${errorCode(error)}`);
+      }
+    }
+    track(jobRunner.tick());
     if (!initializing) {
       initializing = true;
       track(
@@ -344,23 +800,29 @@ async function main(): Promise<void> {
     track(
       (async () => {
         await Promise.all(
-          registry.values().map(async (runtime) => {
-            if (!available(runtime) || changing.has(runtime.context.guild.id)) return;
-            try {
-              await runtime.rooms?.reconcile();
-              if (Date.now() >= runtime.rolesAt) {
-                runtime.rolesAt = Date.now() + 300000;
-                if (runtime.roleSelection) await runtime.roleSelection.reconcile();
-                else runtime.roleSelection = await discordRoleSelection(runtime.context);
-              }
-              if (Date.now() > runtime.retentionAt) {
-                await runtime.context.retention();
-                runtime.retentionAt = Date.now() + 3600000;
-              }
-            } catch (error) {
-              await runtime.context.alert("maintenance", "runtime", errorCode(error));
-            }
-          }),
+          registry.values().map((runtime) =>
+            track(
+              (async () => {
+                if (!available(runtime) || changing.has(runtime.context.guild.id)) return;
+                try {
+                  await runtime.rooms?.reconcile();
+                  await runtime.membership.sweep();
+                  if (Date.now() >= runtime.rolesAt) {
+                    runtime.rolesAt = Date.now() + 300000;
+                    if (runtime.roleSelection) await runtime.roleSelection.reconcile();
+                    else runtime.roleSelection = await discordRoleSelection(runtime.context);
+                  }
+                  if (Date.now() > runtime.retentionAt) {
+                    await runtime.context.retention();
+                    runtime.retentionAt = Date.now() + 3600000;
+                  }
+                } catch (error) {
+                  await runtime.context.alert("maintenance", "runtime", errorCode(error));
+                }
+              })(),
+              runtime.context.guild.id,
+            ),
+          ),
         );
         health();
       })().finally(() => {
@@ -374,6 +836,7 @@ async function main(): Promise<void> {
     stopping = true;
     clearInterval(timer);
     controlServer?.close();
+    twitch?.close();
     health();
     client.removeAllListeners(Events.VoiceStateUpdate);
     client.removeAllListeners(Events.MessageCreate);
@@ -381,19 +844,33 @@ async function main(): Promise<void> {
     client.removeAllListeners(Events.InteractionCreate);
     client.removeAllListeners(Events.MessageReactionAdd);
     client.removeAllListeners(Events.MessageReactionRemove);
+    client.removeAllListeners(Events.GuildMemberRemove);
+    client.removeAllListeners(Events.GuildMemberAdd);
+    client.removeAllListeners(Events.GuildMemberUpdate);
+    client.removeAllListeners(Events.GuildCreate);
+    client.removeAllListeners(Events.GuildDelete);
+    client.removeAllListeners(Events.ClientReady);
     shutdown = (async () => {
       try {
+        await Promise.all(registry.values().map((runtime) => runtime.membership.stop()));
+        await twitchIngress?.close();
+        await jobRunner.stop();
         await Promise.all([...inFlight, ...controlTasks]);
+        await Promise.allSettled([...openingStores.values()]);
         await Promise.all(
           registry.values().map(async (runtime) => {
             await runtime.filter.drain();
             await runtime.rooms?.queue.drain();
             await runtime.roleSelection?.queue.drain();
+            await runtime.membership.drain();
           }),
         );
       } finally {
+        controlServer?.close();
         await client.destroy();
         for (const store of stores.values()) store.close();
+        for (const release of guildReleases.values()) await release();
+        integrationDatabase?.close();
         for (const release of releases.reverse()) await release();
       }
     })();
@@ -408,10 +885,12 @@ async function main(): Promise<void> {
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   client.once(Events.ClientReady, () => {
-    void (async () => {
+    if (stopping) return;
+    const startup = (async () => {
       if (client.user!.id !== credentials.clientId)
         throw Error("Bot identity differs from DISCORD_CLIENT_ID.");
       const application = await client.application!.fetch();
+      if (stopping) return;
       const flags = ApplicationFlagsBitField.Flags;
       if (
         !application.flags.has(flags.GatewayMessageContent) &&
@@ -421,6 +900,7 @@ async function main(): Promise<void> {
       if (publicInstallations) {
         await client.application!.commands.set(commands());
       }
+      if (stopping) return;
       if (process.env.CONTROL_KEY)
         controlServer = await startControlServer(
           process.env.CONTROL_KEY,
@@ -432,36 +912,76 @@ async function main(): Promise<void> {
             return task;
           },
         );
-      for (const installation of installations)
-        if (installation.public && !client.guilds.cache.has(installation.guildId))
+      if (stopping) {
+        controlServer?.close();
+        return;
+      }
+      const known = new Map([...legacy, ...installations].map((entry) => [entry.guildId, entry]));
+      for (const installation of known.values()) {
+        if (!client.guilds.cache.has(installation.guildId)) {
+          uninstalled.add(installation.guildId);
           registry.remove(installation.guildId);
+        } else {
+          await presentInstallation(installation.guildId);
+        }
+      }
       connected = true;
       console.log("Bot connected. Timezone: Europe/Warsaw.");
-    })().catch(async (error) => {
+    })();
+    track(startup);
+    void startup.catch((error) => {
+      if (stopping) return;
       console.error(`Startup failed: ${errorCode(error)}`);
-      await stop();
+      void stop().catch(() => {
+        process.exitCode = 1;
+      });
       process.exitCode = 1;
     });
   });
   // Losing access to one guild must not restart the other installations.
   client.on(Events.GuildCreate, (guild) => {
-    const installation = installations.find((entry) => entry.guildId === guild.id);
-    if (installation) registry.register(installation);
+    if (stopping) return;
+    bumpEpoch(guild.id);
+    track(presentInstallation(guild.id), guild.id);
   });
   client.on(Events.GuildDelete, (guild) => {
+    if (stopping) return;
+    bumpEpoch(guild.id);
+    uninstalled.add(guild.id);
     const runtime = registry.invalidate(guild.id);
+    if (runtime) closingRuntimes.set(guild.id, runtime);
     if (installations.find((entry) => entry.guildId === guild.id)?.public)
       registry.remove(guild.id);
     if (runtime)
       track(
         Promise.all([
           runtime.filter.drain(),
+          runtime.membership.stop(),
           runtime.rooms?.queue.drain(),
           runtime.roleSelection?.queue.drain(),
-        ]),
+        ]).finally(() => {
+          if (closingRuntimes.get(guild.id) === runtime) closingRuntimes.delete(guild.id);
+        }),
+        guild.id,
       );
     health();
   });
+  if (memberEvents) {
+    // Fresh REST membership also makes a delayed or duplicate event safe after rejoining.
+    for (const event of [Events.GuildMemberRemove, Events.GuildMemberAdd] as const)
+      client.on(event, (member) => {
+        const runtime = lookup(member.guild.id);
+        if (runtime) track(runtime.membership.check(member.id), member.guild.id);
+      });
+    client.on(Events.GuildMemberUpdate, (_previous, member) => {
+      const runtime = lookup(member.guild.id);
+      if (runtime)
+        track(
+          Promise.resolve().then(() => runtime.modules.community.memberUpdated(member.id)),
+          member.guild.id,
+        );
+    });
+  }
   client.on(Events.MessageCreate, (message) => {
     const runtime = lookup(message.guildId);
     if (runtime) {
@@ -488,13 +1008,14 @@ async function main(): Promise<void> {
           ),
         )
       ) {
-        track(message.delete());
+        track(message.delete(), message.guildId);
         return;
       }
       track(
         filter
           .handle(message)
           .catch((error) => context?.alert("attachments", message.id, errorCode(error))),
+        message.guildId,
       );
     }
   });
@@ -507,6 +1028,7 @@ async function main(): Promise<void> {
         filter
           .handle(message)
           .catch((error) => context?.alert("attachments", message.id, errorCode(error))),
+        message.guildId,
       );
   });
   for (const [event, active] of [
@@ -528,6 +1050,7 @@ async function main(): Promise<void> {
             active,
           })
           .catch((error) => runtime.context.alert("role-selection", user.id, errorCode(error))),
+        reaction.message.guildId,
       );
     });
   client.on(Events.VoiceStateUpdate, (previous, state) => {
@@ -581,13 +1104,14 @@ async function main(): Promise<void> {
         }
         await rooms.reconcile();
       })().catch((error) => context?.alert("rooms", state.id, errorCode(error))),
+      state.guild.id,
     );
   });
   client.on(Events.InteractionCreate, (interaction) => {
     if (stopping) return;
     const runtime = lookup(interaction.guildId);
     if (!runtime) {
-      if (interaction.isChatInputCommand())
+      if (interaction.isRepliable())
         track(
           interaction.reply({
             content:
@@ -616,6 +1140,8 @@ async function main(): Promise<void> {
           return;
         }
         if (await settingsInteraction(context, interaction)) return;
+        if (await announcementInteraction(runtime.modules, interaction)) return;
+        if (await communityInteraction(runtime.modules, interaction)) return;
         if (!interaction.isChatInputCommand()) return;
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         try {
@@ -643,14 +1169,144 @@ async function main(): Promise<void> {
       })().catch((error) => {
         console.error(`Interaction failed: ${errorCode(error)}`);
       }),
+      interaction.guildId,
     );
   });
   client.on(Events.Error, (error) => console.error(`Discord error: ${errorCode(error)}`));
-  health();
   try {
-    for (const installation of installations) {
-      releases.push(await acquireLock(installation.databasePath));
-      stores.set(installation.guildId, new Store(installation.databasePath, installation.guildId));
+    releases.push(await acquireDataRootLease(dataRoot));
+    ownsDataRoot = true;
+    assertRestoreStartupAllowed(dataRoot);
+    health();
+    uninstallRetention = new GuildUninstallRetention({
+      dataRoot,
+      databaseRoots: [
+        ...new Set([
+          dataRoot,
+          resolve(process.env.CONTROL_DATA_DIR || join(dataRoot, "public-guilds")),
+          ...installations.map((entry) => dirname(entry.databasePath)),
+        ]),
+      ],
+      assetsRoot: join(dataRoot, "announcement-assets"),
+      registry: publicInstallations,
+      hub: () =>
+        integrationDatabase ??
+        (existsSync(
+          resolve(process.env.INTEGRATIONS_DATABASE_PATH || join(dataRoot, "integrations.sqlite")),
+        )
+          ? undefined
+          : null),
+    });
+    for (const installation of [...installations]) {
+      const pending = uninstallRetention.status(installation.guildId);
+      if (pending && !pending.reopenable) {
+        purgingGuilds.add(installation.guildId);
+        changing.add(installation.guildId);
+        registry.remove(installation.guildId);
+        continue;
+      }
+      if (
+        !existsSync(installation.databasePath) &&
+        uninstallRetention.deletionLedger(installation.guildId)
+      ) {
+        registry.remove(installation.guildId);
+        const index = installations.findIndex((entry) => entry === installation);
+        if (index >= 0) installations.splice(index, 1);
+        configs.delete(installation.guildId);
+        const replacement = publicInstallations
+          ?.values()
+          .find((entry) => entry.guildId === installation.guildId);
+        if (replacement && replacement.databasePath !== installation.databasePath) {
+          installations.push(replacement);
+          configs.set(replacement.guildId, publicConfig());
+          await openStore(replacement);
+          registry.register(replacement);
+        }
+        continue;
+      }
+      await openStore(installation);
+    }
+    if (process.env.GILDIUSZ_BETA_MODULES === "1") {
+      let integrationRelease: (() => Promise<void>) | undefined;
+      try {
+        const integration = twitchConfiguration(path);
+        integrationRelease = await acquireLock(integration.databasePath);
+        integrationDatabase = new DatabaseSync(integration.databasePath);
+        integrationDatabase.exec(
+          "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        );
+        twitch = new TwitchRuntime({
+          db: integrationDatabase,
+          configuration: integration.configuration,
+          publicationRest,
+          resolveGuild: (guildId) => {
+            const runtime = lookup(guildId);
+            return runtime
+              ? {
+                  context: runtime.context,
+                  jobs: runtime.modules.jobs,
+                  settings: runtime.modules.settings,
+                }
+              : undefined;
+          },
+          configuredGuildEnabled: (guildId) => {
+            if (stopping) return undefined;
+            if (uninstalled.has(guildId)) return false;
+            if (!connected || !client.isReady()) return undefined;
+            if (!client.guilds.cache.has(guildId)) return false;
+            const store = stores.get(guildId);
+            return store
+              ? new ModuleSettingsStore(store.db, guildId).read().enabled.integrations
+              : undefined;
+          },
+        });
+        if (integration.configuration) {
+          if (!twitch.configured) throw Error("Invalid private Twitch configuration.");
+          twitchIngress = createTwitchIngress({
+            receiver: twitch,
+            proxySecret: integration.proxyKey!,
+            forbiddenSecrets: [
+              credentials.token,
+              process.env.CONTROL_KEY ?? "",
+              integration.configuration.webhookSecret,
+              integration.configuration.clientSecret,
+            ],
+            port: integration.port,
+          });
+          await twitchIngress.listen();
+        }
+        releases.push(integrationRelease);
+      } catch (error) {
+        await twitchIngress?.close().catch(() => {});
+        twitch?.close();
+        integrationDatabase?.close();
+        await integrationRelease?.();
+        twitchIngress = undefined;
+        twitch = undefined;
+        integrationDatabase = undefined;
+        console.error(`Twitch unavailable: ${errorCode(error)}`);
+      }
+    }
+    // Turning a module off must not prevent deletion of its existing local data.
+    const retentionHubPath = resolve(
+      process.env.INTEGRATIONS_DATABASE_PATH || join(dataRoot, "integrations.sqlite"),
+    );
+    if (!integrationDatabase && existsSync(retentionHubPath)) {
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await acquireLock(retentionHubPath, { createTarget: false });
+        integrationDatabase = new DatabaseSync(retentionHubPath);
+        integrationDatabase.exec(
+          "PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000",
+        );
+        verifySchema(schemaOf(integrationDatabase, "hub"), currentRecoverySchemaPolicy().hub);
+        releases.push(release);
+      } catch (error) {
+        integrationDatabase?.close();
+        integrationDatabase = undefined;
+        await release?.();
+        console.error(`Integration data retention unavailable: ${errorCode(error)}`);
+      }
     }
     await client.login(credentials.token);
   } catch (error) {

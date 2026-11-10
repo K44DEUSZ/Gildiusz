@@ -1,17 +1,36 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdtempSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  unlinkSync,
+} from "node:fs";
+import { join, dirname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   validateBuild,
   verifyArchive,
   archiveName,
   createPackage,
+  prepareRuntimePackage,
 } from "../scripts/build-package.mjs";
 import { publishBuild } from "../scripts/publish-build.mjs";
-import { prepareRelease, validateArchiveEntries } from "../scripts/hosting.mjs";
+import {
+  assertUpdateRuntime,
+  prepareRelease,
+  validateArchiveEntries,
+} from "../scripts/hosting.mjs";
+import {
+  assertRuntimePackage,
+  validateRuntimeTree,
+  smokeRuntime,
+} from "../scripts/runtime-package.mjs";
 
 const bytes = Buffer.from("production archive"),
   sha = "a".repeat(40);
@@ -26,6 +45,144 @@ const manifest = {
   size: bytes.length,
   sha256: createHash("sha256").update(bytes).digest("hex"),
 };
+
+test(
+  "a clean production-only stage runs the packaged WASM worker without private source data",
+  { timeout: 60000 },
+  () => {
+    const directory = mkdtempSync(join(tmpdir(), "gildiusz-runtime-stage-"));
+    try {
+      const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+      prepareRuntimePackage(root, directory, { offline: true });
+      assert.ok(existsSync(join(directory, "dist/modules/announcement-assets/decode-worker.js")));
+      assert.ok(
+        existsSync(join(directory, "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm")),
+      );
+      assert.equal(existsSync(join(directory, "node_modules/typescript")), false);
+      for (const name of [
+        ".env",
+        ".env.local",
+        ".bot",
+        "data",
+        "backups",
+        "artifacts",
+        "apps",
+        ".gildiusz-web",
+      ])
+        assert.equal(existsSync(join(directory, name)), false);
+      unlinkSync(join(directory, "dist/modules/announcement-assets/decode-worker.js"));
+      assert.throws(() => assertRuntimePackage(directory));
+    } finally {
+      assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("package privacy validation blocks nested state and uploads inside an allowlisted directory", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gildiusz-runtime-privacy-"));
+  try {
+    for (const name of [
+      "dist/state.sqlite-wal",
+      "content/.bot/a.txt",
+      "node_modules/pkg/.env.local",
+      "node_modules/pkg/snapshot.gldbak",
+      "node_modules/pkg/latest.gldledger",
+      "config/restore-manifest.json",
+      "config/restore-quarantine.json",
+      "config/announcement-assets/image.png",
+    ]) {
+      const path = join(directory, ...name.split("/"));
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "private");
+      assert.throws(() => validateRuntimeTree(directory));
+      rmSync(join(directory, name.split("/")[0]), { recursive: true });
+    }
+  } finally {
+    assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy managed releases remain reusable while new manifests require the worker runtime", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gildiusz-legacy-runtime-")),
+    release = join(directory, "releases", sha);
+  try {
+    for (const name of ["dist/bot", "node_modules/discord.js"])
+      mkdirSync(join(release, name), { recursive: true });
+    for (const name of ["dist/bot/main.js", "dist/cli.js", "node_modules/discord.js/package.json"])
+      writeFileSync(join(release, name), "legacy");
+    writeFileSync(
+      join(release, "build.json"),
+      JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24 }),
+    );
+    writeFileSync(join(release, ".built"), sha);
+    assert.equal(prepareRelease(directory, manifest, bytes), release);
+    assert.throws(() => prepareRelease(directory, { ...manifest, runtimeFormat: 2 }, bytes));
+  } finally {
+    assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+test("format2 retains its historical requirements while format3 gates every backup port before downtime", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gildiusz-format3-runtime-")),
+    release = join(directory, "releases", sha);
+  try {
+    const historicalFormat2 = [
+      "dist/bot/main.js",
+      "dist/cli.js",
+      "dist/contracts/index.js",
+      "dist/contracts/node.js",
+      "dist/storage/recovery/index.js",
+      "scripts/recovery.mjs",
+      "dist/modules/announcement-assets/validate.js",
+      "dist/modules/announcement-assets/decode-worker.js",
+      "dist/modules/twitch/provider.js",
+      "node_modules/discord.js/package.json",
+      "node_modules/image-size/package.json",
+      "node_modules/@silvia-odwyer/photon-node/photon_rs.js",
+      "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm",
+    ];
+    for (const name of historicalFormat2) {
+      const path = join(release, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "historical-format2");
+    }
+    writeFileSync(
+      join(release, "build.json"),
+      JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24, runtimeFormat: 2 }),
+    );
+    writeFileSync(join(release, ".built"), sha);
+    assert.equal(prepareRelease(directory, { ...manifest, runtimeFormat: 2 }, bytes), release);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format3/);
+    assertRuntimePackage(release, { format: 2 });
+    assert.throws(() => assertRuntimePackage(release, { format: 3 }), /uninstall-retention/);
+    writeFileSync(join(release, "dist/storage/uninstall-retention.js"), "format3");
+    for (const name of ["backup-catalog", "backup-collector", "backup-ledger", "backup-scheduler"])
+      writeFileSync(join(release, "scripts", `${name}.mjs`), "format3");
+    assertRuntimePackage(release, { format: 3 });
+    writeFileSync(
+      join(release, "build.json"),
+      JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24, runtimeFormat: 3 }),
+    );
+    assertUpdateRuntime(release);
+    for (const name of [
+      "backup-catalog",
+      "backup-collector",
+      "backup-ledger",
+      "backup-scheduler",
+    ]) {
+      const path = join(release, "scripts", `${name}.mjs`);
+      unlinkSync(path);
+      assert.throws(() => assertRuntimePackage(release, { format: 3 }), /Missing runtime file/);
+      assertRuntimePackage(release, { format: 2 });
+      writeFileSync(path, "format3");
+    }
+  } finally {
+    assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 test(
   "Linux CI produces a complete production package that the host can activate without npm or compilation",
   {
@@ -37,9 +194,11 @@ test(
       const output = join(directory, "output");
       createPackage(process.cwd(), output, sha, "123");
       const metadata = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
+      assert.equal(metadata.runtimeFormat, 3);
       const release = prepareRelease(directory, metadata, readFileSync(join(output, archiveName)));
       assert.ok(existsSync(join(release, "dist", "bot", "main.js")));
       assert.ok(existsSync(join(release, "node_modules", "discord.js", "package.json")));
+      smokeRuntime(release);
       assert.equal(existsSync(join(release, "node_modules", "typescript")), false);
       assert.equal(existsSync(join(release, ".env")), false);
       assert.equal(existsSync(join(release, "data")), false);
@@ -60,6 +219,7 @@ test("deployment rejects mismatched revisions, workflow runs, platforms, corrupt
     { platform: "win32" },
     { architecture: "arm64" },
     { nodeMajor: 26 },
+    { runtimeFormat: 4 },
     { size: 100000000 },
     { sha256: "bad" },
     { archive: "../file" },
@@ -73,6 +233,9 @@ test("deployment rejects mismatched revisions, workflow runs, platforms, corrupt
     "./dist/../../shared/.env",
     "./.env",
     "./node_modules\\escape",
+    "./dist/state.sqlite",
+    "./node_modules/pkg/.env.local",
+    "./config/announcement-assets/image.png",
   ])
     assert.throws(() => validateArchiveEntries([name], ["-"]));
   for (const type of ["l", "h", "b", "p"])

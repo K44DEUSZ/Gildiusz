@@ -16,8 +16,15 @@ import { dirname, join, resolve, basename } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { archiveName, validateBuild, verifyArchive } from "./build-package.mjs";
 import { cleanLegacyBuild, pruneReleases, rotateLogs } from "./maintenance.mjs";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  validatePackagePath,
+  validatePackageFile,
+  validateRuntimeTree,
+  assertRuntimePackage,
+} from "./runtime-package.mjs";
 import { setTimeout as delay } from "node:timers/promises";
+import { randomUUID } from "node:crypto";
 
 export const repository = "https://github.com/K44DEUSZ/Gildiusz.git";
 export function expectedRepository(remote) {
@@ -261,7 +268,7 @@ async function waitReady(root, revision, after, timeout = 100000) {
   return false;
 }
 
-async function stopSupervisor(root) {
+export async function stopSupervisor(root) {
   const state = readJson(paths(root).state);
   if (!state?.supervisorPid) return;
   const matches = () => {
@@ -280,6 +287,11 @@ async function stopSupervisor(root) {
     process.kill(state.supervisorPid, "SIGKILL");
     await delay(500);
   }
+}
+
+export function startSupervisor(root) {
+  if (existsSync(paths(root).pause)) throw Error("The supervisor remains paused.");
+  background(root, "supervise", "supervisor.lock");
 }
 
 async function checkedWorkflow(sha) {
@@ -320,9 +332,12 @@ export function validateArchiveEntries(names, types) {
     "THIRD_PARTY_NOTICES.md",
     "build.json",
   ]);
-  for (const raw of names) {
+  if (names.length !== types.length) throw Error("Incomplete archive listing.");
+  for (const [index, raw] of names.entries()) {
     const name = raw.replace(/^\.\//, "");
     if (!name) continue;
+    validatePackagePath(raw);
+    if (types[index] === "-") validatePackageFile(raw);
     if (
       name.startsWith("/") ||
       name.includes("\\") ||
@@ -343,8 +358,14 @@ export function prepareRelease(root, manifest, bytes) {
   const release = join(releases, manifest.revision);
   if (existsSync(release)) {
     const previous = readJson(join(release, "build.json"));
-    if (previous?.revision !== manifest.revision || previous?.workflowRun !== manifest.workflowRun)
+    if (
+      previous?.revision !== manifest.revision ||
+      previous?.workflowRun !== manifest.workflowRun ||
+      (previous.runtimeFormat ?? 1) !== (manifest.runtimeFormat ?? 1)
+    )
       throw Error("Existing release does not match this build.");
+    validateRuntimeTree(release, { allowBuilt: true });
+    assertRuntimePackage(release, { format: manifest.runtimeFormat ?? 1 });
     return release;
   }
   const staging = mkdtempSync(join(releases, ".incoming-"));
@@ -363,7 +384,8 @@ export function prepareRelease(root, manifest, bytes) {
     if (
       metadata?.revision !== manifest.revision ||
       metadata?.workflowRun !== manifest.workflowRun ||
-      metadata?.nodeMajor !== 24
+      metadata?.nodeMajor !== 24 ||
+      (metadata.runtimeFormat ?? 1) !== (manifest.runtimeFormat ?? 1)
     )
       throw Error("Unpacked build identity differs.");
     if (
@@ -371,6 +393,8 @@ export function prepareRelease(root, manifest, bytes) {
       !existsSync(join(staging, "node_modules", "discord.js", "package.json"))
     )
       throw Error("Incomplete production package.");
+    validateRuntimeTree(staging);
+    assertRuntimePackage(staging, { format: manifest.runtimeFormat ?? 1 });
     run(process.execPath, ["dist/cli.js", "validate"], staging);
     writeFileSync(join(staging, ".built"), manifest.revision + "\n");
     renameSync(staging, release);
@@ -409,35 +433,186 @@ export function deploymentState(root, release) {
   );
 }
 
+function recovery(
+  root,
+  release,
+  command,
+  outputPath,
+  manifest,
+  sourceRevision,
+  sourceDirectory = release,
+) {
+  try {
+    return JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          "--env-file=" + join(root, "shared", ".env"),
+          join(release, "scripts", "recovery.mjs"),
+          command,
+          "--output",
+          outputPath,
+        ],
+        {
+          cwd: sourceDirectory,
+          env: {
+            ...environment,
+            ...(sourceRevision ? { DEPLOYMENT_REVISION: sourceRevision } : {}),
+          },
+          encoding: "utf8",
+          input: manifest ? JSON.stringify(manifest) : undefined,
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: 300000,
+          maxBuffer: 16 * 1024 * 1024,
+        },
+      ),
+    );
+  } catch {
+    // Child diagnostics must never echo an environment file or credential value.
+    throw Error(
+      "Recovery preflight/snapshot failed; inspect the private configuration and data locks.",
+    );
+  }
+}
+
+export async function stoppedSnapshot({ preflight, stop, snapshot }) {
+  await preflight();
+  await stop();
+  return snapshot();
+}
+
+export function deploymentPause(root) {
+  const path = paths(root).pause,
+    marker = `Deployment in progress ${randomUUID()}\n`;
+  writeFileSync(path, marker, { flag: "wx", mode: 0o600, flush: true });
+  return () => {
+    if (!existsSync(path) || readFileSync(path, "utf8") !== marker)
+      throw Error("Deployment pause changed; explicit operator review is required.");
+    rmSync(path);
+  };
+}
+
+function backupCheckpoint(root, release, command, args, input) {
+  try {
+    return JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          "--env-file=" + join(root, "shared", ".env"),
+          join(release, "scripts", "backup-scheduler.mjs"),
+          command,
+          join(root, "shared", "backups"),
+          ...args,
+        ],
+        {
+          cwd: release,
+          env: environment,
+          encoding: "utf8",
+          input: input ? JSON.stringify(input) : undefined,
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: 300000,
+          maxBuffer: 1024 * 1024,
+        },
+      ),
+    );
+  } catch {
+    throw Error("Backup checkpoint verification failed; the update was not approved.");
+  }
+}
+
+export function assertUpdateRuntime(release) {
+  if (readJson(join(release, "build.json"))?.runtimeFormat !== 3)
+    throw Error("New updates require runtime format3 with verified backup ports.");
+  assertRuntimePackage(release, { format: 3 });
+}
+
 export async function install(root, sha, checked) {
   if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Expected a full commit SHA.");
   const workflow = checked ?? (await checkedWorkflow(sha));
   if (!workflow) throw Error("This revision has no successful main push checks.");
   const p = paths(root);
   const release = await retrieveRelease(root, sha, workflow);
-  const installations = deploymentState(root, release);
+  deploymentState(root, release);
   const previous = existsSync(p.current) ? realpathSync(p.current) : null;
   if (previous === release) return event(root, `already active ${sha}`);
-  for (const installation of installations) {
-    if (!existsSync(installation.databasePath)) continue;
-    const { DatabaseSync, backup } = await import("node:sqlite");
-    const database = new DatabaseSync(installation.databasePath, { readOnly: true });
-    try {
-      await backup(
-        database,
-        join(p.shared, "backups", `${Date.now()}-${installation.guildId}-before-${sha}.sqlite`),
-      );
-    } finally {
-      database.close();
-    }
+  assertUpdateRuntime(release);
+  const upgradeId = randomUUID();
+  const outputPath = join(p.shared, "backups", "captures", `${upgradeId}.gldbak`);
+  // Validate the independent operator key before downtime; snapshot all bot data only once stopped.
+  let snapshot;
+  let checkpoint;
+  let unpause;
+  try {
+    snapshot = await stoppedSnapshot({
+      preflight: () =>
+        recovery(
+          root,
+          release,
+          "plan",
+          outputPath,
+          undefined,
+          previous ? basename(previous) : undefined,
+          previous || release,
+        ),
+      stop: async () => {
+        unpause = deploymentPause(root);
+        await stopSupervisor(root);
+      },
+      snapshot: () => {
+        const manifest = recovery(
+          root,
+          release,
+          "snapshot",
+          outputPath,
+          undefined,
+          previous ? basename(previous) : undefined,
+          previous || release,
+        );
+        checkpoint = backupCheckpoint(
+          root,
+          release,
+          "register-before-upgrade",
+          ["--archive", outputPath, "--target-revision", sha, "--upgrade-id", upgradeId],
+          manifest,
+        );
+        if (
+          checkpoint?.id !== manifest.id ||
+          checkpoint.checkpoint?.upgradeId !== upgradeId ||
+          checkpoint.checkpoint?.revision !== sha ||
+          !/^[a-f0-9]{64}$/.test(checkpoint.sha256)
+        )
+          throw Error("The backup checkpoint identity does not match the update.");
+        return manifest;
+      },
+    });
+  } catch (error) {
+    if (unpause) unpause();
+    if (previous && !existsSync(p.pause)) background(root, "supervise", "supervisor.lock");
+    throw error;
   }
   const activated = Date.now();
   // Restart the supervisor as well, so updates to hosting code take effect with the release.
-  await stopSupervisor(root);
   pointTo(root, release);
+  // A scheduler may have started a paused supervisor while the snapshot was being taken.
+  await stopSupervisor(root);
+  unpause();
   event(root, `activating ${sha}`);
   background(root, "supervise", "supervisor.lock");
   if (await waitReady(root, sha, activated)) {
+    try {
+      backupCheckpoint(root, release, "mark-healthy", [
+        "--id",
+        checkpoint.id,
+        "--sha256",
+        checkpoint.sha256,
+        "--target-revision",
+        sha,
+        "--upgrade-id",
+        upgradeId,
+      ]);
+    } catch {
+      event(root, "backup health acknowledgement failed; checkpoint retained for operator review");
+    }
     rmSync(join(p.shared, "failed-revision"), { force: true });
     event(root, `activation healthy ${sha}`);
     try {
@@ -450,16 +625,40 @@ export async function install(root, sha, checked) {
     return;
   }
   writeFileSync(join(p.shared, "failed-revision"), sha, { mode: 0o600 });
+  const rollbackUnpause = deploymentPause(root);
+  await stopSupervisor(root);
+  let compatible = false;
   if (previous) {
+    try {
+      compatible =
+        recovery(
+          root,
+          release,
+          "compatible",
+          outputPath,
+          snapshot,
+          previous ? basename(previous) : undefined,
+          previous || release,
+        ).compatible === true;
+    } catch {
+      compatible = false;
+    }
+  }
+  if (previous && compatible) {
     const reverted = Date.now();
-    await stopSupervisor(root);
     pointTo(root, previous);
+    rollbackUnpause();
     event(root, `rollback to ${basename(previous)}`);
     background(root, "supervise", "supervisor.lock");
     const recovered = await waitReady(root, basename(previous), reverted);
     event(root, `rollback healthy=${recovered}`);
   } else {
-    writeFileSync(p.pause, "Initial activation failed.\n", { mode: 0o600 });
+    writeFileSync(
+      p.pause,
+      "Activation failed. Schema compatibility is unconfirmed; operator review is required.\n",
+      { mode: 0o600 },
+    );
+    event(root, "activation paused; code-only rollback denied, encrypted snapshot retained");
   }
   throw Error("New release did not become healthy; inspect private hosting logs.");
 }
@@ -497,7 +696,25 @@ async function main() {
   ])
     mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (command === "supervise") return supervise(root);
-  if (command === "install") return install(root, sha);
+  if (command === "install") {
+    return console.log(
+      run(
+        "flock",
+        [
+          "-o",
+          "-n",
+          join(p.shared, "deploy.lock"),
+          process.execPath,
+          fileURLToPath(import.meta.url),
+          "install-locked",
+          root,
+          sha,
+        ],
+        root,
+      ),
+    );
+  }
+  if (command === "install-locked") return install(root, sha);
   if (command === "update") return update(root);
   if (command === "cleanup") {
     if (!/^[a-f0-9]{40}$/.test(sha ?? "")) throw Error("Specify the rollback release SHA.");

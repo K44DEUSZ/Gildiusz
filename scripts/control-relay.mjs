@@ -1,23 +1,22 @@
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
+import { isControlPath, controlHeaderNames, controlLimits } from "../dist/contracts/index.js";
 
 export async function relay(input, send = globalThis.fetch) {
   if (
     !input ||
     typeof input !== "object" ||
     input.method !== "POST" ||
-    !/^\/guilds(?:\/\d{17,20}(?:\/save)?)?$/.test(input.path ?? "") ||
+    !isControlPath(input.path ?? "") ||
     typeof input.body !== "string" ||
-    Buffer.byteLength(input.body) > 49152
+    Buffer.byteLength(input.body) > controlLimits.bodyBytes
   )
     throw Error("Invalid control request");
   const headers = input.headers;
   if (
     !headers ||
     typeof headers !== "object" ||
-    Object.keys(headers).some(
-      (key) => !["x-gildiusz-time", "x-gildiusz-nonce", "x-gildiusz-signature"].includes(key),
-    ) ||
+    Object.keys(headers).some((key) => !controlHeaderNames.includes(key)) ||
     Object.values(headers).some((value) => typeof value !== "string" || value.length > 80)
   )
     throw Error("Invalid control headers");

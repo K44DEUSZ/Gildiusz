@@ -14,6 +14,13 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { npmEntrypoint } from "./build-contracts.mjs";
+import {
+  runtimeSources,
+  validateRuntimeTree,
+  assertRuntimePackage,
+  smokeRuntime,
+} from "./runtime-package.mjs";
 
 export const archiveName = "gildiusz-linux-x64.tar.gz";
 export function validateBuild(manifest, sha, runId) {
@@ -26,6 +33,7 @@ export function validateBuild(manifest, sha, runId) {
     manifest.platform !== "linux" ||
     manifest.architecture !== "x64" ||
     manifest.nodeMajor !== 24 ||
+    (manifest.runtimeFormat !== undefined && ![1, 2, 3].includes(manifest.runtimeFormat)) ||
     manifest.archive !== archiveName ||
     !/^[a-f0-9]{64}$/.test(manifest.sha256 ?? "") ||
     !Number.isSafeInteger(manifest.size) ||
@@ -49,6 +57,30 @@ function removeLinks(directory) {
     else if (stat.isDirectory()) removeLinks(path);
   }
 }
+export function prepareRuntimePackage(root, staging, { offline = false } = {}) {
+  if (readdirSync(staging).length) throw Error("Runtime staging must be empty.");
+  for (const name of runtimeSources) {
+    validateRuntimeTree(join(root, name), { prefix: name });
+    cpSync(join(root, name), join(staging, name), { recursive: true });
+  }
+  execFileSync(
+    process.execPath,
+    [
+      npmEntrypoint(),
+      "ci",
+      "--omit=dev",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      ...(offline ? ["--offline"] : []),
+    ],
+    { cwd: staging, stdio: "pipe", env: { ...process.env, npm_config_update_notifier: "false" } },
+  );
+  removeLinks(join(staging, "node_modules"));
+  validateRuntimeTree(staging);
+  assertRuntimePackage(staging);
+  smokeRuntime(staging);
+}
 export function createPackage(root, output, revision, workflowRun) {
   if (
     process.platform !== "linux" ||
@@ -61,22 +93,7 @@ export function createPackage(root, output, revision, workflowRun) {
   const staging = mkdtempSync(join(tmpdir(), "gildiusz-package-"));
   try {
     // An explicit allowlist prevents local settings, member data and tokens entering the package.
-    for (const name of [
-      "dist",
-      "content",
-      "config",
-      "scripts",
-      "package.json",
-      "package-lock.json",
-      "LICENSE",
-      "THIRD_PARTY_NOTICES.md",
-    ])
-      cpSync(join(root, name), join(staging, name), { recursive: true });
-    execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
-      cwd: staging,
-      stdio: "inherit",
-    });
-    removeLinks(join(staging, "node_modules"));
+    prepareRuntimePackage(root, staging);
     const metadata = {
       format: 1,
       revision,
@@ -84,8 +101,10 @@ export function createPackage(root, output, revision, workflowRun) {
       platform: "linux",
       architecture: "x64",
       nodeMajor: 24,
+      runtimeFormat: 3,
     };
     writeFileSync(join(staging, "build.json"), JSON.stringify(metadata) + "\n");
+    validateRuntimeTree(staging);
     if (!existsSync(join(staging, "dist", "bot", "main.js"))) throw Error("Missing compiled bot.");
     execFileSync(process.execPath, ["dist/cli.js", "validate"], { cwd: staging, stdio: "inherit" });
     mkdirSync(output, { recursive: true });

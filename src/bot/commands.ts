@@ -5,8 +5,10 @@ import {
   ChannelType,
   PermissionFlagsBits as P,
 } from "discord.js";
+import { announcementCommands } from "./announcement-commands.js";
+import { communityCommands } from "./community-commands.js";
 
-export function commands() {
+export function commands(beta = process.env.GILDIUSZ_BETA_MODULES === "1") {
   const room = new SlashCommandBuilder()
     .setName("pokoj")
     .setDescription("Zarządzaj swoim pokojem projektowym.")
@@ -93,5 +95,8 @@ export function commands() {
     .setDefaultMemberPermissions(P.ManageGuild)
     .setContexts(InteractionContextType.Guild)
     .setIntegrationTypes(ApplicationIntegrationType.GuildInstall);
-  return [room, report, settings, panel, help, configure].map((command) => command.toJSON());
+  return [
+    ...[room, report, settings, panel, help, configure].map((command) => command.toJSON()),
+    ...(beta ? [...announcementCommands(), ...communityCommands()] : []),
+  ];
 }

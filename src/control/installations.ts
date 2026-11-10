@@ -1,7 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { GuildInstallation } from "../installations.js";
 import { requireId } from "../shared/utils.js";
+import { privateDirectory, regularFile, syncDirectory } from "../storage/recovery/files.js";
+
+class RegistryPersistenceError extends Error {
+  constructor(
+    readonly committed: boolean,
+    cause: unknown,
+  ) {
+    super("Could not persist the public installation registry.", { cause });
+  }
+}
 
 export class PublicInstallations {
   private readonly path: string;
@@ -34,21 +45,60 @@ export class PublicInstallations {
   values(): GuildInstallation[] {
     return [...this.entries.values()];
   }
+  private save(): void {
+    this.validateRemoval();
+    const temporary = this.path + `.${randomUUID()}.tmp`;
+    let committed = false;
+    try {
+      writeFileSync(
+        temporary,
+        JSON.stringify(this.values().map(({ guildId, ownerId }) => ({ guildId, ownerId }))) + "\n",
+        { flag: "wx", mode: 0o600, flush: true },
+      );
+      renameSync(temporary, this.path);
+      committed = true;
+      syncDirectory(this.directory);
+    } catch (error) {
+      throw new RegistryPersistenceError(committed, error);
+    } finally {
+      rmSync(temporary, { force: true });
+    }
+  }
+  remove(guildId: string): boolean {
+    requireId(guildId, "guildId");
+    const previous = this.entries.get(guildId);
+    if (!previous) {
+      this.save();
+      return false;
+    }
+    this.entries.delete(guildId);
+    try {
+      this.save();
+    } catch (error) {
+      if (!(error instanceof RegistryPersistenceError) || !error.committed)
+        this.entries.set(guildId, previous);
+      throw error;
+    }
+    return true;
+  }
+  validateRemoval(): void {
+    privateDirectory(this.directory);
+    if (existsSync(this.path)) regularFile(this.path);
+  }
   add(guildId: string, ownerId: string): GuildInstallation {
     const existing = this.entries.get(guildId);
-    if (existing) return existing;
+    if (existing) {
+      this.save();
+      return existing;
+    }
     if (this.entries.size >= 1000) throw Error("Public installation limit");
     const value = this.installation(guildId, ownerId);
     this.entries.set(guildId, value);
     try {
-      writeFileSync(
-        this.path + ".tmp",
-        JSON.stringify(this.values().map(({ guildId, ownerId }) => ({ guildId, ownerId }))) + "\n",
-        { mode: 0o600 },
-      );
-      renameSync(this.path + ".tmp", this.path);
+      this.save();
     } catch (error) {
-      this.entries.delete(guildId);
+      if (!(error instanceof RegistryPersistenceError) || !error.committed)
+        this.entries.delete(guildId);
       throw error;
     }
     return value;

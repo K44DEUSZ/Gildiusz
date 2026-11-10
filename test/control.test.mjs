@@ -20,11 +20,13 @@ test("the forced SSH command runs through the current release symlink", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "gildiusz-relay-")),
     actual = join(directory, "release"),
     alias = join(directory, "current");
-  mkdirSync(actual);
-  cpSync("scripts/control-relay.mjs", join(actual, "control-relay.mjs"));
+  mkdirSync(join(actual, "scripts"), { recursive: true });
+  mkdirSync(join(actual, "dist"));
+  cpSync("scripts/control-relay.mjs", join(actual, "scripts", "control-relay.mjs"));
+  cpSync("dist/contracts", join(actual, "dist", "contracts"), { recursive: true });
   symlinkSync(actual, alias, process.platform === "win32" ? "junction" : "dir");
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const result = spawnSync(process.execPath, [join(alias, "control-relay.mjs")], {
+  const result = spawnSync(process.execPath, [join(alias, "scripts", "control-relay.mjs")], {
     input: "{}",
     encoding: "utf8",
   });

@@ -24,7 +24,7 @@ function setup(t) {
     members: async (id) => rooms.get(id) ?? null,
     eligible: async (id) => !blocked.has(id),
     atEntrance: (id) => entrance.has(id),
-    capacity: () => true,
+    capacity: (maximum) => rooms.size < maximum,
     create: async () => {
       const id = String(++created);
       rooms.set(id, []);

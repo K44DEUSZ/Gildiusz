@@ -11,9 +11,11 @@ Gildiusz używa poniższych zależności produkcyjnych, według package-lock.jso
 | @discordjs/rest                 | 2.6.3   | Apache-2.0 |
 | @discordjs/util                 | 1.2.0   | Apache-2.0 |
 | @discordjs/ws                   | 1.2.3   | Apache-2.0 |
+| @js-temporal/polyfill           | 0.5.1   | ISC        |
 | @sapphire/async-queue           | 1.5.5   | MIT        |
 | @sapphire/shapeshift            | 4.0.0   | MIT        |
 | @sapphire/snowflake             | 3.5.5   | MIT        |
+| @silvia-odwyer/photon-node      | 0.3.4   | Apache-2.0 |
 | @types/node                     | 24.19.2 | MIT        |
 | @types/ws                       | 8.18.2  | MIT        |
 | @vladfrangu/async_event_emitter | 2.4.7   | MIT        |
@@ -21,6 +23,8 @@ Gildiusz używa poniższych zależności produkcyjnych, według package-lock.jso
 | discord.js                      | 14.28.1 | Apache-2.0 |
 | fast-deep-equal                 | 3.1.3   | MIT        |
 | graceful-fs                     | 4.2.11  | ISC        |
+| image-size                      | 2.1.0   | MIT        |
+| jsbi                            | 4.3.2   | Apache-2.0 |
 | lodash                          | 4.18.1  | MIT        |
 | lodash.snakecase                | 4.1.1   | MIT        |
 | magic-bytes.js                  | 1.13.1  | MIT        |

@@ -128,7 +128,7 @@ test("the same member can own a room in each guild with separate settings, coold
           ready: () => true,
           eligible: async () => true,
           atEntrance: () => true,
-          capacity: () => true,
+          capacity: (maximum) => members.size < maximum,
           create: async () => {
             const id = `room-${index}`;
             members.set(id, []);

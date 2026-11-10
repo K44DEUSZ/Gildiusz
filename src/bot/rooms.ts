@@ -1,7 +1,8 @@
 import {
   ChannelType,
   PermissionFlagsBits as P,
-  type VoiceChannel,
+  type REST,
+  type CategoryChannel,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { RoomService, type RoomPort } from "./room-service.js";
@@ -9,10 +10,13 @@ import type { BotContext } from "./context.js";
 import { overwrites } from "../permissions/model.js";
 import { readContent } from "../content.js";
 import { errorCode } from "../shared/utils.js";
+import { DiscordVoiceRooms, definitiveNoVoiceCreate } from "./voice-rooms.js";
 
-export function discordRoomService(context: BotContext): RoomService {
+export function discordRoomService(context: BotContext, rest: REST): RoomService {
   const category = context.control.rooms.categoryId;
-  function roomOverwrites(locked = false, allowed: string[] = []) {
+  const voice = new DiscordVoiceRooms(context, rest),
+    identity = { source: "temporary" as const, categoryId: category };
+  function roomOverwrites(locked = false, allowed: string[] = [], currentParent?: CategoryChannel) {
     if (context.managedLayout && category === context.store.resource("category.rooms")?.id) {
       const entries = overwrites(
         locked ? "private" : "voice",
@@ -30,7 +34,7 @@ export function discordRoomService(context: BotContext): RoomService {
         type: entry.type as 0 | 1,
       }));
     }
-    const parent = context.guild.channels.cache.get(category);
+    const parent = currentParent ?? context.guild.channels.cache.get(category);
     if (parent?.type !== ChannelType.GuildCategory) throw Error("Missing room category");
     const access = P.ViewChannel | P.Connect;
     const entries = [...parent.permissionOverwrites.cache.values()]
@@ -55,7 +59,6 @@ export function discordRoomService(context: BotContext): RoomService {
         P.ViewChannel |
         P.Connect |
         P.ManageChannels |
-        P.ManageRoles |
         P.MoveMembers |
         P.ReadMessageHistory |
         P.SendMessages |
@@ -64,27 +67,10 @@ export function discordRoomService(context: BotContext): RoomService {
     });
     return entries;
   }
-  async function managedChannel(id: string): Promise<VoiceChannel | null> {
-    try {
-      const channel = await context.guild.channels.fetch(id);
-      if (!channel) return null;
-      if (
-        channel.type !== ChannelType.GuildVoice ||
-        channel.parentId !== category ||
-        !context.store.room(id)
-      )
-        throw new Error("Managed room identity differs from the database.");
-      return channel;
-    } catch (error) {
-      if (errorCode(error) === "10003") return null;
-      throw error;
-    }
-  }
   const port: RoomPort = {
-    ready: () =>
-      context.client.isReady() && context.guild.available && context.client.ws.status === 0,
+    ready: () => voice.ready(),
     members: async (id) => {
-      const channel = await managedChannel(id);
+      const channel = await voice.inspect(id, identity, { fresh: false });
       return channel
         ? [...channel.members.values()].map((member) => ({
             id: member.id,
@@ -111,20 +97,18 @@ export function discordRoomService(context: BotContext): RoomService {
     atEntrance: (id) =>
       context.control.modules.rooms &&
       context.guild.voiceStates.cache.get(id)?.channelId === context.control.rooms.entryChannelId,
-    capacity: () =>
-      context.guild.channels.cache.size < 490 &&
-      [...context.guild.channels.cache.values()].filter((channel) => channel.parentId === category)
-        .length < 45,
+    capacity: (maximum) => voice.capacity(category, maximum),
+    definitiveNoCreate: definitiveNoVoiceCreate,
     create: async (name, operation) =>
       (
-        await context.guild.channels.create({
+        await voice.create({
           name,
-          type: ChannelType.GuildVoice,
-          parent: category,
-          reason: operation,
-          rateLimitPerUser: 0,
+          categoryId: category,
+          operation,
+          source: "temporary",
+          objectId: operation,
           userLimit: context.control.rooms.userLimit,
-          permissionOverwrites: roomOverwrites(),
+          overwrites: (parent) => roomOverwrites(false, [], parent),
         })
       ).id,
     move: async (id, channel) => {
@@ -134,22 +118,15 @@ export function discordRoomService(context: BotContext): RoomService {
       return true;
     },
     remove: async (id) => {
-      const channel = await managedChannel(id);
-      if (channel && channel.members.size === 0) await channel.delete("Pusty zarządzany pokój");
-      else if (channel) throw new Error("Occupied room cannot be removed.");
+      await voice.remove(id, identity);
     },
     permissions: async (room) => {
-      const channel = await managedChannel(room.id);
-      if (!channel) throw new Error("Room no longer exists.");
-      await channel.permissionOverwrites.set(
-        roomOverwrites(room.locked, room.allowed),
-        "Dostęp do pokoju projektowego",
+      await voice.permissions(room.id, identity, (parent) =>
+        roomOverwrites(room.locked, room.allowed, parent),
       );
     },
     rename: async (id, name) => {
-      const channel = await managedChannel(id);
-      if (!channel) throw new Error("Room no longer exists.");
-      await channel.setName(name);
+      await voice.rename(id, identity, name);
     },
   };
   return new RoomService(context.store, context.config.rooms, port);

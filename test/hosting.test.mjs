@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { healthy, checkedRun, expectedRepository } from "../scripts/hosting.mjs";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { healthy, checkedRun, expectedRepository, deploymentPause } from "../scripts/hosting.mjs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -91,9 +91,11 @@ test(
       const recovered = await waitFor((s) => ready(s) && s.childPid !== workerPid);
       workerPid = recovered.childPid;
       assert.ok(recovered.restarts >= 1);
-      writeFileSync(join(root, "shared", "paused"), "pause");
+      const resumeDeployment = deploymentPause(root);
       await waitFor((s) => s.paused && s.childPid === null);
-      rmSync(join(root, "shared", "paused"));
+      await delay(100);
+      assert.equal(state().childPid, null);
+      resumeDeployment();
       workerPid = (await waitFor(ready)).childPid;
     } finally {
       supervisor.kill("SIGTERM");

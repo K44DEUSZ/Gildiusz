@@ -2,9 +2,12 @@ import lockfile from "proper-lockfile";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-export async function acquireLock(databasePath: string): Promise<() => Promise<void>> {
+export async function acquireLock(
+  databasePath: string,
+  options: { createTarget?: boolean } = {},
+): Promise<() => Promise<void>> {
   mkdirSync(dirname(databasePath), { recursive: true });
-  writeFileSync(databasePath, "", { flag: "a" });
+  if (options.createTarget !== false) writeFileSync(databasePath, "", { flag: "a" });
   return lockfile.lock(databasePath, {
     realpath: false,
     stale: 120000,

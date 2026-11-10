@@ -27,6 +27,20 @@ jobs:
       - run: npm run cli -- validate
       - run: npm audit --audit-level=moderate
       - run: docker build -t gildiusz-check .
+      - name: Przygotuj paczkę gałęzi test
+        if: github.ref == 'refs/heads/test' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: node scripts/build-package.mjs "$RUNNER_TEMP/test-runtime-package"
+      - name: Zachowaj testową paczkę
+        if: github.ref == 'refs/heads/test' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gildiusz-test-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/test-runtime-package/gildiusz-linux-x64.tar.gz
+            ${{ runner.temp }}/test-runtime-package/manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
   hosting-package:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check]

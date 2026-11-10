@@ -12,7 +12,8 @@ export interface RoomPort {
   members(channelId: string): Promise<RoomMember[] | null>;
   eligible(id: string): Promise<boolean>;
   atEntrance(id: string): boolean;
-  capacity(): boolean;
+  capacity(maximum: number): boolean;
+  definitiveNoCreate?(error: unknown): boolean;
   create(name: string, operation: string): Promise<string>;
   move(member: string, channel: string): Promise<boolean>;
   remove(channel: string): Promise<void>;
@@ -82,8 +83,7 @@ export class RoomService {
         )
       )
         throw new Error("cooldown");
-      if (this.store.rooms().length >= this.settings.maximum || !this.port.capacity())
-        throw new Error("Room capacity reached.");
+      if (!this.port.capacity(this.settings.maximum)) throw new Error("Room capacity reached.");
       if (!this.port.atEntrance(member.id)) throw new Error("Member left the entrance.");
       const operation = `room-create:${member.id}`;
       this.store.beginOperation(operation, { owner: member.id });
@@ -119,7 +119,11 @@ export class RoomService {
         this.store.putRoom(room);
         return channel;
       } catch (error) {
-        if (!channel && ["50013", "50001", "10003", "403", "400"].includes(errorCode(error)))
+        if (
+          !channel &&
+          (["50013", "50001", "10003", "403", "400"].includes(errorCode(error)) ||
+            this.port.definitiveNoCreate?.(error))
+        )
           this.store.endOperation(operation);
         if (channel) {
           const present = await this.port.members(channel);

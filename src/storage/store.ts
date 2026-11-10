@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { canonical } from "../shared/utils.js";
+import { migrate } from "./migrations.js";
 
 export interface Resource {
   key: string;
@@ -72,6 +73,7 @@ export class Store {
     this.db.exec(
       "CREATE TABLE IF NOT EXISTS control_configuration (guild TEXT PRIMARY KEY, body TEXT NOT NULL)",
     );
+    migrate(this.db);
   }
   roleSelections(key: string): string[] {
     return this.db

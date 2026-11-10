@@ -1,4 +1,10 @@
-import { ChannelType, PermissionFlagsBits as P, type Client, type Guild } from "discord.js";
+import {
+  ChannelType,
+  PermissionFlagsBits as P,
+  type Client,
+  type Guild,
+  type GuildMember,
+} from "discord.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { BotContext } from "./context.js";
 import {
@@ -10,12 +16,14 @@ import {
 } from "../control/contracts.js";
 import { noMentions } from "../shared/utils.js";
 import { roleChoices } from "../role-selection.js";
+import { freshMember } from "./module-permissions.js";
 
 export async function authorizeControl(
   client: Client,
   guildId: string | undefined,
   input: unknown,
-): Promise<{ actor: string; guild?: Guild; configuration?: unknown }> {
+  options: { manage?: boolean } = {},
+): Promise<{ actor: string; guild?: Guild; member?: GuildMember; configuration?: unknown }> {
   if (!input || typeof input !== "object")
     throw new ControlError(400, "invalid_request", "Nieprawidłowe żądanie.");
   const body = input as Record<string, unknown>;
@@ -43,25 +51,33 @@ export async function authorizeControl(
   let guild: Guild;
   try {
     guild = await client.guilds.fetch(guildId);
-  } catch {
-    throw new ControlError(404, "not_installed", "Najpierw dodaj Gildiusza do tego serwera.");
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if ([10004, 50001].includes(Number(code)))
+      throw new ControlError(404, "not_installed", "Najpierw dodaj Gildiusza do tego serwera.");
+    throw new ControlError(503, "discord", "Nie udało się sprawdzić dostępu do serwera.");
   }
-  const member = await guild.members.fetch({ user: user.id, force: true });
+  const refreshed = await freshMember(guild, user.id);
+  guild = refreshed.guild;
+  const member = refreshed.member;
   if (
     member.pending ||
     member.isCommunicationDisabled() ||
-    (guild.ownerId !== user.id && !member.permissions.has(P.ManageGuild))
+    (options.manage !== false &&
+      guild.ownerId !== user.id &&
+      !member.permissions.has(P.ManageGuild))
   )
     throw new ControlError(403, "permission", "Potrzebujesz uprawnienia Zarządzanie serwerem.");
-  return { actor: user.id, guild, configuration: body.configuration };
+  return { actor: user.id, guild, member, configuration: body.configuration };
 }
 
 export async function controlResources(guild: Guild): Promise<GuildResources> {
-  await guild.channels.fetch();
+  const channels = await guild.channels.fetch();
   const roles = await guild.roles.fetch(),
     me = await guild.members.fetchMe({ force: true });
   return {
-    channels: [...guild.channels.cache.values()]
+    channels: [...channels.values()]
+      .filter((channel) => channel !== null)
       .filter((channel) =>
         [
           ChannelType.GuildText,

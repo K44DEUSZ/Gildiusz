@@ -4,6 +4,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
+COPY scripts/*.mjs ./scripts/
+COPY LICENSE ./
 RUN npm run build && npm prune --omit=dev --ignore-scripts
 
 FROM node:24-bookworm-slim
@@ -14,7 +16,9 @@ COPY --from=build /app/dist ./dist
 COPY package.json LICENSE THIRD_PARTY_NOTICES.md ./
 COPY config ./config
 COPY content ./content
-RUN mkdir /app/data && chown node:node /app/data
+COPY scripts/*.mjs ./scripts/
+RUN node scripts/runtime-package.mjs --smoke
+RUN mkdir -m 700 /app/data && chown node:node /app/data
 USER node
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "dist/cli.js", "health"]

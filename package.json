@@ -8,7 +8,8 @@
     "node": ">=24.17.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/build-contracts.mjs",
+    "build:contracts": "node scripts/build-contracts.mjs",
     "check": "tsc --noEmit && eslint . && prettier --check .",
     "test": "npm run build && node --test test/*.test.mjs",
     "format": "prettier --write .",
@@ -16,7 +17,10 @@
     "start": "node --env-file-if-exists=.env dist/bot/main.js"
   },
   "dependencies": {
+    "@js-temporal/polyfill": "0.5.1",
+    "@silvia-odwyer/photon-node": "0.3.4",
     "discord.js": "14.28.1",
+    "image-size": "2.1.0",
     "proper-lockfile": "4.1.2"
   },
   "devDependencies": {
