@@ -45,9 +45,9 @@ export function rulesControlId(guildId: string, versionId: string): string {
     throw new RulesError("invalid_input");
   return `gildiusz:rules:${guildId}:${versionId}:accept`;
 }
-export function rulesParts(draft: RulesDraft): string[] {
+export function rulesParts(draft: RulesDraft, format: 1 | 2 = 2): string[] {
   try {
-    return rulesDraftMessages(draft);
+    return rulesDraftMessages(draft, format);
   } catch {
     throw new RulesError("invalid_input");
   }

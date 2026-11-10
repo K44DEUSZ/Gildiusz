@@ -92,9 +92,37 @@ export interface RulesAcceptancePage {
 
 export const rulesLimits = Object.freeze({ content: 12000, label: 80, part: 1800, parts: 8 });
 
+function messageBoundary(text: string, maximum: number, format: 1 | 2): number {
+  let end = Math.min(maximum, text.length);
+  if (format === 1) {
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+    return end;
+  }
+  if (end === text.length) return end;
+  const minimum = Math.ceil(end * 0.9),
+    paragraph = text.lastIndexOf("\n\n", end - 2),
+    line = text.lastIndexOf("\n", end - 1);
+  if (paragraph >= minimum) end = paragraph + 2;
+  else if (line >= minimum) end = line + 1;
+  else {
+    const whitespace = [...text.slice(0, end).matchAll(/\s/gu)].at(-1);
+    if (whitespace && whitespace.index >= minimum) end = whitespace.index + 1;
+  }
+  let boundary = 0;
+  for (const part of new Intl.Segmenter("pl", { granularity: "grapheme" }).segment(text)) {
+    const next = part.index + part.segment.length;
+    if (next > end) break;
+    boundary = next;
+  }
+  if (!boundary)
+    throw new ControlError(400, "invalid_input", "Fragment regulaminu jest zbyt długi.");
+  return boundary;
+}
+
 /** Presentation only; the backend still validates the draft and its current channel/role. */
-export function rulesDraftMessages(draft: RulesDraft): string[] {
+export function rulesDraftMessages(draft: RulesDraft, format: 1 | 2 = 2): string[] {
   if (
+    ![1, 2].includes(format) ||
     !draft ||
     typeof draft.label !== "string" ||
     draft.label.length > rulesLimits.label ||
@@ -114,8 +142,7 @@ export function rulesDraftMessages(draft: RulesDraft): string[] {
   const maximum = Math.min(rulesLimits.part, 2000 - prefix.length - instruction.length - 2);
   let remainder = draft.content.replace(/\r\n?/g, "\n");
   while (remainder) {
-    let end = Math.min(maximum, remainder.length);
-    if (end < remainder.length && /[\uD800-\uDBFF]/.test(remainder[end - 1])) end--;
+    const end = messageBoundary(remainder, maximum, format);
     chunks.push(remainder.slice(0, end));
     remainder = remainder.slice(end);
   }

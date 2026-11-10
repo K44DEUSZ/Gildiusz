@@ -16,6 +16,8 @@ coverage/
 *.sqlite*
 *.gldbak*
 *.gldledger*
+*.gldproof*
+rules-acceptance-deletions/
 restore-quarantine.json
 restore-manifest.json
 uninstall-retention/

@@ -88,6 +88,8 @@ test("package privacy validation blocks nested state and uploads inside an allow
       "node_modules/pkg/.env.local",
       "node_modules/pkg/snapshot.gldbak",
       "node_modules/pkg/latest.gldledger",
+      "node_modules/pkg/latest.gldproof",
+      "node_modules/pkg/rules-acceptance-deletions/journal.json",
       "config/restore-manifest.json",
       "config/restore-quarantine.json",
       "config/announcement-assets/image.png",
@@ -154,7 +156,7 @@ test("format2 retains its historical requirements while format3 gates every back
     );
     writeFileSync(join(release, ".built"), sha);
     assert.equal(prepareRelease(directory, { ...manifest, runtimeFormat: 2 }, bytes), release);
-    assert.throws(() => assertUpdateRuntime(release), /require runtime format3/);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format4/);
     assertRuntimePackage(release, { format: 2 });
     assert.throws(() => assertRuntimePackage(release, { format: 3 }), /uninstall-retention/);
     writeFileSync(join(release, "dist/storage/uninstall-retention.js"), "format3");
@@ -165,7 +167,7 @@ test("format2 retains its historical requirements while format3 gates every back
       join(release, "build.json"),
       JSON.stringify({ revision: sha, workflowRun: "123", nodeMajor: 24, runtimeFormat: 3 }),
     );
-    assertUpdateRuntime(release);
+    assert.throws(() => assertUpdateRuntime(release), /require runtime format4/);
     for (const name of [
       "backup-catalog",
       "backup-collector",
@@ -177,6 +179,40 @@ test("format2 retains its historical requirements while format3 gates every back
       assert.throws(() => assertRuntimePackage(release, { format: 3 }), /Missing runtime file/);
       assertRuntimePackage(release, { format: 2 });
       writeFileSync(path, "format3");
+    }
+    const format4 = [
+      "scripts/backup-proof.mjs",
+      "scripts/recovery-deletions.mjs",
+      "dist/storage/rules-deletion-journal.js",
+      "dist/modules/server-rules/deletion-schema.js",
+      "dist/modules/server-rules/deletion-outbox.js",
+      "dist/storage/recovery/age.js",
+      "dist/storage/recovery/deletions.js",
+      "dist/bot/music-rehearsal-voice.js",
+      "dist/bot/music-rehearsal-operator.js",
+      "dist/bot/music-rehearsal-operator-files.js",
+      "dist/modules/music-rehearsal/types.js",
+      "dist/modules/music-rehearsal/bounded.js",
+      "dist/modules/music-rehearsal/synthetic.js",
+      "dist/modules/music-rehearsal/ffmpeg.js",
+      "dist/modules/music-rehearsal/service.js",
+      "node_modules/@discordjs/voice/package.json",
+      "node_modules/@snazzah/davey/package.json",
+      "node_modules/@noble/ciphers/package.json",
+    ];
+    for (const name of format4) {
+      const path = join(release, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "format4");
+    }
+    writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 4 }));
+    assertUpdateRuntime(release);
+    for (const name of format4) {
+      const path = join(release, name);
+      unlinkSync(path);
+      assert.throws(() => assertRuntimePackage(release), /Missing runtime file/);
+      assertRuntimePackage(release, { format: 3 });
+      writeFileSync(path, "format4");
     }
   } finally {
     assert.ok(directory.startsWith(resolve(tmpdir()) + sep));
@@ -194,7 +230,7 @@ test(
       const output = join(directory, "output");
       createPackage(process.cwd(), output, sha, "123");
       const metadata = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
-      assert.equal(metadata.runtimeFormat, 3);
+      assert.equal(metadata.runtimeFormat, 4);
       const release = prepareRelease(directory, metadata, readFileSync(join(output, archiveName)));
       assert.ok(existsSync(join(release, "dist", "bot", "main.js")));
       assert.ok(existsSync(join(release, "node_modules", "discord.js", "package.json")));
@@ -219,7 +255,7 @@ test("deployment rejects mismatched revisions, workflow runs, platforms, corrupt
     { platform: "win32" },
     { architecture: "arm64" },
     { nodeMajor: 26 },
-    { runtimeFormat: 4 },
+    { runtimeFormat: 5 },
     { size: 100000000 },
     { sha256: "bad" },
     { archive: "../file" },

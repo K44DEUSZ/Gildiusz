@@ -33,7 +33,7 @@ export function validateBuild(manifest, sha, runId) {
     manifest.platform !== "linux" ||
     manifest.architecture !== "x64" ||
     manifest.nodeMajor !== 24 ||
-    (manifest.runtimeFormat !== undefined && ![1, 2, 3].includes(manifest.runtimeFormat)) ||
+    (manifest.runtimeFormat !== undefined && ![1, 2, 3, 4].includes(manifest.runtimeFormat)) ||
     manifest.archive !== archiveName ||
     !/^[a-f0-9]{64}$/.test(manifest.sha256 ?? "") ||
     !Number.isSafeInteger(manifest.size) ||
@@ -101,7 +101,7 @@ export function createPackage(root, output, revision, workflowRun) {
       platform: "linux",
       architecture: "x64",
       nodeMajor: 24,
-      runtimeFormat: 3,
+      runtimeFormat: 4,
     };
     writeFileSync(join(staging, "build.json"), JSON.stringify(metadata) + "\n");
     validateRuntimeTree(staging);

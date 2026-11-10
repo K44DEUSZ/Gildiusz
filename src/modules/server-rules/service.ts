@@ -414,17 +414,26 @@ export class ServerRulesService {
       throw new RulesError("publication_unavailable");
   }
   private async verifyPublication(version: RulesVersion, controls = true): Promise<void> {
-    const parts = this.parts(version.id),
-      expected = rulesParts(version);
-    if (
-      !parts.length ||
-      parts.length !== expected.length ||
-      parts.some(
-        (part, index) =>
-          part.index !== index || part.content !== expected[index] || part.state !== "confirmed",
-      )
-    )
-      throw new RulesError("publication_not_ready");
+    const parts = this.parts(version.id);
+    // Published parts are immutable. Older publications keep their original message boundaries.
+    const completeFormat = ([2, 1] as const).some((format) => {
+      let expected: string[];
+      try {
+        expected = rulesParts(version, format);
+      } catch (error) {
+        if (error instanceof RulesError && error.code === "invalid_input") return false;
+        throw error;
+      }
+      return (
+        parts.length > 0 &&
+        parts.length === expected.length &&
+        parts.every(
+          (part, index) =>
+            part.index === index && part.content === expected[index] && part.state === "confirmed",
+        )
+      );
+    });
+    if (!completeFormat) throw new RulesError("publication_not_ready");
     for (const part of parts) await this.verifyPart(version, part, controls);
   }
   private findAcceptance(acceptanceId: string): RulesAcceptance {

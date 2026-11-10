@@ -24,6 +24,7 @@ import {
   restoreQuarantineFile,
 } from "./lease.js";
 import { backupKey, decryptArchive, encryptArchive, manifestLimit } from "./archive.js";
+import { assertRecoveryArchiveAge } from "./age.js";
 import {
   copyPrivate,
   hashFile,
@@ -206,6 +207,8 @@ function inspectGuild(db: DatabaseSync, guildId: string): void {
     "server_rules_memberships",
     "server_rules_acceptances",
     "server_rules_retired_acceptances",
+    "server_rules_deletion_state",
+    "server_rules_deletion_outbox",
   ])
     if (
       db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) &&
@@ -665,6 +668,8 @@ export async function restoreSnapshot(options: {
   schemaPolicy?: RecoverySchemaPolicy;
   maxBytes?: number;
   maxFiles?: number;
+  now?: number;
+  maxArchiveAgeMs?: number;
 }): Promise<SnapshotManifest> {
   const key = backupKey(options.key, options.forbiddenKeys),
     limits = budgets(options);
@@ -696,6 +701,7 @@ export async function restoreSnapshot(options: {
       if (readSync(input, json, 0, length, 4) !== length)
         throw new Error("Truncated recovery manifest.");
       const manifest = validateManifest(JSON.parse(json.toString("utf8")), limits);
+      assertRecoveryArchiveAge(manifest.createdAt, options);
       if (4 + length + manifest.files.reduce((sum, entry) => sum + entry.size, 0) !== size)
         throw new Error("Recovery archive length mismatch.");
       let position = length + 4;
@@ -724,7 +730,7 @@ export async function restoreSnapshot(options: {
       return manifest;
     });
     const policy = options.schemaPolicy ?? currentRecoverySchemaPolicy(),
-      now = Date.now();
+      now = assertRecoveryArchiveAge(manifest.createdAt, options);
     verifyConfiguration(data, manifest);
     // The marker exists before any recovered SQLite state can be opened by a worker.
     writeJson(join(data, restoreQuarantineFile), {
@@ -808,6 +814,7 @@ export async function restoreSnapshot(options: {
     }
     if (manifest.files.some((entry) => entry.kind === "asset" && !expectedAssets.has(entry.path)))
       throw new Error("Restored asset has no database metadata.");
+    assertRecoveryArchiveAge(manifest.createdAt, options);
     writeJson(join(data, "restore-manifest.json"), manifest);
     if (options.dryRun) return manifest;
     for (const entry of manifest.files.filter((entry) =>
@@ -822,6 +829,7 @@ export async function restoreSnapshot(options: {
     }
     syncDirectory(data);
     assertEmpty();
+    assertRecoveryArchiveAge(manifest.createdAt, options);
     if (existsSync(target)) rmdirSync(target);
     renameSync(data, target);
     syncDirectory(dirname(target));

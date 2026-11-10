@@ -29,6 +29,7 @@ import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
   snapshotSchemasUnchanged,
+  maximumRecoveryArchiveAgeMs,
 } from "../dist/storage/recovery/index.js";
 import { encryptArchive } from "../dist/storage/recovery/archive.js";
 import { configuredSnapshot, recoveryCommand } from "../scripts/recovery.mjs";
@@ -250,6 +251,64 @@ test("rules from another guild cannot enter a guild snapshot", async (t) => {
   f.stores[0].db.prepare("INSERT INTO server_rules_settings VALUES(?,0,0,0,NULL,NULL)").run(guildB);
   await assert.rejects(createSnapshot(f.options), /another guild's data/);
   assert.equal(existsSync(f.options.outputPath), false);
+});
+
+test("foreign rules deletion counters and UUID outbox rows cannot enter another guild's snapshot", async (t) => {
+  for (const table of ["server_rules_deletion_state", "server_rules_deletion_outbox"]) {
+    const f = await fixture(t);
+    if (table === "server_rules_deletion_state")
+      f.stores[0].db
+        .prepare("INSERT INTO server_rules_deletion_state VALUES(?,0,0,NULL)")
+        .run(guildB);
+    else
+      f.stores[0].db
+        .prepare("INSERT INTO server_rules_deletion_outbox VALUES(?,?,0,3024000000,1,NULL)")
+        .run(guildB, randomUUID());
+    await assert.rejects(createSnapshot(f.options), /another guild's data/);
+    assert.equal(existsSync(f.options.outputPath), false);
+  }
+});
+
+test("direct restore enforces the original archive deadline even after the encrypted file is copied", async (t) => {
+  const f = await fixture(t),
+    manifest = await createSnapshot(f.options),
+    copied = join(f.root, "copied-later.gldbak");
+  writeFileSync(copied, readFileSync(f.options.outputPath));
+  for (const [label, now] of [
+    ["deadline", manifest.createdAt + maximumRecoveryArchiveAgeMs],
+    ["expired", manifest.createdAt + maximumRecoveryArchiveAgeMs + 1],
+    ["future", manifest.createdAt - 1],
+  ]) {
+    const targetRoot = join(f.root, "rejected-" + label);
+    await assert.rejects(
+      restoreSnapshot({ archivePath: copied, targetRoot, key: f.options.key, now }),
+      /expired or dated in the future/,
+    );
+    assert.equal(existsSync(targetRoot), false);
+  }
+  const targetRoot = join(f.root, "just-before-deadline");
+  await restoreSnapshot({
+    archivePath: copied,
+    targetRoot,
+    key: f.options.key,
+    now: manifest.createdAt + maximumRecoveryArchiveAgeMs - 1,
+  });
+  assert.throws(() => assertRestoreStartupAllowed(targetRoot), /quarantined/);
+  assert.equal(
+    readdirSync(f.root).some((name) => name.startsWith(".gildiusz-restore-")),
+    false,
+  );
+  await assert.rejects(
+    restoreSnapshot({
+      archivePath: copied,
+      targetRoot: join(f.root, "invalid-policy"),
+      key: f.options.key,
+      now: manifest.createdAt,
+      maxArchiveAgeMs: maximumRecoveryArchiveAgeMs + 1,
+      dryRun: true,
+    }),
+    /age policy/,
+  );
 });
 
 test("two WAL guilds, shared hub, registry and controlled assets round-trip only into quarantined data", async (t) => {
@@ -570,7 +629,7 @@ test("known pre-migration schemas restore under quarantine while altered SQL wit
   const f = await fixture(t);
   for (const store of f.stores)
     store.db.exec(
-      "DROP TABLE server_rules_acceptances;DROP TABLE server_rules_parts;DROP TABLE server_rules_memberships;DROP TABLE server_rules_retired_acceptances;DROP TABLE server_rules_settings;DROP TABLE server_rules_versions;DROP TABLE domain_retired;DROP TABLE job_history_retired;DROP INDEX announcements_visible;ALTER TABLE announcements DROP COLUMN removed_at;DELETE FROM schema_migrations WHERE version>=10",
+      "DROP TABLE server_rules_deletion_outbox;DROP TABLE server_rules_deletion_state;DROP TABLE server_rules_acceptances;DROP TABLE server_rules_parts;DROP TABLE server_rules_memberships;DROP TABLE server_rules_retired_acceptances;DROP TABLE server_rules_settings;DROP TABLE server_rules_versions;DROP TABLE domain_retired;DROP TABLE job_history_retired;DROP INDEX announcements_visible;ALTER TABLE announcements DROP COLUMN removed_at;DELETE FROM schema_migrations WHERE version>=10",
     );
   const manifest = await createSnapshot(f.options);
   assert.equal(manifest.files.find((entry) => entry.kind === "guild").schema.migrations.length, 9);

@@ -94,3 +94,45 @@ test("the common rules formatter renders the selected method and preserves all U
   assert.ok(!reaction[0].includes("wybierz „Akceptuję regulamin”"));
   assert.throws(() => rulesDraftMessages({ ...draft, content: "x".repeat(12001) }));
 });
+
+function bodies(parts) {
+  const prefix = "**Regulamin serwera · 2026.1**\n\n",
+    instruction = "\n\nPrzeczytaj zasady. Jeśli się zgadzasz, wybierz „Akceptuję regulamin”.";
+  return parts.map((part, index) => {
+    const body = part.slice(prefix.length);
+    return index === parts.length - 1 ? body.slice(0, -instruction.length) : body;
+  });
+}
+
+test("new rules messages end at natural boundaries without dropping whitespace or splitting graphemes", () => {
+  const content = "\n" + "Polskie zasady dla uczestników. ".repeat(100),
+    chunks = bodies(rulesDraftMessages({ ...draft, content }));
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.slice(0, -1).every((chunk) => /\s$/u.test(chunk)));
+  assert.equal(chunks.join(""), content);
+  const paragraph = "x".repeat(1640) + "\n\n" + "Zasady ".repeat(100);
+  assert.equal(
+    bodies(rulesDraftMessages({ ...draft, content: paragraph }))[0],
+    paragraph.slice(0, 1642),
+  );
+
+  const emojiText = "x".repeat(1794) + "👨‍👩‍👧‍👦" + "🙂".repeat(3500),
+    emojiChunks = bodies(rulesDraftMessages({ ...draft, content: emojiText }));
+  assert.equal(emojiChunks[0], "x".repeat(1794));
+  assert.ok(emojiChunks[1].startsWith("👨‍👩‍👧‍👦"));
+  assert.equal(emojiChunks.join(""), emojiText);
+  const maximumContent = "Polskie zasady. ".repeat(1000).slice(0, rulesLimits.content);
+  assert.ok(rulesDraftMessages({ ...draft, content: maximumContent }).length <= 8);
+});
+
+test("legacy formatting remains byte stable and oversized single graphemes are rejected only for new drafts", () => {
+  const content = "\n" + "Polskie zasady dla uczestników. ".repeat(100),
+    legacy = bodies(rulesDraftMessages({ ...draft, content }, 1));
+  assert.equal(legacy[0], content.slice(0, 1800));
+  assert.equal(legacy.join(""), content);
+  assert.notDeepEqual(legacy, bodies(rulesDraftMessages({ ...draft, content })));
+  const oversized = { ...draft, content: "x" + "\u0301".repeat(2500) };
+  assert.throws(() => rulesDraftMessages(oversized));
+  assert.equal(bodies(rulesDraftMessages(oversized, 1)).join(""), oversized.content);
+  assert.throws(() => rulesDraftMessages(draft, 3));
+});

@@ -209,7 +209,7 @@ function keyOf(key, forbiddenKeys) {
     fail("invalid_key");
   }
 }
-function sourceEntries(dataRoot, now) {
+export function readDeletionLedgerSourceForProof(dataRoot, now) {
   const directory = join(dataRoot, "uninstall-retention");
   if (missing(directory)) return [];
   const stat = lstatSync(directory);
@@ -270,6 +270,13 @@ function sourceEntries(dataRoot, now) {
   }
   return entriesOf(entries, now);
 }
+
+const sourceEntries = readDeletionLedgerSourceForProof;
+export {
+  sealLatestDeletionProof,
+  verifyLatestDeletionProof,
+  importLatestDeletionProof,
+} from "./backup-proof.mjs";
 
 /** Caller keeps its owned pause until this lease-protected latest snapshot is sealed. */
 async function withLockedSource({ dataRoot, key, forbiddenKeys = [], now = Date.now() }, task) {

@@ -12,3 +12,5 @@ export {
 export type { SnapshotManifest, SnapshotOptions } from "./snapshot.js";
 export { currentRecoverySchemaPolicy, schemaOf, verifySchema } from "./schema.js";
 export type { RecoverySchema, RecoverySchemaPolicy } from "./schema.js";
+export { assertRecoveryArchiveAge, maximumRecoveryArchiveAgeMs } from "./age.js";
+export type { RecoveryArchiveAgeOptions } from "./age.js";

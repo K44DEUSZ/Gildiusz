@@ -521,9 +521,9 @@ function backupCheckpoint(root, release, command, args, input) {
 }
 
 export function assertUpdateRuntime(release) {
-  if (readJson(join(release, "build.json"))?.runtimeFormat !== 3)
-    throw Error("New updates require runtime format3 with verified backup ports.");
-  assertRuntimePackage(release, { format: 3 });
+  if (readJson(join(release, "build.json"))?.runtimeFormat !== 4)
+    throw Error("New updates require runtime format4 with verified deletion proof ports.");
+  assertRuntimePackage(release, { format: 4 });
 }
 
 export async function install(root, sha, checked) {

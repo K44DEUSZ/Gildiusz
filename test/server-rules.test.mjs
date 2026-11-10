@@ -8,6 +8,7 @@ import { Store } from "../dist/storage/store.js";
 import { JobStore } from "../dist/core/jobs/store.js";
 import { serverRulesMigration } from "../dist/modules/server-rules/schema.js";
 import { ServerRulesService, RulesError } from "../dist/modules/server-rules/service.js";
+import { canonical, digest } from "../dist/shared/utils.js";
 import {
   ServerRulesRetention,
   serverRulesRetentionPolicy,
@@ -244,6 +245,68 @@ async function publish(f, draft = f.draft(), request = "publish") {
   await run(f, "server-rules.activate");
   return version;
 }
+
+function legacyPublication(f, version, draft) {
+  const legacy = rulesParts(draft, 1),
+    stored = f.service.parts(version.id);
+  assert.equal(stored.length, legacy.length);
+  f.jobs.db
+    .prepare("UPDATE server_rules_versions SET body=?,content_hash=? WHERE guild_id=? AND id=?")
+    .run(canonical(draft), digest(draft), f.service.guildId, version.id);
+  for (const [index, part] of stored.entries()) {
+    f.jobs.db
+      .prepare(
+        "UPDATE server_rules_parts SET content=?,content_hash=? WHERE guild_id=? AND version_id=? AND part_index=?",
+      )
+      .run(legacy[index], digest(legacy[index]), f.service.guildId, version.id, index);
+    f.messages.get(channelId + ":" + part.messageId).content = legacy[index];
+  }
+}
+
+test("an active legacy publication still accepts without rewriting or reposting its stored messages", async (t) => {
+  const f = fixture(t),
+    draft = f.draft({ content: "\n" + "Polskie zasady dla uczestników. ".repeat(100) }),
+    version = await publish(f, draft);
+  legacyPublication(f, version, draft);
+  const before = f.service.parts(version.id).map((part) => part.content),
+    sends = f.sends.length;
+  await f.service.accept(userId, event(f, version));
+  await run(f, "server-rules.grant-role");
+  assert.equal(f.grants.length, 1);
+  assert.equal(f.sends.length, sends);
+  assert.deepEqual(
+    f.service.parts(version.id).map((part) => part.content),
+    before,
+  );
+});
+
+test("legacy verification still works when the new formatter cannot render a historical single grapheme", async (t) => {
+  const f = fixture(t),
+    version = await publish(f, f.draft({ content: "Zdanie ".repeat(400) })),
+    historical = f.draft({ content: "x" + "\u0301".repeat(2500) });
+  assert.throws(() => rulesParts(historical));
+  legacyPublication(f, version, historical);
+  await f.service.accept(userId, event(f, version));
+  assert.equal(f.service.parts(version.id).map((part) => part.content).length, 2);
+});
+
+test("mixing old and new message boundaries cannot manufacture a valid rules publication", async (t) => {
+  const f = fixture(t),
+    draft = f.draft({ content: "\n" + "Polskie zasady dla uczestników. ".repeat(100) }),
+    version = await publish(f, draft),
+    part = f.service.parts(version.id)[0],
+    incompatible = rulesParts(draft, 1)[0];
+  assert.notEqual(part.content, incompatible);
+  f.jobs.db
+    .prepare(
+      "UPDATE server_rules_parts SET content=?,content_hash=? WHERE guild_id=? AND version_id=? AND part_index=0",
+    )
+    .run(incompatible, digest(incompatible), f.service.guildId, version.id);
+  f.messages.get(channelId + ":" + part.messageId).content = incompatible;
+  await assert.rejects(f.service.accept(userId, event(f, version)), code("publication_not_ready"));
+  assert.equal(f.grants.length, 0);
+  assert.equal(f.jobs.db.prepare("SELECT COUNT(*) n FROM server_rules_acceptances").get().n, 0);
+});
 function event(f, version, patch = {}) {
   return {
     guildId: f.service.guildId,

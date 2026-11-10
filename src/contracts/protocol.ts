@@ -1,6 +1,6 @@
 import { ControlError } from "./configuration.js";
 
-export const contractsVersion = "0.8.0";
+export const contractsVersion = "0.9.0";
 export const schemaVersion = 1 as const;
 export const controlMethod = "POST" as const;
 export const controlHeaderNames = [

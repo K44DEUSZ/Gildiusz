@@ -9,6 +9,7 @@ import {
 import { announcementAssetsMigration } from "../modules/announcement-assets/schema.js";
 import { domainRetentionMigration } from "./retention-schema.js";
 import { serverRulesMigration } from "../modules/server-rules/schema.js";
+import { serverRulesDeletionMigration } from "../modules/server-rules/deletion-schema.js";
 
 const migrations = [
   {
@@ -139,6 +140,7 @@ const migrations = [
   announcementRemovalMigration,
   domainRetentionMigration,
   serverRulesMigration,
+  serverRulesDeletionMigration,
 ] as const;
 
 export function migrationDefinitions(): readonly { version: number; name: string; sql: string }[] {

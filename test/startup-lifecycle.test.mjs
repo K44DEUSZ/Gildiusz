@@ -85,8 +85,9 @@ test("a stopped startup releases a late-acquired lease without constructing or r
   assert.equal(bindings.guildReleases.size, 0);
 });
 
-test("actual shutdown waits for pending Store opens before releasing the data-root lease", async () => {
+test("actual shutdown waits for pending Store opens and audio cleanup before destroying the client and releasing the data-root lease", async () => {
   const lease = deferred(),
+    audio = deferred(),
     events = [];
   let writes = 0,
     finished = false;
@@ -104,6 +105,13 @@ test("actual shutdown waits for pending Store opens before releasing the data-ro
     twitch: undefined,
     twitchIngress: undefined,
     integrationDatabase: undefined,
+    audioRehearsal: {
+      stop: async () => {
+        events.push("audio_stop_started");
+        await audio.promise;
+        events.push("audio_stopped");
+      },
+    },
     registry: { values: () => [] },
     client: {
       removeAllListeners() {},
@@ -135,9 +143,19 @@ test("actual shutdown waits for pending Store opens before releasing the data-ro
     events.push("guild_lease_released");
   });
   await rejected;
+  await new Promise(setImmediate);
+  assert.equal(finished, false);
+  assert.deepEqual(events, ["guild_lease_released", "audio_stop_started"]);
+  audio.resolve();
   await shutdown;
   assert.equal(writes, 0);
-  assert.deepEqual(events, ["guild_lease_released", "destroy", "data_root_released"]);
+  assert.deepEqual(events, [
+    "guild_lease_released",
+    "audio_stop_started",
+    "audio_stopped",
+    "destroy",
+    "data_root_released",
+  ]);
 });
 
 test("concurrent initialization shares one lease and one Store constructor", async () => {

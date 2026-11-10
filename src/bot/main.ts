@@ -74,6 +74,11 @@ import { RetentionSchedule } from "./retention-schedule.js";
 import { serverRulesInteraction } from "./server-rules-interactions.js";
 import { ServerRulesRetention } from "../modules/server-rules/retention.js";
 import {
+  drainRulesDeletionOutbox,
+  pruneRulesDeletionJournal,
+} from "../storage/rules-deletion-journal.js";
+import type { MusicRehearsalOperator } from "./music-rehearsal-operator.js";
+import {
   GuildUninstallRetention,
   readUninstallMarker,
   recordGuildMembership,
@@ -168,10 +173,15 @@ async function main(): Promise<void> {
   const localRetentionBusy = new Set<string>();
   const closingRuntimes = new Map<string, GuildRuntime>();
   const retentionWarnings = new Map<string, string>();
+  let deletionProofState: "uninitialized" | "ready" | "blocked" = "uninitialized";
+  let deletionProofCode: string | null = "source_uninitialized";
+  let deletionProofAt = 0;
+  let deletionProofBusy = false;
   let controlServer: Server | undefined;
   let twitch: TwitchRuntime | undefined;
   let integrationDatabase: DatabaseSync | undefined;
   let twitchIngress: TwitchIngress | undefined;
+  let audioRehearsal: MusicRehearsalOperator | null = null;
   const epoch = (guildId: string) => guildEpochs.get(guildId) ?? 0;
   const bumpEpoch = (guildId: string) => guildEpochs.set(guildId, epoch(guildId) + 1);
   async function openStore(installation: GuildInstallation): Promise<void> {
@@ -389,6 +399,7 @@ async function main(): Promise<void> {
         ready,
         degraded: guilds.some((guild) => !guild.ready) || retentionWarnings.size > 0,
         retentionWarnings: [...retentionWarnings].map(([guildId, state]) => ({ guildId, state })),
+        rulesDeletionProof: { state: deletionProofState, code: deletionProofCode },
         guilds,
         updated: Date.now(),
       }) + "\n",
@@ -729,10 +740,49 @@ async function main(): Promise<void> {
     }
   }
 
+  async function maintainRulesDeletionJournal(sources: readonly [string, Store][]): Promise<void> {
+    try {
+      if (!existsSync(join(dataRoot, "rules-acceptance-deletions", "journal.json"))) {
+        deletionProofState = "uninitialized";
+        deletionProofCode = "source_uninitialized";
+        return;
+      }
+      // UUID expiry must continue even if a source DB has gone away or the Gateway is down.
+      await pruneRulesDeletionJournal({ dataRoot });
+      if (openingStores.size || changing.size) {
+        deletionProofState = "blocked";
+        deletionProofCode = "inventory_changing";
+        return;
+      }
+      // A changed inventory fails closed; it must never reset coverage or omit prior decisions.
+      const result = await drainRulesDeletionOutbox({
+        dataRoot,
+        stores: sources.map(([guildId, store]) => ({ guildId, jobs: new JobStore(store.db) })),
+      });
+      deletionProofState = result.pending ? "blocked" : "ready";
+      deletionProofCode = result.pending ? "source_incomplete" : null;
+      if (result.pending) deletionProofAt = Date.now() + 5000;
+    } catch (error) {
+      deletionProofState = "blocked";
+      deletionProofCode = errorCode(error);
+    } finally {
+      deletionProofBusy = false;
+    }
+  }
+
   const timer = setInterval(() => {
     if (stopping) return;
     // A slow guild API request must not suppress health signals or other guilds' maintenance.
     health();
+    if (ownsDataRoot && !deletionProofBusy && Date.now() >= deletionProofAt) {
+      deletionProofBusy = true;
+      deletionProofAt = Date.now() + 60000;
+      const sources = [...stores];
+      const maintenance = maintainRulesDeletionJournal(sources);
+      // Purge fences new work and drains every captured source before closing its SQLite handle.
+      for (const [guildId] of sources) guildActivity.track(guildId, maintenance);
+      track(maintenance);
+    }
     // Local retention continues during a Gateway outage; it performs no Discord effects.
     const retentionIds = [...stores.keys()].filter(
       (id) => !changing.has(id) && !localRetentionBusy.has(id),
@@ -880,11 +930,15 @@ async function main(): Promise<void> {
         );
       } finally {
         controlServer?.close();
-        await client.destroy();
-        for (const store of stores.values()) store.close();
-        for (const release of guildReleases.values()) await release();
-        integrationDatabase?.close();
-        for (const release of releases.reverse()) await release();
+        try {
+          await audioRehearsal?.stop();
+        } finally {
+          await client.destroy();
+          for (const store of stores.values()) store.close();
+          for (const release of guildReleases.values()) await release();
+          integrationDatabase?.close();
+          for (const release of releases.reverse()) await release();
+        }
       }
     })();
     return shutdown;
@@ -938,6 +992,20 @@ async function main(): Promise<void> {
           await presentInstallation(installation.guildId);
         }
       }
+      if (process.env.GILDIUSZ_AUDIO_REHEARSAL === "1" && !stopping) {
+        const { createMusicRehearsalOperator } = await import("./music-rehearsal-operator.js");
+        if (!stopping) {
+          const rehearsal = await createMusicRehearsalOperator(client, {
+            enabled: true,
+            expectedApplicationId: credentials.clientId,
+            dataRoot,
+            configPath: process.env.GILDIUSZ_AUDIO_REHEARSAL_CONFIG,
+          });
+          if (stopping) await rehearsal?.stop();
+          else audioRehearsal = rehearsal;
+        }
+      }
+      if (stopping) return;
       connected = true;
       console.log("Bot connected. Timezone: Europe/Warsaw.");
     })();

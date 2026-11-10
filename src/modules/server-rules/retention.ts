@@ -1,6 +1,7 @@
 import type { JobStore } from "../../core/jobs/store.js";
 import { assertFresh, rulesId, rulesInteger } from "./policy.js";
 import { RulesError } from "./types.js";
+import { expireRulesDeletions, recordRulesDeletion } from "./deletion-outbox.js";
 
 const day = 86400000;
 export const serverRulesRetentionPolicy = Object.freeze({
@@ -213,6 +214,18 @@ export class ServerRulesRetention {
             now,
             now + serverRulesRetentionPolicy.retiredAcceptanceFenceMs,
           );
+          const fence = db
+            .prepare(
+              "SELECT retired_at,expires_at FROM server_rules_retired_acceptances WHERE guild_id=? AND id=?",
+            )
+            .get(this.guildId, String(row.id))!;
+          recordRulesDeletion(
+            db,
+            this.guildId,
+            String(row.id),
+            Number(fence.retired_at),
+            Number(fence.expires_at),
+          );
           if (row.job_id) {
             const jobId = String(row.job_id),
               job = this.jobs.get(jobId);
@@ -267,6 +280,7 @@ export class ServerRulesRetention {
         );
         result.fencesExpired++;
       }
+      expireRulesDeletions(db, this.guildId, now, limit);
       return result;
     });
   }
