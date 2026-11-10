@@ -6,7 +6,7 @@ Bot Discord do prowadzenia społeczności. Tworzy pokoje na czas rozmowy, nadaje
 
 - **Pokoje głosowe:** osobny pokój po wejściu na wskazany kanał, zmiana nazwy, zamknięcie, zapraszanie osób i sprzątanie po rozmowie.
 - **Role z reakcji:** wybór kilku ról, nadanie po kliknięciu emoji i odebranie po cofnięciu reakcji.
-- **Filtr plików:** dozwolone formaty PDF, PNG, JPG, JPEG, WebP i GIF, sprawdzane po wysłaniu wiadomości. To kontrola formatu, nie skaner antywirusowy.
+- **Filtr plików:** wybór formatów dla kanału i sprawdzanie nagłówka po wysłaniu wiadomości. Domyślnie PDF, PNG, JPG, JPEG, WebP i GIF; można też wybrać dodatkowe obrazy, audio, wideo i archiwa. To kontrola formatu, nie skaner antywirusowy.
 - **Zgłoszenia:** prywatne przekazanie opisu problemu na kanał wybrany przez administrację.
 
 Każdy serwer ma własne ustawienia. Funkcje można włączać osobno i przypisywać do istniejących kanałów oraz ról. Bot nie nagrywa rozmów głosowych.
@@ -20,6 +20,8 @@ Uczestnicy korzystają z `/pokoj` i `/zglos`. Role do samodzielnego wyboru musz�
 ## Status projektu
 
 Gildiusz jest we wczesnej wersji. Strona i panel są rozwijane oddzielnie, a publiczne uruchomienie wspólnej usługi jest w przygotowaniu. W tym repozytorium znajduje się kod bota do własnego uruchomienia.
+
+Na gałęzi `test` sprawdzamy spotkania, zgłoszenia z historią i pomysły, ogłoszenia na termin, integrację Twitch oraz akceptację regulaminu z rolą członka. Udostępnienie tych funkcji we wspólnej usłudze wymaga jeszcze odbioru. Muzyka oraz aktywność i rangi są planowane.
 
 <details>
 <summary>Uruchom własną instancję</summary>

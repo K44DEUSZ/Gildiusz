@@ -1,6 +1,6 @@
 import { ControlError } from "./configuration.js";
 
-export const contractsVersion = "0.5.0";
+export const contractsVersion = "0.8.0";
 export const schemaVersion = 1 as const;
 export const controlMethod = "POST" as const;
 export const controlHeaderNames = [
@@ -32,6 +32,27 @@ export const controlOperations = {
   },
   "settings.read": { method: "GET", path: "/v1/guilds/{guildId}/settings", mutation: false },
   "settings.save": { method: "PUT", path: "/v1/guilds/{guildId}/settings/save", mutation: true },
+  "rules.read": { method: "GET", path: "/v1/guilds/{guildId}/rules", mutation: false },
+  "rules.configure": {
+    method: "PUT",
+    path: "/v1/guilds/{guildId}/rules/configure",
+    mutation: true,
+  },
+  "rules.publish": {
+    method: "POST",
+    path: "/v1/guilds/{guildId}/rules/publish",
+    mutation: true,
+  },
+  "rules.acceptances.list": {
+    method: "POST",
+    path: "/v1/guilds/{guildId}/rules/acceptances",
+    mutation: false,
+  },
+  "rules.publications.reconcile": {
+    method: "POST",
+    path: "/v1/guilds/{guildId}/rules/{objectId}/reconcile",
+    mutation: true,
+  },
   "meetings.list": { method: "GET", path: "/v1/guilds/{guildId}/meetings", mutation: false },
   "meetings.preview": {
     method: "POST",
@@ -433,6 +454,11 @@ export const featureCatalog = [
     key: "reactions",
     label: "Role za reakcje",
     requiredPermissions: ["ViewChannel", "ReadMessageHistory", "ManageRoles", "AddReactions"],
+  },
+  {
+    key: "rules",
+    label: "Regulamin serwera",
+    requiredPermissions: ["ViewChannel", "ReadMessageHistory", "SendMessages", "ManageRoles"],
   },
   {
     key: "files",

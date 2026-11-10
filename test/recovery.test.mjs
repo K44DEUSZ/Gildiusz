@@ -33,6 +33,8 @@ import {
 import { encryptArchive } from "../dist/storage/recovery/archive.js";
 import { configuredSnapshot, recoveryCommand } from "../scripts/recovery.mjs";
 import { stoppedSnapshot, deploymentPause } from "../scripts/hosting.mjs";
+import { quarantineDatabase } from "../dist/storage/recovery/schema.js";
+import { serverRulesMigration } from "../dist/modules/server-rules/schema.js";
 
 const guildA = "900000000000000001",
   guildB = "900000000000000002",
@@ -42,6 +44,49 @@ const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP8AAP8FAAH/+lyI0QAAAABJRU5ErkJggg==",
   "base64",
 );
+
+test("restore quarantine independently disables rules and retires old controls and queued grants", (t) => {
+  const store = new Store(":memory:", guildA),
+    db = store.db;
+  t.after(() => store.close());
+  if (
+    !db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_rules_settings'")
+      .get()
+  )
+    db.exec(serverRulesMigration.sql);
+  const version = randomUUID(),
+    acceptance = randomUUID(),
+    now = Date.now();
+  db.prepare("INSERT INTO server_rules_settings VALUES(?,4,8,1,NULL,?)").run(guildA, version);
+  db.prepare("INSERT INTO server_rules_versions VALUES(?,?,8,?,'hash','active',?,?)").run(
+    guildA,
+    version,
+    JSON.stringify({
+      channelId: channel,
+      roleId: actor,
+      label: "1",
+      content: "Test",
+      method: "button",
+      emoji: null,
+    }),
+    now,
+    actor,
+  );
+  db.prepare(
+    "INSERT INTO server_rules_acceptances VALUES(?,?,?,?,?,?,?,'button','pending',NULL,NULL,NULL)",
+  ).run(guildA, acceptance, actor, now - 1000, version, actor, now);
+  quarantineDatabase(db, "guild", now + 1);
+  const settings = db.prepare("SELECT * FROM server_rules_settings").get();
+  assert.equal(settings.enabled, 0);
+  assert.equal(settings.active_version_id, null);
+  assert.equal(settings.revision, 5);
+  assert.equal(settings.generation, 9);
+  assert.equal(db.prepare("SELECT state FROM server_rules_versions").get().state, "retired");
+  const grant = db.prepare("SELECT grant_state,reason FROM server_rules_acceptances").get();
+  assert.equal(grant.grant_state, "blocked");
+  assert.equal(grant.reason, "restore_quarantine");
+});
 async function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "gildiusz-recovery-"));
   chmodSync(root, 0o700);
@@ -199,6 +244,13 @@ async function fixture(t) {
   });
   return { root, options, stores, hubDb, bindingA, assetId, annId };
 }
+
+test("rules from another guild cannot enter a guild snapshot", async (t) => {
+  const f = await fixture(t);
+  f.stores[0].db.prepare("INSERT INTO server_rules_settings VALUES(?,0,0,0,NULL,NULL)").run(guildB);
+  await assert.rejects(createSnapshot(f.options), /another guild's data/);
+  assert.equal(existsSync(f.options.outputPath), false);
+});
 
 test("two WAL guilds, shared hub, registry and controlled assets round-trip only into quarantined data", async (t) => {
   const f = await fixture(t),
@@ -518,7 +570,7 @@ test("known pre-migration schemas restore under quarantine while altered SQL wit
   const f = await fixture(t);
   for (const store of f.stores)
     store.db.exec(
-      "DROP TABLE domain_retired;DROP TABLE job_history_retired;DROP INDEX announcements_visible;ALTER TABLE announcements DROP COLUMN removed_at;DELETE FROM schema_migrations WHERE version>=10",
+      "DROP TABLE server_rules_acceptances;DROP TABLE server_rules_parts;DROP TABLE server_rules_memberships;DROP TABLE server_rules_retired_acceptances;DROP TABLE server_rules_settings;DROP TABLE server_rules_versions;DROP TABLE domain_retired;DROP TABLE job_history_retired;DROP INDEX announcements_visible;ALTER TABLE announcements DROP COLUMN removed_at;DELETE FROM schema_migrations WHERE version>=10",
     );
   const manifest = await createSnapshot(f.options);
   assert.equal(manifest.files.find((entry) => entry.kind === "guild").schema.migrations.length, 9);

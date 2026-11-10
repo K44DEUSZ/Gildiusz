@@ -1,4 +1,6 @@
-export const fileFormats = ["PDF", "PNG", "JPG", "JPEG", "WEBP", "GIF"] as const;
+import { fileFormats, type FileFormat } from "./file-formats.js";
+import { normalizeReactionEmoji, reactionEmojiKey, reactionEmojiValidation } from "./emoji.js";
+export { fileFormats } from "./file-formats.js";
 export const moduleKeys = ["rooms", "reactions", "files", "reports"] as const;
 export type ModuleKey = (typeof moduleKeys)[number];
 export const moduleNames: Record<ModuleKey, string> = {
@@ -37,6 +39,10 @@ export interface GuildRole {
 export interface GuildResources {
   channels: GuildChannel[];
   roles: GuildRole[];
+  configurationCapabilities?: {
+    fileFormats: readonly FileFormat[];
+    reactionEmojiMaxLength: number;
+  };
 }
 export interface GuildSummary {
   id: string;
@@ -115,7 +121,7 @@ export function parseConfiguration(input: unknown): Configuration {
   const reactions = record(value.reactions, ["channelId", "choices"]);
   const files = record(value.files, ["channelIds", "formats", "includeRooms"]);
   const reports = record(value.reports, ["channelId"]);
-  const formats = array(files.formats, 6);
+  const formats = array(files.formats, fileFormats.length);
   if (
     formats.some((format) => !fileFormats.includes(format as (typeof fileFormats)[number])) ||
     new Set(formats).size !== formats.length
@@ -140,13 +146,16 @@ export function parseConfiguration(input: unknown): Configuration {
       channelId: id(reactions.channelId),
       choices: array(reactions.choices, 15).map((input) => {
         const choice = record(input, ["emoji", "roleId"]);
-        if (
-          typeof choice.emoji !== "string" ||
-          choice.emoji.length > 16 ||
-          choice.emoji.trim() !== choice.emoji
-        )
+        const emojiStatus = reactionEmojiValidation(choice.emoji);
+        if (emojiStatus === "invalid")
           throw new ControlError(400, "invalid_emoji", "Wybierz pojedyncze emoji.");
-        return { emoji: choice.emoji, roleId: id(choice.roleId) };
+        return {
+          emoji:
+            emojiStatus === "valid"
+              ? normalizeReactionEmoji(choice.emoji as string)
+              : (choice.emoji as string),
+          roleId: id(choice.roleId),
+        };
       }),
     },
     files: {
@@ -183,17 +192,12 @@ export function validateBindings(config: Configuration, resources: GuildResource
     for (const choice of config.reactions.choices) {
       if (!resources.roles.some((role) => role.id === choice.roleId && role.assignable))
         errors.push("Wybierz rolę, którą Gildiusz może bezpiecznie nadawać.");
-      const segments = [
-        ...new Intl.Segmenter("pl", { granularity: "grapheme" }).segment(choice.emoji),
-      ];
-      if (
-        segments.length !== 1 ||
-        !/[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3]/u.test(choice.emoji)
-      )
+      if (reactionEmojiValidation(choice.emoji) === "invalid")
         errors.push("Każdy wybór potrzebuje jednego emoji.");
-      if (emoji.has(choice.emoji) || roles.has(choice.roleId))
+      const emojiKey = reactionEmojiKey(choice.emoji);
+      if (emoji.has(emojiKey) || roles.has(choice.roleId))
         errors.push("Emoji i role nie mogą się powtarzać.");
-      emoji.add(choice.emoji);
+      emoji.add(emojiKey);
       roles.add(choice.roleId);
     }
   }

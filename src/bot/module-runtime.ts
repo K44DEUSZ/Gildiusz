@@ -8,6 +8,7 @@ import {
 import { controlResources } from "./control.js";
 import { CommunityRuntime } from "./community-runtime.js";
 import type { TwitchRuntime } from "./twitch-runtime.js";
+import { ServerRulesRuntime } from "./server-rules-runtime.js";
 import type { AnnouncementAssetPort } from "../modules/announcement-assets/types.js";
 import { AnnouncementAssetError } from "../modules/announcement-assets/types.js";
 import { JobStore } from "../core/jobs/store.js";
@@ -106,6 +107,7 @@ export class ModuleRuntime {
   readonly settings: ModuleSettingsStore;
   readonly announcements: AnnouncementService;
   readonly community: CommunityRuntime;
+  readonly rules: ServerRulesRuntime;
   private readonly transport: DeliveryTransport;
 
   constructor(
@@ -114,9 +116,17 @@ export class ModuleRuntime {
     readonly beta = process.env.GILDIUSZ_BETA_MODULES === "1",
     private readonly integrations?: Pick<TwitchRuntime, "capability" | "request">,
     readonly announcementAssets?: AnnouncementAssetPort,
+    memberEvents = process.env.GILDIUSZ_MEMBER_EVENTS === "1",
   ) {
     this.jobs = new JobStore(context.store.db);
     this.settings = new ModuleSettingsStore(context.store.db, context.guild.id);
+    this.rules = new ServerRulesRuntime(
+      context,
+      this.jobs,
+      this.settings,
+      publicationRest,
+      beta && memberEvents,
+    );
     this.community = new CommunityRuntime(context, this.jobs, this.settings, publicationRest, beta);
     this.announcements = new AnnouncementService(this.jobs, {
       guildId: context.guild.id,
@@ -190,6 +200,10 @@ export class ModuleRuntime {
       ]),
     ) as Partial<Record<FeatureKey, ModuleStatus>>;
     const implemented: FeatureKey[] = ["rooms", "reactions", "files", "reports"];
+    if (this.rules.effectsReady) {
+      implemented.push("rules");
+      states.rules = this.rules.status();
+    }
     if (this.beta) {
       implemented.push("announcements");
       states.announcements = this.settings.read().enabled.announcements ? "enabled" : "available";
@@ -278,6 +292,14 @@ export class ModuleRuntime {
       }
       if (this.beta && this.integrations?.capability(guild.id).availability === "available")
         available.push("integrations.list", "integrations.create");
+      if (this.rules.effectsReady)
+        available.push(
+          "rules.read",
+          "rules.configure",
+          "rules.publish",
+          "rules.acceptances.list",
+          "rules.publications.reconcile",
+        );
       const permissions = available.filter((operation) =>
         canPerform(operation, facts, policy, { guildId: guild.id }),
       );
@@ -318,6 +340,10 @@ export class ModuleRuntime {
   ): Promise<unknown> {
     const policy = this.settings.policy();
     try {
+      if (operation.startsWith("rules.")) {
+        requirePermission(operation, actor, policy, { guildId: this.context.guild.id });
+        return await this.rules.request(actor.userId, operation, input, objectId, requestId);
+      }
       if (operation.startsWith("integrations.")) {
         if (!this.beta || !this.integrations)
           throw new ControlError(
@@ -645,6 +671,7 @@ export class ModuleRuntime {
   }
 
   async execute(job: Job, execution: ExecutionContext): Promise<ExecutionOutcome> {
+    if (job.type.startsWith("server-rules.")) return this.rules.execute(job, execution);
     if (
       job.type.startsWith("meeting.") ||
       job.type.startsWith("case.") ||

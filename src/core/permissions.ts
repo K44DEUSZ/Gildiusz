@@ -36,6 +36,11 @@ export const moduleActions = [
   "capabilities.read",
   "settings.read",
   "settings.save",
+  "rules.read",
+  "rules.configure",
+  "rules.publish",
+  "rules.acceptances.list",
+  "rules.publications.reconcile",
   "integrations.list",
   "integrations.lookup",
   "integrations.create",
@@ -216,6 +221,7 @@ export function permissionDecision(
   if (action === "capabilities.read") return allow;
   if (
     action.startsWith("settings.") ||
+    action.startsWith("rules.") ||
     action.startsWith("integrations.") ||
     action.startsWith("jobs.") ||
     action === "deliveries.list"

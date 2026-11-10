@@ -11,9 +11,11 @@ import {
   ControlError,
   parseConfiguration,
   validateBindings,
+  fileFormats,
   type Configuration,
   type GuildResources,
 } from "../control/contracts.js";
+import { reactionEmojiMaxLength } from "../contracts/emoji.js";
 import { noMentions } from "../shared/utils.js";
 import { roleChoices } from "../role-selection.js";
 import { freshMember } from "./module-permissions.js";
@@ -76,6 +78,7 @@ export async function controlResources(guild: Guild): Promise<GuildResources> {
   const roles = await guild.roles.fetch(),
     me = await guild.members.fetchMe({ force: true });
   return {
+    configurationCapabilities: { fileFormats: [...fileFormats], reactionEmojiMaxLength },
     channels: [...channels.values()]
       .filter((channel) => channel !== null)
       .filter((channel) =>

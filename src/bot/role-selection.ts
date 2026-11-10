@@ -3,6 +3,7 @@ import type { BotContext } from "./context.js";
 import { RoleSelectionService } from "../role-selection.js";
 import { selectionChoices, rolePanel } from "./control.js";
 import { errorCode } from "../shared/utils.js";
+import { reactionEmojiKey, reactionEmojiValidation } from "../contracts/emoji.js";
 
 export async function discordRoleSelection(
   context: BotContext,
@@ -26,7 +27,13 @@ export async function discordRoleSelection(
       reactors: async (emoji) => {
         const current = await channel.messages.fetch({ message: panel.id, force: true });
         if (current.author.id !== environment.clientId) throw Error("Role panel author differs");
-        const reaction = current.reactions.cache.find((entry) => entry.emoji.name === emoji);
+        const reaction = current.reactions.cache.find(
+          (entry) =>
+            !entry.emoji.id &&
+            entry.emoji.name !== null &&
+            reactionEmojiValidation(entry.emoji.name) === "valid" &&
+            reactionEmojiKey(entry.emoji.name) === reactionEmojiKey(emoji),
+        );
         if (!reaction) return [];
         const users: string[] = [];
         let after: string | undefined;

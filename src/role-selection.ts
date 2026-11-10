@@ -1,5 +1,6 @@
 import type { Store } from "./storage/store.js";
 import { SerialQueue } from "./shared/utils.js";
+import { reactionEmojiKey, reactionEmojiValidation } from "./contracts/emoji.js";
 
 export const roleChoices = [
   { key: "programming", emoji: "💻" },
@@ -36,7 +37,10 @@ export class RoleSelectionService {
     private choices: readonly { key: string; emoji: string }[] = roleChoices,
   ) {}
   handle(event: RoleReaction): Promise<void> {
-    const choice = this.choices.find((entry) => entry.emoji === event.emoji);
+    if (event.emoji === null || reactionEmojiValidation(event.emoji) !== "valid")
+      return Promise.resolve();
+    const emojiKey = reactionEmojiKey(event.emoji);
+    const choice = this.choices.find((entry) => reactionEmojiKey(entry.emoji) === emojiKey);
     if (
       !choice ||
       event.guild !== this.panel.guild ||

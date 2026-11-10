@@ -197,6 +197,10 @@ test("contracts artifacts are reproducible, contain only public runtime files an
         "community.js",
         "configuration.d.ts",
         "configuration.js",
+        "emoji.d.ts",
+        "emoji.js",
+        "file-formats.d.ts",
+        "file-formats.js",
         "index.d.ts",
         "index.js",
         "jobs.d.ts",
@@ -208,6 +212,8 @@ test("contracts artifacts are reproducible, contain only public runtime files an
         "package.json",
         "protocol.d.ts",
         "protocol.js",
+        "server-rules.d.ts",
+        "server-rules.js",
         "twitch-proxy.d.ts",
         "twitch-proxy.js",
         "twitch.d.ts",
@@ -239,7 +245,7 @@ test("contracts artifacts are reproducible, contain only public runtime files an
         [
           "--input-type=module",
           "-e",
-          "import{schemaVersion,contractsVersion,parseConfiguration}from'@gildiusz/contracts';import{controlSignature}from'@gildiusz/contracts/node';console.log(JSON.stringify({schemaVersion,contractsVersion,parser:typeof parseConfiguration,signer:typeof controlSignature}))",
+          "import{schemaVersion,contractsVersion,parseConfiguration,reactionEmojiValidation,fileFormats,rulesDraftMessages,rulesLimits,controlOperations}from'@gildiusz/contracts';import{controlSignature}from'@gildiusz/contracts/node';console.log(JSON.stringify({schemaVersion,contractsVersion,parser:typeof parseConfiguration,signer:typeof controlSignature,emoji:reactionEmojiValidation('❤️'),formatCount:fileFormats.length,rulesFormatter:typeof rulesDraftMessages,rulesLimit:rulesLimits.content,rulesList:controlOperations['rules.acceptances.list']}))",
         ],
         { cwd: consumer, encoding: "utf8" },
       ),
@@ -249,8 +255,20 @@ test("contracts artifacts are reproducible, contain only public runtime files an
       contractsVersion: first.version,
       parser: "function",
       signer: "function",
+      emoji: "valid",
+      formatCount: contracts.fileFormats.length,
+      rulesFormatter: "function",
+      rulesLimit: contracts.rulesLimits.content,
+      rulesList: contracts.controlOperations["rules.acceptances.list"],
     });
-    const clientSource = ["index.js", "configuration.js", "protocol.js"]
+    const clientSource = [
+      "index.js",
+      "configuration.js",
+      "protocol.js",
+      "emoji.js",
+      "file-formats.js",
+      "server-rules.js",
+    ]
       .map((entry) =>
         readFileSync(join(consumer, "node_modules", "@gildiusz", "contracts", entry), "utf8"),
       )

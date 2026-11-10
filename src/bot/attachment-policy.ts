@@ -1,4 +1,5 @@
 import type { Config } from "../config.js";
+import { sniffExtendedAttachment } from "./attachment-formats.js";
 
 export function extension(filename: string, allowed: string[]): string | null {
   const name = filename.normalize("NFKC");
@@ -35,7 +36,7 @@ export function sniff(bytes: Uint8Array): string | null {
   )
     return "webp";
   if (/^%PDF-[12]\.\d/.test(buffer.subarray(0, 8).toString("ascii"))) return "pdf";
-  return null;
+  return sniffExtendedAttachment(bytes);
 }
 
 export function attachmentUrl(address: string, hosts: string[]): URL {
@@ -87,5 +88,5 @@ export async function fetchHeader(
 
 export function matchesHeader(filename: string, bytes: Uint8Array, allowed: string[]): boolean {
   const ext = extension(filename, allowed);
-  return Boolean(ext && sniff(bytes) === (ext === "jpg" ? "jpeg" : ext));
+  return Boolean(ext && sniff(bytes) === (ext === "jpg" ? "jpeg" : ext === "tif" ? "tiff" : ext));
 }

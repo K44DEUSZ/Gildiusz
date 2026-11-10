@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileExtensions } from "./contracts/file-formats.js";
 import { requireId } from "./shared/utils.js";
 
 export type ChannelKind = "readonly" | "text" | "forum" | "voice" | "admin";
@@ -123,7 +124,7 @@ export function validateConfig(config: Config): void {
     throw new Error("Configured limits are outside the supported range.");
   if (
     config.attachments.extensions.some(
-      (ext) => !["pdf", "png", "jpg", "jpeg", "webp", "gif"].includes(ext),
+      (ext) => !fileExtensions.includes(ext as (typeof fileExtensions)[number]),
     )
   )
     throw new Error("Unsupported attachment type.");

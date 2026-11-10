@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Config } from "./config.js";
 import type { Store } from "./storage/store.js";
+import { fileExtensions } from "./contracts/file-formats.js";
 
-export const supportedExtensions = ["pdf", "png", "jpg", "jpeg", "webp", "gif"] as const;
+export const supportedExtensions = fileExtensions;
 export interface EditableSettings {
   maximum: number;
   creationCooldownSeconds: number;

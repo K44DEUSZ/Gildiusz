@@ -29,6 +29,33 @@ function fixture(t) {
   });
   return { store, path };
 }
+
+test("presentation variants of the same Unicode reaction grant and revoke the configured role", async (t) => {
+  const { store } = fixture(t),
+    calls = [];
+  const service = new RoleSelectionService(
+    store,
+    panel,
+    {
+      reactors: async () => [],
+      apply: async (...args) => {
+        calls.push(args);
+        return true;
+      },
+    },
+    [{ key: "heart", emoji: "❤️" }],
+  );
+  await service.handle(event(true, "\uFE0F❤"));
+  await service.handle(event(true, "❤\uFE0F\uFE0F"));
+  assert.deepEqual(calls, []);
+  await service.handle(event(true, "❤"));
+  await service.handle(event(false, "❤️"));
+  assert.deepEqual(calls, [
+    [user, "heart", true],
+    [user, "heart", false],
+  ]);
+  assert.deepEqual(store.roleSelections("heart"), []);
+});
 test("reaction selection is confined to its guild, channel, managed message and emoji allowlist", async (t) => {
   const { store } = fixture(t);
   const calls = [];

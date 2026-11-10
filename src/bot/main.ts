@@ -71,6 +71,8 @@ import { AnnouncementAssetStore } from "../modules/announcement-assets/store.js"
 import { freshBotGuildPresence } from "./guild-presence.js";
 import { GuildActivity } from "./guild-activity.js";
 import { RetentionSchedule } from "./retention-schedule.js";
+import { serverRulesInteraction } from "./server-rules-interactions.js";
+import { ServerRulesRetention } from "../modules/server-rules/retention.js";
 import {
   GuildUninstallRetention,
   readUninstallMarker,
@@ -450,7 +452,14 @@ async function main(): Promise<void> {
         console.error(`Announcement images unavailable: ${guild.id}; ${errorCode(error)}`);
       }
     }
-    const modules = new ModuleRuntime(context, publicationRest, undefined, twitch, assets);
+    const modules = new ModuleRuntime(
+      context,
+      publicationRest,
+      undefined,
+      twitch,
+      assets,
+      memberEvents,
+    );
     const membership = new MeetingMembership(modules.community, publicationRest);
     modules.community.setMembershipCheck((userId) => membership.check(userId));
     const filter = new AttachmentFilter(context);
@@ -738,7 +747,10 @@ async function main(): Promise<void> {
       track(
         (async () => {
           try {
-            pruneDomainData(new JobStore(store.db), guildId);
+            const jobs = new JobStore(store.db);
+            pruneDomainData(jobs, guildId);
+            await registry.get(guildId)?.modules.rules.sweepMemberships();
+            new ServerRulesRetention(jobs, { guildId }).prune();
             const assetDirectory = join(dataRoot, "announcement-assets", guildId);
             if (
               existsSync(assetDirectory) ||
@@ -775,6 +787,7 @@ async function main(): Promise<void> {
     }
     if (twitch) track(twitch.pump());
     for (const runtime of registry.values()) {
+      track(runtime.modules.rules.sweepMemberships(), runtime.context.guild.id);
       try {
         runtime.modules.sync();
       } catch (error) {
@@ -949,6 +962,7 @@ async function main(): Promise<void> {
     bumpEpoch(guild.id);
     uninstalled.add(guild.id);
     const runtime = registry.invalidate(guild.id);
+    runtime?.modules.rules.stop();
     if (runtime) closingRuntimes.set(guild.id, runtime);
     if (installations.find((entry) => entry.guildId === guild.id)?.public)
       registry.remove(guild.id);
@@ -971,7 +985,10 @@ async function main(): Promise<void> {
     for (const event of [Events.GuildMemberRemove, Events.GuildMemberAdd] as const)
       client.on(event, (member) => {
         const runtime = lookup(member.guild.id);
-        if (runtime) track(runtime.membership.check(member.id), member.guild.id);
+        if (runtime) {
+          track(runtime.membership.check(member.id), member.guild.id);
+          track(runtime.modules.rules.memberChanged(member.id), member.guild.id);
+        }
       });
     client.on(Events.GuildMemberUpdate, (_previous, member) => {
       const runtime = lookup(member.guild.id);
@@ -980,6 +997,7 @@ async function main(): Promise<void> {
           Promise.resolve().then(() => runtime.modules.community.memberUpdated(member.id)),
           member.guild.id,
         );
+      if (runtime) track(runtime.modules.rules.memberChanged(member.id), member.guild.id);
     });
   }
   client.on(Events.MessageCreate, (message) => {
@@ -1038,20 +1056,33 @@ async function main(): Promise<void> {
     client.on(event, (...args) => {
       const [reaction, user] = args;
       const runtime = lookup(reaction.message.guildId);
-      if (!runtime?.roleSelection || user.id === credentials.clientId || user.bot) return;
+      if (!runtime || user.id === credentials.clientId || user.bot) return;
       track(
-        runtime.roleSelection
-          .handle({
-            guild: reaction.message.guildId,
-            channel: reaction.message.channelId,
-            message: reaction.message.id,
-            emoji: reaction.emoji.id ? null : reaction.emoji.name,
-            user: user.id,
+        runtime.modules.rules
+          .reaction(
+            user.id,
+            reaction.message.channelId,
+            reaction.message.id,
+            reaction.emoji.id ? null : reaction.emoji.name,
             active,
-          })
-          .catch((error) => runtime.context.alert("role-selection", user.id, errorCode(error))),
+          )
+          .catch((error) => runtime.context.store.event("server-rules", user.id, errorCode(error))),
         reaction.message.guildId,
       );
+      if (runtime.roleSelection)
+        track(
+          runtime.roleSelection
+            .handle({
+              guild: reaction.message.guildId,
+              channel: reaction.message.channelId,
+              message: reaction.message.id,
+              emoji: reaction.emoji.id ? null : reaction.emoji.name,
+              user: user.id,
+              active,
+            })
+            .catch((error) => runtime.context.alert("role-selection", user.id, errorCode(error))),
+          reaction.message.guildId,
+        );
     });
   client.on(Events.VoiceStateUpdate, (previous, state) => {
     const runtime = lookup(state.guild.id);
@@ -1140,6 +1171,7 @@ async function main(): Promise<void> {
           return;
         }
         if (await settingsInteraction(context, interaction)) return;
+        if (await serverRulesInteraction(runtime.modules.rules, interaction)) return;
         if (await announcementInteraction(runtime.modules, interaction)) return;
         if (await communityInteraction(runtime.modules, interaction)) return;
         if (!interaction.isChatInputCommand()) return;

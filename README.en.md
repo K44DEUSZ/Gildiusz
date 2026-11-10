@@ -6,7 +6,7 @@ A Discord community bot with a Polish interface: temporary voice rooms, reaction
 
 - **Voice rooms:** create a personal room through an entry channel, rename it, lock it, invite members and clean it up after the conversation.
 - **Reaction roles:** select several roles using emoji; removing a reaction removes its role.
-- **File filtering:** allow PDF, PNG, JPG, JPEG, WebP and GIF, checking file headers after a message is sent. Format validation is not antivirus scanning.
+- **File filtering:** choose formats for each channel and check file headers after a message is sent. PDF, PNG, JPG, JPEG, WebP and GIF are allowed by default; additional image, audio, video and archive formats can be selected. Format validation is not antivirus scanning.
 - **Reports:** privately forward a problem description to the moderation channel chosen by the guild administrators.
 
 Every guild has independent settings. Modules can be enabled separately and connected to existing channels and roles. The bot does not record voice conversations.
@@ -18,6 +18,8 @@ The owner or a member with **Manage Server** can configure the bot. Use `/ustawi
 ## Project status
 
 This is an early version. The website and panel are developed separately; the shared public service is being prepared. This repository contains the bot source for self-hosting.
+
+The `test` branch includes work on meetings, reports with conversation history, suggestions, scheduled announcements, Twitch integration and server rules acceptance with a member role. These features still require acceptance testing before release in the shared service. Music, activity points and ranks are planned.
 
 <details>
 <summary>Run your own instance</summary>

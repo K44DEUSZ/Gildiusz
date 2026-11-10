@@ -14,6 +14,7 @@ import { resolve, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type { Server } from "node:http";
+import { PermissionFlagsBits as P } from "discord.js";
 import { startControlServer } from "../control/server.js";
 import {
   buildCapabilities,
@@ -71,6 +72,8 @@ import {
   type ConfirmedCaseTarget,
 } from "../modules/cases/service.js";
 import { defaultCaseSettings } from "../core/modules/settings.js";
+import { ServerRulesService, RulesError } from "../modules/server-rules/service.js";
+import type { RulesDraft, RulesMessage, RulesChannel } from "../modules/server-rules/types.js";
 
 export const previewActorId = "900000000000000001";
 export const previewGuildIds = ["900000000000000101", "900000000000000102"] as const;
@@ -134,6 +137,23 @@ function only(value: Record<string, unknown>, fields: string[]): void {
   if (Object.keys(value).some((key) => !fields.includes(key)))
     throw new ControlError(400, "invalid_input", "Żądanie zawiera nieobsługiwane pole.");
 }
+function previewRulesDraft(value: unknown): value is RulesDraft {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return (
+    "channelId" in value &&
+    typeof value.channelId === "string" &&
+    "roleId" in value &&
+    typeof value.roleId === "string" &&
+    "label" in value &&
+    typeof value.label === "string" &&
+    "content" in value &&
+    typeof value.content === "string" &&
+    "method" in value &&
+    (value.method === "button" || value.method === "reaction") &&
+    "emoji" in value &&
+    (value.emoji === null || typeof value.emoji === "string")
+  );
+}
 function resources(guildId: string): GuildResources {
   const block = guildId === previewGuildIds[0] ? 0 : 10000;
   const channel = (offset: number) => (BigInt(guildId) + BigInt(block + 1000 + offset)).toString();
@@ -157,11 +177,13 @@ function resources(guildId: string): GuildResources {
       { id: channel(2), name: "projekty", kind: "text", accessible: true, uses: ["files"] },
       { id: channel(3), name: "Rozmowy", kind: "voice", accessible: true, uses: ["rooms"] },
       { id: channel(4), name: "Pokoje", kind: "category", accessible: true, uses: ["rooms"] },
+      { id: channel(5), name: "regulamin", kind: "text", accessible: true, uses: [] },
     ],
     roles: [
       { id: role(0), name: "Administracja", color: "#f0b745", assignable: false },
       { id: role(1), name: "Programowanie", color: "#6e9df1", assignable: true },
       { id: role(2), name: "Design", color: "#bd8ee5", assignable: true },
+      { id: role(3), name: "Członek", color: "#a9b1bc", assignable: true },
     ],
   };
 }
@@ -175,6 +197,7 @@ interface Runtime {
   assets: AnnouncementAssetStore;
   assetsPruneAt?: number;
   meetings: MeetingService;
+  rules: ServerRulesService;
 }
 export interface PreviewWorkerOptions {
   key: string;
@@ -309,6 +332,153 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
       800000000000000000n +
       (BigInt("0x" + hash.slice(0, 16)) % 100000000000000000n)
     ).toString();
+  }
+  function ruleMessage(
+    runtime: Runtime,
+    channelId: string,
+    messageId: string,
+  ): RulesMessage | null {
+    const resource = runtime.store.resource(`preview.rules-message.${messageId}`);
+    if (!resource) return null;
+    const saved = object(JSON.parse(resource.baseline));
+    if (
+      resource.kind !== "preview-rules-message" ||
+      resource.id !== messageId ||
+      saved.scope !== runtime.scope ||
+      saved.guildId !== runtime.guildId ||
+      saved.channelId !== channelId ||
+      saved.messageId !== messageId ||
+      saved.authorId !== previewActorId ||
+      saved.webhookId !== null ||
+      typeof saved.content !== "string" ||
+      (saved.controlId !== null && typeof saved.controlId !== "string") ||
+      (saved.reactionEmoji !== null && typeof saved.reactionEmoji !== "string")
+    )
+      throw new RulesError("publication_unavailable");
+    return {
+      guildId: runtime.guildId,
+      channelId,
+      messageId,
+      authorId: previewActorId,
+      webhookId: null,
+      content: saved.content,
+      controlId: saved.controlId,
+      reactionEmoji: saved.reactionEmoji,
+    };
+  }
+  function putRuleMessage(runtime: Runtime, message: RulesMessage): void {
+    runtime.store.putResource(
+      `preview.rules-message.${message.messageId}`,
+      "preview-rules-message",
+      message.messageId,
+      { ...message, scope: runtime.scope, simulated: true },
+    );
+  }
+  function previewRules(runtime: Runtime): ServerRulesService {
+    const available = resources(runtime.guildId),
+      botRoleId = available.roles[0].id,
+      channelId = available.channels.find((channel) => channel.name === "regulamin")!.id;
+    return new ServerRulesService(runtime.jobs, {
+      guildId: runtime.guildId,
+      botId: previewActorId,
+      clock: now,
+      ports: {
+        administrator: async (userId) => ({
+          guildId: runtime.guildId,
+          userId,
+          observedAt: now(),
+          owner: userId === previewActorId,
+          manageGuild: userId === previewActorId,
+          pending: false,
+          timedOut: false,
+        }),
+        preflight: async () => ({
+          guildId: runtime.guildId,
+          observedAt: now(),
+          nativeScreening: false,
+          complete: true,
+          roles: [
+            {
+              guildId: runtime.guildId,
+              id: runtime.guildId,
+              permissions: P.ViewChannel | P.ReadMessageHistory,
+              position: 0,
+              managed: false,
+              restricted: false,
+            },
+            ...available.roles.map((role, index) => ({
+              guildId: runtime.guildId,
+              id: role.id,
+              permissions: index === 0 ? P.ManageRoles | P.SendMessages | P.AddReactions : 0n,
+              position: index === 0 ? 10 : index,
+              managed: index === 0,
+              restricted: false,
+            })),
+          ],
+          channels: available.channels.map<RulesChannel>((channel) => ({
+            guildId: runtime.guildId,
+            id: channel.id,
+            type: channel.kind === "text" ? "text" : "other",
+            overwrites:
+              channel.id === channelId
+                ? []
+                : [{ id: runtime.guildId, type: "role", allow: P.SendMessages, deny: 0n }],
+          })),
+          botRoleIds: [botRoleId],
+          interestRoleIds: available.roles.slice(1, 3).map((role) => role.id),
+          staffRoleIds: [],
+          staffUserIds: [],
+        }),
+        member: async () => null,
+        sendPart: async (input) => {
+          if (input.signal.aborted) throw new RulesError("stale_lease");
+          if (
+            input.guildId !== runtime.guildId ||
+            input.allowedMentions.parse.length ||
+            input.allowedMentions.roles.length ||
+            input.allowedMentions.users.length
+          )
+            throw new RulesError("permission_revoked");
+          const messageId = scopedId(runtime, "rules-message", input.nonce),
+            previous = ruleMessage(runtime, input.channelId, messageId);
+          if (
+            previous &&
+            (previous.content !== input.content || previous.controlId !== input.controlId)
+          )
+            throw new RulesError("unknown_effect");
+          if (!previous)
+            putRuleMessage(runtime, {
+              guildId: runtime.guildId,
+              channelId: input.channelId,
+              messageId,
+              authorId: previewActorId,
+              webhookId: null,
+              content: input.content,
+              controlId: input.controlId,
+              reactionEmoji: null,
+            });
+          return { guildId: runtime.guildId, channelId: input.channelId, messageId };
+        },
+        message: async (channel, message) => ruleMessage(runtime, channel, message),
+        seedReaction: async (input) => {
+          if (input.signal.aborted) throw new RulesError("stale_lease");
+          const message = ruleMessage(runtime, input.channelId, input.messageId);
+          if (input.guildId !== runtime.guildId || !message)
+            throw new RulesError("publication_unavailable");
+          putRuleMessage(runtime, { ...message, reactionEmoji: input.emoji });
+        },
+        addRole: async () => {
+          throw new RulesError("member_unavailable");
+        },
+        retireControls: async (input) => {
+          if (input.signal.aborted) throw new RulesError("stale_lease");
+          const message = ruleMessage(runtime, input.channelId, input.messageId);
+          if (input.guildId !== runtime.guildId || !message)
+            throw new RulesError("publication_unavailable");
+          putRuleMessage(runtime, { ...message, controlId: null, reactionEmoji: null });
+        },
+      },
+    });
   }
   function meetingBound(value: Meeting, participantIds: readonly string[] = []): BoundObject {
     return {
@@ -502,6 +672,7 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
       });
     }
     const runtime = { scope, guildId, store, jobs, settings } as Runtime;
+    runtime.rules = previewRules(runtime);
     runtime.assets = new AnnouncementAssetStore(
       store.db,
       guildId,
@@ -620,8 +791,9 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
           : settings.cases?.categoryId
             ? "enabled"
             : "needs_configuration",
+        rules: runtime.rules.settings().enabled ? "enabled" : "available",
       },
-      ["rooms", "reactions", "files", "reports", "announcements", "meetings", "cases"],
+      ["rooms", "reactions", "files", "reports", "announcements", "meetings", "cases", "rules"],
     );
   }
   function permissions(runtime: Runtime): string[] {
@@ -634,6 +806,11 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
       "jobs.read",
       "jobs.cancel",
       "deliveries.list",
+      "rules.read",
+      "rules.configure",
+      "rules.publish",
+      "rules.acceptances.list",
+      "rules.publications.reconcile",
       ...(settings.enabled.announcements
         ? [
             "announcements.list",
@@ -799,6 +976,86 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
     const payload = object(input);
     const service = runtime.announcements;
     switch (operation) {
+      case "rules.read": {
+        only(payload, []);
+        const overview = await runtime.rules.inspect(previewActorId);
+        return { ...overview, versions: overview.versions.slice(0, 5) };
+      }
+      case "rules.configure": {
+        only(payload, ["revision", "enabled", "draft"]);
+        if (
+          typeof payload.enabled !== "boolean" ||
+          (payload.draft !== null && !previewRulesDraft(payload.draft))
+        )
+          throw new RulesError("invalid_input");
+        return {
+          settings: await runtime.rules.configure(
+            previewActorId,
+            requestId!,
+            revision(payload.revision),
+            {
+              enabled: payload.enabled,
+              draft: payload.draft,
+            },
+          ),
+        };
+      }
+      case "rules.publish": {
+        only(payload, ["revision"]);
+        const version = await runtime.rules.publish(
+          previewActorId,
+          requestId!,
+          revision(payload.revision),
+        );
+        return {
+          version,
+          settings: runtime.rules.settings(),
+          parts: runtime.rules.parts(version.id),
+        };
+      }
+      case "rules.publications.reconcile": {
+        only(payload, []);
+        const version = await runtime.rules.reconcilePublication(previewActorId, objectId!);
+        return {
+          version,
+          settings: runtime.rules.settings(),
+          parts: runtime.rules.parts(version.id),
+        };
+      }
+      case "rules.acceptances.list": {
+        only(payload, ["limit", "before"]);
+        if (
+          payload.limit !== undefined &&
+          (typeof payload.limit !== "number" ||
+            !Number.isSafeInteger(payload.limit) ||
+            payload.limit < 1 ||
+            payload.limit > 100)
+        )
+          throw new RulesError("invalid_input");
+        let before: { acceptedAt: number; id: string } | undefined;
+        if (payload.before !== undefined) {
+          const value = object(payload.before);
+          only(value, ["acceptedAt", "id"]);
+          if (
+            typeof value.acceptedAt !== "number" ||
+            !Number.isSafeInteger(value.acceptedAt) ||
+            value.acceptedAt < 0 ||
+            typeof value.id !== "string"
+          )
+            throw new RulesError("invalid_input");
+          before = { acceptedAt: value.acceptedAt, id: value.id };
+        }
+        const limit = payload.limit ?? 50;
+        const acceptances = await runtime.rules.listAcceptances(previewActorId, { limit, before }),
+          last = acceptances.at(-1);
+        return {
+          acceptances,
+          nextCursor:
+            acceptances.length === limit && last
+              ? { acceptedAt: last.acceptedAt, id: last.id }
+              : null,
+        };
+      }
       case "capabilities.read":
         return {
           ...capabilities(runtime),
@@ -1215,14 +1472,22 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
         store: runtime.jobs,
         available: () =>
           !closed &&
-          ["announcements", "meetings", "cases"].some(
+          (["announcements", "meetings", "cases"].some(
             (key) => runtime.settings.read().enabled[key as "announcements" | "meetings" | "cases"],
-          ),
+          ) ||
+            runtime.rules.settings().enabled ||
+            runtime.jobs.list({
+              guildId: runtime.guildId,
+              type: "server-rules.retire-controls",
+              states: ["pending", "retry"],
+              limit: 1,
+            }).length > 0),
       })),
     async (job: JobLease, execution) => {
       const runtime = [...runtimes.values()].find((value) => value.jobs.get(job.id));
       if (!runtime) return { state: "failed", error: "preview_scope_missing" };
       try {
+        if (job.type.startsWith("server-rules.")) return runtime.rules.execute(job, execution);
         if (job.type.startsWith("meeting.")) {
           const prepared = await runtime.meetings.prepare(job),
             meeting = prepared.meeting;
@@ -1368,6 +1633,24 @@ export async function createPreviewWorker(options: PreviewWorkerOptions): Promis
     });
   }
   function mapped(error: unknown): unknown {
+    if (error instanceof RulesError)
+      return new ControlError(
+        error.code === "not_found"
+          ? 404
+          : error.code === "invalid_input"
+            ? 400
+            : [
+                  "native_pending",
+                  "permission_revoked",
+                  "member_unavailable",
+                  "membership_changed",
+                  "role_revoked",
+                ].includes(error.code)
+              ? 403
+              : 409,
+        error.code,
+        "Sprawdź ustawienia i aktualny stan regulaminu.",
+      );
     if (error instanceof AnnouncementAssetError)
       return new ControlError(
         error.code === "asset_not_found"

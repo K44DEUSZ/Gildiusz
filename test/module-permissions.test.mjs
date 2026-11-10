@@ -55,6 +55,37 @@ const suggestion = {
 };
 const music = { guildId: guild, ownerId: author, voiceChannelId: channel, state: "playing" };
 
+test("server rules configuration and acceptance history require a current guild administrator", () => {
+  const actions = [
+    "rules.read",
+    "rules.configure",
+    "rules.publish",
+    "rules.acceptances.list",
+    "rules.publications.reconcile",
+  ];
+  for (const action of actions) {
+    assert.equal(canPerform(action, facts(visitor), policy), false);
+    assert.equal(
+      canPerform(
+        action,
+        facts(moderator, { roleIds: [staffRole, announcementRole, organizerRole, djRole] }),
+        policy,
+      ),
+      false,
+    );
+    assert.equal(canPerform(action, facts(author, { owner: true }), policy), true);
+    assert.equal(canPerform(action, facts(author, { manageGuild: true }), policy), true);
+    for (const patch of [
+      { pending: true },
+      { timedOut: true },
+      { isBot: true },
+      { guildId: otherGuild },
+    ])
+      assert.equal(canPerform(action, facts(author, { owner: true, ...patch }), policy), false);
+  }
+  assert.equal(canPerform("rules.accept", facts(author, { owner: true }), policy), false);
+});
+
 test("unknown operations, malformed facts and missing bound objects fail closed", () => {
   for (const action of [
     "music.actions",

@@ -200,6 +200,12 @@ function inspectGuild(db: DatabaseSync, guildId: string): void {
     "case_events",
     "case_actions",
     "domain_retired",
+    "server_rules_settings",
+    "server_rules_versions",
+    "server_rules_parts",
+    "server_rules_memberships",
+    "server_rules_acceptances",
+    "server_rules_retired_acceptances",
   ])
     if (
       db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) &&

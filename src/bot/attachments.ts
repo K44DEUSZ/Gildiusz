@@ -1,5 +1,6 @@
 import type { Message, PartialMessage } from "discord.js";
 import { extension, fetchHeader, matchesHeader } from "./attachment-policy.js";
+import { attachmentProbeBytes } from "./attachment-formats.js";
 import type { BotContext } from "./context.js";
 import { errorCode, Pool, SerialQueue } from "../shared/utils.js";
 
@@ -51,12 +52,18 @@ export class AttachmentFilter {
         if (!message.attachments.size) return;
         let failure: "attachmentDenied" | "attachmentFailed" | null = null;
         for (const attachment of message.attachments.values()) {
-          if (!extension(attachment.name, settings.extensions)) {
+          const ext = extension(attachment.name, settings.extensions);
+          if (!ext) {
             failure = "attachmentDenied";
             break;
           }
           try {
-            const header = await this.pool.run(() => fetchHeader(attachment.url, settings));
+            const header = await this.pool.run(() =>
+              fetchHeader(attachment.url, {
+                ...settings,
+                maxBytes: attachmentProbeBytes(ext, settings.maxBytes),
+              }),
+            );
             if (!matchesHeader(attachment.name, header, settings.extensions)) {
               failure = "attachmentDenied";
               break;

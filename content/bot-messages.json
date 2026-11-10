@@ -1,5 +1,5 @@
 {
-  "attachmentDenied": "Usunąłem wiadomość z niedozwolonym załącznikiem. Aktualne dozwolone formaty sprawdzisz komendą /pomoc. Jeśli wiadomość zawierała też opis albo poprawne pliki, wyślij je jeszcze raz bez tego załącznika.",
+  "attachmentDenied": "Usunąłem wiadomość z załącznikiem, którego format jest niedozwolony lub nie udało się go potwierdzić. Dozwolone formaty sprawdzisz komendą /pomoc. Jeśli plik ma właściwy format, zapisz go ponownie. Opis i pozostałe pliki możesz wysłać jeszcze raz bez tego załącznika.",
   "attachmentFailed": "Nie udało mi się sprawdzić załącznika, więc usunąłem wiadomość. Spróbuj ponownie za chwilę. Jeśli problem wraca, zgłoś go moderatorowi.",
   "roomClosed": "Pokój jest zamknięty dla nowych osób. Obecni uczestnicy zachowują dostęp. Moderatorzy nadal mogą wejść.",
   "roomDenied": "Tym pokojem zarządza jego właściciel. W razie problemu zgłoś się do moderatora.",

@@ -197,6 +197,17 @@ export function quarantineDatabase(db: DatabaseSync, kind: "guild" | "hub", now:
           ).run(JSON.stringify(body), body.revision, now, String(row.guild_id));
         }
       }
+      // Rules have independent settings; restoring the other module switches cannot disable them.
+      if (has("server_rules_settings"))
+        db.exec(
+          "UPDATE server_rules_settings SET enabled=0,active_version_id=NULL,revision=revision+1,generation=generation+1",
+        );
+      if (has("server_rules_versions"))
+        db.exec("UPDATE server_rules_versions SET state='retired' WHERE state<>'retired'");
+      if (has("server_rules_acceptances"))
+        db.exec(
+          "UPDATE server_rules_acceptances SET grant_state='blocked',reason='restore_quarantine' WHERE grant_state IN ('pending','sending','unknown')",
+        );
       if (has("meetings"))
         db.prepare(
           "UPDATE meetings SET state='cancelled',revision=revision+1,generation=generation+1,updated_at=? WHERE state IN ('draft','open','starting','active')",

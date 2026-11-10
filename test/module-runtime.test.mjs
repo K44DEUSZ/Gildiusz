@@ -16,6 +16,7 @@ import {
 } from "../dist/bot/module-permissions.js";
 import { ControlError } from "../dist/control/contracts.js";
 import { pruneDomainData } from "../dist/storage/domain-retention.js";
+import { fileFormats, reactionEmojiMaxLength } from "../dist/contracts/index.js";
 
 const guildId = "100000000000000001",
   otherGuildId = "100000000000000002",
@@ -422,6 +423,10 @@ test("fresh member facts refresh ownership and role definitions before deriving 
 test("capabilities expose visible resources and implemented permissions, keeping settings admin-only", async (t) => {
   const f = fixture(t);
   const view = await f.runtime.request(f.facts(), "capabilities.read", {});
+  assert.deepEqual(view.resources.configurationCapabilities, {
+    fileFormats: [...fileFormats],
+    reactionEmojiMaxLength,
+  });
   assert.deepEqual(
     view.resources.channels.map((value) => value.id),
     [channelId],
