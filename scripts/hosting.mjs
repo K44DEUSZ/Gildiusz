@@ -2,6 +2,7 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -25,6 +26,8 @@ import {
 } from "./runtime-package.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
+import { parseEnv } from "node:util";
+import { privateDirectory, regularFile } from "../dist/storage/recovery/files.js";
 
 export const repository = "https://github.com/K44DEUSZ/Gildiusz.git";
 export function expectedRepository(remote) {
@@ -433,6 +436,35 @@ export function deploymentState(root, release) {
   );
 }
 
+export function backupEnvironmentArguments(root) {
+  const args = ["--env-file=" + join(root, "shared", ".env")],
+    file = join(root, "shared", "backup-key.env");
+  let stat;
+  try {
+    stat = lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return args;
+    throw Error("Cannot inspect the private backup environment.", { cause: error });
+  }
+  privateDirectory(join(root, "shared"));
+  regularFile(file);
+  if (
+    stat.size < 1 ||
+    stat.size > 4096 ||
+    (process.platform !== "win32" &&
+      ((stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())))
+  )
+    throw Error("Use an owned private backup environment with mode0600.");
+  const values = parseEnv(readFileSync(file, "utf8"));
+  if (
+    Object.keys(values).join(",") !== "BACKUP_ENCRYPTION_KEY" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(values.BACKUP_ENCRYPTION_KEY)
+  )
+    throw Error("The backup environment may contain only its independent encryption key.");
+  // Only recovery subprocesses read this file; it is not loaded into the worker environment.
+  return [...args, "--env-file=" + file];
+}
+
 function recovery(
   root,
   release,
@@ -447,7 +479,7 @@ function recovery(
       execFileSync(
         process.execPath,
         [
-          "--env-file=" + join(root, "shared", ".env"),
+          ...backupEnvironmentArguments(root),
           join(release, "scripts", "recovery.mjs"),
           command,
           "--output",
@@ -498,7 +530,7 @@ function backupCheckpoint(root, release, command, args, input) {
       execFileSync(
         process.execPath,
         [
-          "--env-file=" + join(root, "shared", ".env"),
+          ...backupEnvironmentArguments(root),
           join(release, "scripts", "backup-scheduler.mjs"),
           command,
           join(root, "shared", "backups"),
