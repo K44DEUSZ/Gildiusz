@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   ChannelType,
@@ -121,10 +122,29 @@ function fixture(t, { enabled = true, beta = true, assets } = {}) {
   const runtime = new ModuleRuntime(
     {
       guild,
+      environment: { clientId: botId },
       store: { db, event() {} },
       control: { modules: { rooms: true, reactions: true, files: true, reports: true } },
     },
     {
+      async get(route) {
+        if (state.readError) throw state.readError;
+        state.readTimestamp ??= new Date().toISOString();
+        await state.onRead?.();
+        return {
+          id: route.split("/").at(-1),
+          channel_id: channelId,
+          author: { id: botId },
+          type: 0,
+          timestamp: state.readTimestamp,
+          edited_timestamp: null,
+          content: "Ogłoszenie",
+          embeds: [],
+          attachments: [],
+          components: [],
+          ...state.readMessage,
+        };
+      },
       async post(route, options) {
         sent.push({ route, options });
         if (state.sendError) throw state.sendError;
@@ -602,4 +622,141 @@ test("network membership failure stays private and never turns into a successful
   assert.match(command.last(), /Nie udało się wykonać/);
   assert.doesNotMatch(command.last(), /sensitive internal endpoint/);
   assert.equal(f.runtime.jobs.list().length, 0);
+});
+
+async function unknownHistory(t) {
+  const f = fixture(t);
+  await f.run("utworz", { tresc: "Ogłoszenie" });
+  const actor = f.calls[0][0],
+    [lease] = f.runtime.jobs.claim();
+  f.runtime.jobs.beginAttempt(lease.id, lease.leaseToken, { channelId });
+  f.runtime.jobs.unknown(lease.id, lease.leaseToken, "lost_ack");
+  f.runtime.settings.save(
+    {
+      ...f.runtime.settings.read(),
+      enabled: { ...f.runtime.settings.read().enabled, announcements: false },
+    },
+    actorId,
+  );
+  f.state.memberFlags = P.ViewChannel | P.ReadMessageHistory;
+  f.state.botFlags = P.ViewChannel | P.ReadMessageHistory;
+  const detail = await f.runtime.request(actor, "announcements.read", {}, lease.objectId);
+  const input = {
+    jobId: lease.id,
+    jobRevision: detail.jobs[0].revision,
+    announcementRevision: detail.announcement.revision,
+    attemptIds: detail.deliveries.map((entry) => entry.id),
+    attemptsFingerprint: detail.jobs[0].attemptsFingerprint,
+    decisions: [
+      {
+        attemptId: detail.deliveries[0].id,
+        decision: "human_confirmed_message",
+        messageUrl: `https://discord.com/channels/${guildId}/${channelId}/${messageId}`,
+      },
+    ],
+  };
+  return { ...f, actor, lease, detail, input };
+}
+
+test("delegated manager can inspect and resolve old history with announcements OFF and no SendMessages permission", async (t) => {
+  const f = await unknownHistory(t);
+  assert.match(f.input.attemptsFingerprint, /^[a-f0-9]{64}$/);
+  const inspected = await f.runtime.request(
+    f.actor,
+    "announcements.delivery.inspect",
+    f.input,
+    f.lease.objectId,
+  );
+  assert.equal(inspected.messages[0].messageId, messageId);
+  await f.runtime.request(
+    f.actor,
+    "announcements.delivery.resolve",
+    { ...inspected.decision, confirmed: true },
+    f.lease.objectId,
+    randomUUID(),
+  );
+  const result = await f.runtime.request(f.actor, "announcements.read", {}, f.lease.objectId);
+  assert.equal(result.jobs[0].state, "unknown");
+  assert.equal(result.jobs[0].manualResolution.decisions[0].decision, "human_confirmed_message");
+  assert.equal(result.announcement.publishedCount, 1);
+  assert.equal(result.announcement.status, "paused");
+  assert.equal(f.runtime.settings.read().enabled.announcements, false);
+  assert.equal(f.sent.length, 0);
+  f.runtime.jobs.db
+    .prepare("UPDATE announcements SET channel_id=? WHERE id=?")
+    .run("400000000000000099", f.lease.objectId);
+  const status = await f.run("stan", { id: f.lease.objectId });
+  assert.match(status.last(), /Próby z ręcznie wskazaną wiadomością: 1/);
+  assert.match(status.last(), /Stan techniczny wysyłki pozostaje niepewny/);
+  assert.doesNotMatch(status.last(), /Nie udało się potwierdzić ostatniej wysyłki/);
+  assert.ok(
+    status.last().includes(`https://discord.com/channels/${guildId}/${channelId}/${messageId}`),
+  );
+  assert.doesNotMatch(status.last(), /400000000000000099/);
+});
+
+test("Discord status distinguishes an unconfirmed closure and later conflicting genuine receipt", async (t) => {
+  for (const decision of ["closed_unconfirmed", "human_confirmed_message"]) {
+    await t.test(decision, async (t) => {
+      const f = await unknownHistory(t);
+      const inspected = await f.runtime.request(
+        f.actor,
+        "announcements.delivery.inspect",
+        {
+          ...f.input,
+          decisions: f.input.decisions.map((entry) => ({
+            attemptId: entry.attemptId,
+            decision,
+            ...(decision === "human_confirmed_message" ? { messageUrl: entry.messageUrl } : {}),
+          })),
+        },
+        f.lease.objectId,
+      );
+      await f.runtime.request(
+        f.actor,
+        "announcements.delivery.resolve",
+        { ...inspected.decision, confirmed: true },
+        f.lease.objectId,
+        randomUUID(),
+      );
+      if (decision === "human_confirmed_message")
+        f.runtime.jobs.recordReceipt(f.lease.id, f.lease.leaseToken, {
+          messageId: "500000000000000002",
+        });
+      const status = await f.run("stan", { id: f.lease.objectId });
+      assert.doesNotMatch(status.last(), /Nie udało się potwierdzić ostatniej wysyłki/);
+      assert.match(status.last(), /Stan techniczny wysyłki pozostaje niepewny/);
+      if (decision === "closed_unconfirmed") {
+        assert.match(status.last(), /Zamknięte bez potwierdzenia: 1/);
+        assert.match(status.last(), /Potwierdzone publikacje: 0/);
+      } else {
+        assert.match(status.last(), /Historia zawiera różne identyfikatory wiadomości/);
+        assert.match(status.last(), /Potwierdzone publikacje: 1/);
+      }
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.runtime.settings.read().enabled.announcements, false);
+    });
+  }
+});
+
+test("the real adapter rechecks fresh role and original channel access after fetching a message", async (t) => {
+  const f = await unknownHistory(t),
+    before = f.runtime.jobs.get(f.lease.id);
+  f.state.onRead = async () => {
+    f.state.roleIds = [];
+  };
+  await assert.rejects(
+    f.runtime.request(f.actor, "announcements.delivery.inspect", f.input, f.lease.objectId),
+    (error) => error.status === 403,
+  );
+  assert.deepEqual(f.runtime.jobs.get(f.lease.id), before);
+  f.state.onRead = undefined;
+  f.state.roleIds = [managerId];
+  f.state.memberFlags = P.ViewChannel;
+  await assert.rejects(
+    f.runtime.request(f.actor, "announcements.delivery.inspect", f.input, f.lease.objectId),
+    (error) => error.code === "channel_unavailable",
+  );
+  assert.deepEqual(f.runtime.jobs.get(f.lease.id), before);
+  assert.equal(f.sent.length, 0);
 });

@@ -83,6 +83,8 @@ export const moduleActions = [
   "announcements.resume",
   "announcements.cancel",
   "announcements.remove",
+  "announcements.delivery.inspect",
+  "announcements.delivery.resolve",
 ] as const;
 export type ModuleAction = (typeof moduleActions)[number];
 export type PermissionCode =
@@ -143,6 +145,8 @@ const ownedActions = new Set<string>([
   "announcements.resume",
   "announcements.cancel",
   "announcements.remove",
+  "announcements.delivery.inspect",
+  "announcements.delivery.resolve",
 ]);
 
 // Adapters supply current facts refreshed from Discord, never roles or flags from request bodies.

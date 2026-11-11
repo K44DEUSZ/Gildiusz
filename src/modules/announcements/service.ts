@@ -379,14 +379,18 @@ export class AnnouncementService {
     return outcome;
   }
 
-  async get(actorId: string, announcementId: string): Promise<Announcement> {
+  async get(
+    actorId: string,
+    announcementId: string,
+    options: { sync?: boolean } = {},
+  ): Promise<Announcement> {
     await this.authorize(actorId, "read");
-    this.sync();
+    if (options.sync !== false) this.sync();
     return this.read(announcementId);
   }
-  async list(actorId: string): Promise<Announcement[]> {
+  async list(actorId: string, options: { sync?: boolean } = {}): Promise<Announcement[]> {
     await this.authorize(actorId, "list");
-    this.sync();
+    if (options.sync !== false) this.sync();
     return this.jobs.db
       .prepare(
         "SELECT id FROM announcements WHERE guild_id=? AND removed_at IS NULL ORDER BY created_at DESC,id LIMIT 500",

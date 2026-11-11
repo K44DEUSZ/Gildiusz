@@ -1395,7 +1395,7 @@ async function main(): Promise<void> {
       }
       track(
         filter
-          .handle(message)
+          .handle(message, "create")
           .catch((error) => context?.alert("attachments", message.id, errorCode(error))),
         message.guildId,
       );

@@ -461,7 +461,7 @@ test("capabilities expose visible resources and implemented permissions, keeping
   );
 });
 
-test("beta and module switches hide announcement permissions and stop schedule synchronization", async (t) => {
+test("beta hides announcement support while module OFF keeps history resolution without scheduling or publishing", async (t) => {
   for (const options of [{ beta: false }, { enabled: false }]) {
     const f = fixture(t, options);
     let calls = 0;
@@ -469,7 +469,21 @@ test("beta and module switches hide announcement permissions and stop schedule s
     f.runtime.sync();
     assert.equal(calls, 0);
     const view = await f.runtime.capabilitiesView(actorId);
-    assert.ok(!view.permissions.some((value) => value.startsWith("announcements.")));
+    if (options.beta === false) {
+      assert.ok(!view.permissions.some((value) => value.startsWith("announcements.")));
+      assert.equal(view.announcementReconciliation, undefined);
+    } else {
+      assert.deepEqual(
+        view.permissions.filter((value) => value.startsWith("announcements.")).sort(),
+        [
+          "announcements.list",
+          "announcements.read",
+          "announcements.delivery.inspect",
+          "announcements.delivery.resolve",
+        ].sort(),
+      );
+      assert.deepEqual(view.announcementReconciliation, { version: 1 });
+    }
     await assert.rejects(() => f.create("beta-disabled"), isControl(403, "permission_revoked"));
   }
   const enabled = fixture(t);

@@ -1,4 +1,5 @@
 import { JobStore } from "../core/jobs/store.js";
+import { readManualDeliveryResolution } from "../core/jobs/manual-delivery.js";
 
 const day = 86400000;
 export const domainRetentionPolicy = Object.freeze({
@@ -155,6 +156,45 @@ export function pruneDomainData(
       db.prepare(
         "UPDATE delivery_attempts SET nonce=NULL,error=NULL,result=NULL WHERE job_id=?",
       ).run(jobId);
+      result.jobsRetired++;
+    }
+    // A human-closed delivery stays UNKNOWN as a minimal fence after its private history expires.
+    for (const row of db
+      .prepare(
+        `SELECT j.id FROM jobs j WHERE j.guild_id=? AND j.type='announcement.send'
+      AND j.state='unknown' AND j.cancel_requested=1 AND j.updated_at<=?
+      AND json_extract(j.result,'$.manualDeliveryResolution.format')=1
+      AND NOT EXISTS(SELECT 1 FROM job_history_retired h WHERE h.job_id=j.id)
+      AND NOT EXISTS(SELECT 1 FROM schedules s WHERE s.active_job_id=j.id)
+      AND NOT EXISTS(SELECT 1 FROM delivery_attempts a WHERE a.job_id=j.id AND a.state='sending')
+      ORDER BY j.updated_at,j.id LIMIT ?`,
+      )
+      .all(guildId, now - domainRetentionPolicy.terminalJobHistoryMs, limit)) {
+      const jobId = String(row.id),
+        job = jobs.get(jobId)!,
+        manual = readManualDeliveryResolution(job.result);
+      if (
+        !manual ||
+        manual.decidedAt > now - domainRetentionPolicy.terminalJobHistoryMs ||
+        jobs
+          .attempts(jobId)
+          .some(
+            (entry) =>
+              entry.state === "unknown" &&
+              readManualDeliveryResolution(entry.result)?.decidedAt !== manual.decidedAt,
+          )
+      )
+        continue;
+      db.prepare("INSERT INTO job_history_retired VALUES (?,?)").run(jobId, now);
+      db.prepare(
+        "UPDATE jobs SET payload=json_object('announcementId',object_id,'test',json_extract(payload,'$.test')),result=NULL,last_error=NULL WHERE id=?",
+      ).run(jobId);
+      db.prepare(
+        "UPDATE delivery_attempts SET nonce=NULL,error=NULL,result=NULL WHERE job_id=?",
+      ).run(jobId);
+      db.prepare(
+        "UPDATE idempotency_keys SET result=json_object('retiredJobId',?) WHERE scope=? AND json_extract(result,'$.jobId')=?",
+      ).run(jobId, `announcement:delivery:${guildId}`, jobId);
       result.jobsRetired++;
     }
     return result;

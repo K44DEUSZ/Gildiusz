@@ -1,6 +1,6 @@
 import { ControlError } from "./configuration.js";
 
-export const contractsVersion = "0.9.0";
+export const contractsVersion = "0.10.0";
 export const schemaVersion = 1 as const;
 export const controlMethod = "POST" as const;
 export const controlHeaderNames = [
@@ -199,6 +199,16 @@ export const controlOperations = {
   "announcements.remove": {
     method: "POST",
     path: "/v1/guilds/{guildId}/announcements/{objectId}/remove",
+    mutation: true,
+  },
+  "announcements.delivery.inspect": {
+    method: "POST",
+    path: "/v1/guilds/{guildId}/announcements/{objectId}/delivery/inspect",
+    mutation: false,
+  },
+  "announcements.delivery.resolve": {
+    method: "POST",
+    path: "/v1/guilds/{guildId}/announcements/{objectId}/delivery/resolve",
     mutation: true,
   },
   "integrations.list": {

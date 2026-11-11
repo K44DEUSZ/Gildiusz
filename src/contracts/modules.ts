@@ -129,6 +129,7 @@ export interface ScheduledOccurrence {
 
 export interface RuntimeCapabilities extends Capabilities {
   announcementEditor?: { cards: boolean; links: boolean; drafts: boolean };
+  announcementReconciliation?: { version: 1 };
   announcementAssets?: {
     available: boolean;
     maxBytes: number;
@@ -145,4 +146,31 @@ export interface AnnouncementDetail {
   announcement: Announcement;
   jobs: PublicJob[];
   deliveries: PublicDelivery[];
+}
+
+export interface AnnouncementDeliveryDecision {
+  jobId: string;
+  jobRevision: number;
+  announcementRevision: number;
+  attemptIds: string[];
+  attemptsFingerprint: string;
+  decisions: {
+    attemptId: string;
+    decision: "human_confirmed_message" | "closed_unconfirmed";
+    messageUrl?: string;
+    messageFingerprint?: string;
+  }[];
+}
+export interface AnnouncementDeliveryInspection {
+  format: 1;
+  decision: AnnouncementDeliveryDecision;
+  messages: {
+    attemptId: string;
+    channelId: string;
+    messageId: string;
+    url: string;
+    content: string;
+    createdAt: number;
+  }[];
+  hasMultipleAttempts: boolean;
 }

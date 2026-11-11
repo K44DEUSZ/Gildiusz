@@ -14,7 +14,13 @@ import {
   type JobResult,
   type JobState,
   type Reconciliation,
+  type ManualDeliveryResolution,
 } from "./types.js";
+import {
+  deliveryAttemptsFingerprint,
+  mergeManualDeliveryResult,
+  readManualDeliveryResolution,
+} from "./manual-delivery.js";
 
 export { JobError } from "./types.js";
 export type * from "./types.js";
@@ -393,6 +399,7 @@ export class JobStore {
         if (previous.message_id !== messageId) throw new JobError("state_conflict");
         return attempt(previous);
       }
+      const previousResult = previous.result === null ? null : JSON.parse(String(previous.result));
       // A receipt records a fact about the old send; it never takes over a newer job lease.
       this.db
         .prepare(
@@ -400,7 +407,11 @@ export class JobStore {
         )
         .run(
           messageId,
-          this.isHistoryRetired(id) || this.isDomainRetired(id) ? null : result,
+          this.isHistoryRetired(id) || this.isDomainRetired(id)
+            ? null
+            : readManualDeliveryResolution(previousResult)
+              ? json(mergeManualDeliveryResult(previousResult, output.result ?? null))
+              : result,
           this.now(),
           String(previous.id),
         );
@@ -619,6 +630,64 @@ export class JobStore {
       .map(attempt);
   }
 
+  /** Records a human decision without asserting an ACK or authorizing another send. */
+  recordManualDeliveryResolution(
+    id: string,
+    expectedRevision: number,
+    expectedAttemptsFingerprint: string,
+    resolution: ManualDeliveryResolution,
+  ): Job {
+    if (!readManualDeliveryResolution({ manualDeliveryResolution: resolution }))
+      throw new JobError("invalid_input");
+    return this.transaction(() => {
+      const current = this.require(id),
+        attempts = this.attempts(id);
+      if (
+        current.revision !== integer(expectedRevision, 1) ||
+        deliveryAttemptsFingerprint(attempts) !== expectedAttemptsFingerprint
+      )
+        throw new JobError("revision_conflict");
+      if (
+        current.state !== "unknown" ||
+        current.type !== "announcement.send" ||
+        this.isHistoryRetired(id) ||
+        this.isDomainRetired(id) ||
+        readManualDeliveryResolution(current.result) ||
+        attempts.map((entry) => entry.id).join(",") !== resolution.attemptIds.join(",")
+      )
+        throw new JobError("state_conflict");
+      const ambiguous = attempts.filter((entry) => ["sending", "unknown"].includes(entry.state));
+      if (
+        resolution.decisions.length !== ambiguous.length ||
+        ambiguous.some((entry) => !resolution.decisions.some((item) => item.attemptId === entry.id))
+      )
+        throw new JobError("state_conflict");
+      for (const item of resolution.decisions) {
+        const entry = attempts.find((attempt) => attempt.id === item.attemptId)!;
+        if (
+          item.linkedMessage &&
+          (entry.channelId !== item.linkedMessage.channelId ||
+            (entry.messageId && entry.messageId !== item.linkedMessage.messageId))
+        )
+          throw new JobError("state_conflict");
+      }
+      for (const entry of attempts.filter((entry) => ["sending", "unknown"].includes(entry.state)))
+        this.db
+          .prepare("UPDATE delivery_attempts SET result=? WHERE id=?")
+          .run(json({ manualDeliveryResolution: resolution, priorResult: entry.result }), entry.id);
+      this.db
+        .prepare(
+          "UPDATE jobs SET cancel_requested=1,result=?,revision=revision+1,updated_at=? WHERE id=?",
+        )
+        .run(
+          json({ manualDeliveryResolution: resolution, priorResult: current.result }),
+          this.now(),
+          id,
+        );
+      return this.require(id);
+    });
+  }
+
   reconcile(id: string, expectedRevision: number, resolution: Reconciliation): Job {
     integer(expectedRevision, 1);
     return this.transaction(() => {
@@ -687,5 +756,14 @@ export class JobStore {
         .run(scope, requestId, hash, encoded, this.now());
       return JSON.parse(encoded) as T;
     });
+  }
+
+  readIdempotent<T>(scope: string, requestId: string, input: unknown): T | undefined {
+    const previous = this.db
+      .prepare("SELECT input_hash,result FROM idempotency_keys WHERE scope=? AND request_id=?")
+      .get(text(scope), text(requestId));
+    if (!previous) return;
+    if (previous.input_hash !== digest(json(input))) throw new JobError("idempotency_conflict");
+    return JSON.parse(String(previous.result)) as T;
   }
 }

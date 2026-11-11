@@ -104,6 +104,63 @@ function contextFor(messages) {
   return { filter, calls, messages };
 }
 
+test("complete attachment-free creates do not spend a Discord REST request", async () => {
+  let fetched = 0;
+  const { filter, calls } = contextFor([]);
+  await filter.handle(
+    {
+      guildId: "guild",
+      id: "plain-text",
+      channelId: "forum",
+      channel: { isThread: () => false },
+      partial: false,
+      attachments: new Map(),
+      fetch: async () => {
+        fetched++;
+        throw Error("No REST refresh needed for this complete create.");
+      },
+    },
+    "create",
+  );
+  await filter.drain();
+  assert.equal(fetched, 0);
+  assert.deepEqual(calls.alerts, []);
+  assert.deepEqual(calls.notices, []);
+});
+
+test("edits, partial creates and uploads still refresh and reject forbidden attachments", async () => {
+  for (const [source, partial, incomingAttachments] of [
+    ["update", false, new Map()],
+    ["create", true, new Map()],
+    ["create", false, new Map([["file", { name: "new-file.zip" }]])],
+  ]) {
+    let fetched = 0,
+      deleted = 0;
+    const { filter, calls } = contextFor([]),
+      incoming = {
+        guildId: "guild",
+        id: "changed-file",
+        channelId: "forum",
+        channel: { isThread: () => false },
+        partial,
+        attachments: incomingAttachments,
+        author: { id: "author" },
+        inGuild: () => true,
+        delete: async () => {
+          deleted++;
+        },
+        fetch: async () => {
+          fetched++;
+          return { ...incoming, attachments: new Map([["file", { name: "new-file.zip" }]]) };
+        },
+      };
+    await filter.handle(incoming, source);
+    assert.equal(fetched, 1);
+    assert.equal(deleted, 1);
+    assert.equal(calls.notices[0][2], "attachmentDenied");
+  }
+});
+
 test("uncached partial forum edits are fetched, mixed attachments delete the whole message, and webhooks are checked", async () => {
   let fetched = 0,
     deleted = 0;

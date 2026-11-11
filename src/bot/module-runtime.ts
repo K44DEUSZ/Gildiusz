@@ -27,6 +27,12 @@ import {
   type MemberFacts,
 } from "../core/permissions.js";
 import { AnnouncementService } from "../modules/announcements/service.js";
+import { AnnouncementDeliveryResolution } from "../modules/announcements/delivery-resolution.js";
+import { announcementDeliveryAccess } from "./announcement-delivery.js";
+import {
+  publicManualDeliveryResolution,
+  deliveryAttemptsFingerprint,
+} from "../core/jobs/manual-delivery.js";
 import {
   AnnouncementError,
   type AnnouncementAuthorization,
@@ -61,8 +67,11 @@ function revision(value: unknown): number {
     throw new ControlError(400, "revision", "Wczytaj aktualną wersję wpisu.");
   return value as number;
 }
-function jobView(job: Job): PublicJob {
+function jobView(job: Job, attempts: readonly DeliveryAttempt[] = []): PublicJob {
+  const manualResolution = publicManualDeliveryResolution(job.result, attempts);
   return {
+    ...(attempts.length ? { attemptsFingerprint: deliveryAttemptsFingerprint(attempts) } : {}),
+    ...(manualResolution ? { manualResolution } : {}),
     id: job.id,
     guildId: job.guildId,
     type: job.type,
@@ -106,6 +115,7 @@ export class ModuleRuntime {
   readonly jobs: JobStore;
   readonly settings: ModuleSettingsStore;
   readonly announcements: AnnouncementService;
+  readonly announcementDeliveries: AnnouncementDeliveryResolution;
   readonly community: CommunityRuntime;
   readonly rules: ServerRulesRuntime;
   private readonly transport: DeliveryTransport;
@@ -136,6 +146,13 @@ export class ModuleRuntime {
         return announcementAssets.validateAsset(id);
       },
       onSaved: (announcement) => announcementAssets?.syncAnnouncement(announcement),
+    });
+    this.announcementDeliveries = new AnnouncementDeliveryResolution(this.jobs, {
+      guildId: context.guild.id,
+      botId: context.environment?.clientId ?? context.client?.user?.id ?? "",
+      ...announcementDeliveryAccess(context, this.settings, publicationRest),
+      audit: (jobId, resolution) =>
+        context.store.event("announcement-delivery-resolution", jobId, JSON.stringify(resolution)),
     });
     this.transport = {
       check: async (publication) => {
@@ -271,10 +288,15 @@ export class ModuleRuntime {
         "jobs.cancel",
         "deliveries.list",
       ];
-      if (this.beta && this.settings.read().enabled.announcements)
+      if (this.beta)
         available.push(
           "announcements.list",
           "announcements.read",
+          "announcements.delivery.inspect",
+          "announcements.delivery.resolve",
+        );
+      if (this.beta && this.settings.read().enabled.announcements)
+        available.push(
           "announcements.create",
           "announcements.update",
           "announcements.preview",
@@ -307,6 +329,7 @@ export class ModuleRuntime {
       return {
         ...this.capabilities(),
         ...(this.beta ? { announcementEditor: { cards: true, links: true, drafts: true } } : {}),
+        ...(this.beta ? { announcementReconciliation: { version: 1 as const } } : {}),
         resources,
         announcementAssets: {
           available: Boolean(
@@ -329,6 +352,7 @@ export class ModuleRuntime {
   }
 
   sync(): void {
+    if (this.beta) this.announcementDeliveries.syncReceipts();
     if (this.beta && this.settings.read().enabled.announcements) this.announcements.sync();
   }
 
@@ -501,7 +525,11 @@ export class ModuleRuntime {
           throw new ControlError(404, "not_found", "Nie znaleziono zadania.");
         requirePermission(operation, actor, policy, job ? { guildId: job.guildId } : undefined);
         if (operation === "jobs.list")
-          return { jobs: this.jobs.list({ guildId: actor.guildId, limit: 100 }).map(jobView) };
+          return {
+            jobs: this.jobs
+              .list({ guildId: actor.guildId, limit: 100 })
+              .map((job) => jobView(job, this.jobs.attempts(job.id))),
+          };
         if (operation === "deliveries.list")
           return {
             deliveries: this.jobs
@@ -509,7 +537,10 @@ export class ModuleRuntime {
               .flatMap((value) => this.jobs.attempts(value.id).map(deliveryView)),
           };
         if (operation === "jobs.read")
-          return { job: jobView(job!), attempts: this.jobs.attempts(job!.id).map(deliveryView) };
+          return {
+            job: jobView(job!, this.jobs.attempts(job!.id)),
+            attempts: this.jobs.attempts(job!.id).map(deliveryView),
+          };
         if (operation === "jobs.cancel" && requestId)
           return this.jobs.idempotent(
             `${actor.guildId}:job-cancel`,
@@ -537,12 +568,36 @@ export class ModuleRuntime {
           "module_unavailable",
           "Ta funkcja jest jeszcze w przygotowaniu.",
         );
-      this.requireAnnouncements();
+      const historical = [
+        "announcements.list",
+        "announcements.read",
+        "announcements.delivery.inspect",
+        "announcements.delivery.resolve",
+      ].includes(operation);
+      if (!this.beta) throw new AnnouncementError("permission_revoked");
+      if (!historical) this.requireAnnouncements();
       switch (operation) {
+        case "announcements.delivery.inspect":
+          return await this.announcementDeliveries.preview(actor.userId, objectId!, payload);
+        case "announcements.delivery.resolve":
+          return await this.announcementDeliveries.resolve(
+            actor.userId,
+            requestId!,
+            objectId!,
+            payload,
+          );
         case "announcements.list":
-          return { announcements: await this.announcements.list(actor.userId) };
+          this.announcementDeliveries.syncReceipts();
+          return {
+            announcements: await this.announcements.list(actor.userId, {
+              sync: this.settings.read().enabled.announcements,
+            }),
+          };
         case "announcements.read": {
-          const announcement = await this.announcements.get(actor.userId, objectId!);
+          this.announcementDeliveries.syncReceipts();
+          const announcement = await this.announcements.get(actor.userId, objectId!, {
+            sync: this.settings.read().enabled.announcements,
+          });
           const jobs = this.jobs.list({
             guildId: actor.guildId,
             type: "announcement.send",
@@ -551,7 +606,7 @@ export class ModuleRuntime {
           });
           return {
             announcement,
-            jobs: jobs.map(jobView),
+            jobs: jobs.map((job) => jobView(job, this.jobs.attempts(job.id))),
             deliveries: jobs.flatMap((job) => this.jobs.attempts(job.id).map(deliveryView)),
           };
         }
@@ -737,7 +792,8 @@ export class ModuleRuntime {
   }
 
   private async authorizeAnnouncement(request: AnnouncementAuthorization): Promise<void> {
-    this.requireAnnouncements();
+    if (!this.beta) throw new AnnouncementError("permission_revoked");
+    if (!["read", "list"].includes(request.operation)) this.requireAnnouncements();
     let current: Awaited<ReturnType<typeof freshMember>>;
     try {
       current = await freshMember(this.context.guild, request.actorId);
@@ -853,6 +909,9 @@ export class ModuleRuntime {
                   "paused",
                   "cancelled",
                   "stale_generation",
+                  "delivery_conflict",
+                  "message_changed",
+                  "already_resolved",
                 ].includes(error.code)
               ? 409
               : error.code === "permission_revoked"

@@ -23,8 +23,14 @@ export class AttachmentFilter {
           Boolean(this.context.store.room(parent ?? message.channelId))))
     );
   }
-  async handle(incoming: Message | PartialMessage): Promise<void> {
+  async handle(
+    incoming: Message | PartialMessage,
+    source: "create" | "update" = "update",
+  ): Promise<void> {
     if (incoming.guildId !== this.context.environment.guildId || !this.inScope(incoming)) return;
+    // Complete create events identify plain text without REST. Edits can add attachments later.
+    if (source === "create" && incoming.partial === false && incoming.attachments.size === 0)
+      return;
     const entry = this.queues.get(incoming.id) ?? { queue: new SerialQueue(), active: 0 };
     entry.active++;
     this.queues.set(incoming.id, entry);

@@ -7,6 +7,7 @@ import {
   type Interaction,
 } from "discord.js";
 import { ControlError } from "../control/contracts.js";
+import type { PublicDelivery, PublicJob } from "../contracts/jobs.js";
 import type { Announcement } from "../modules/announcements/types.js";
 import { resolveLocalDateTime } from "../modules/announcements/schedule.js";
 import { noMentions } from "../shared/utils.js";
@@ -236,11 +237,36 @@ export async function announcementInteraction(
       throw new ControlError(400, "id", "Wklej pełny identyfikator z listy ogłoszeń.");
     const detail = (await call("announcements.read", {}, id)) as {
       announcement: Announcement;
-      jobs: { state: string; messageId?: string | null }[];
+      jobs: PublicJob[];
+      deliveries: PublicDelivery[];
     };
     if (action === "stan") {
       const record = detail.announcement;
-      const unconfirmed = detail.jobs.some((job) => job.state === "unknown");
+      const unconfirmed = detail.jobs.some(
+        (job) => job.state === "unknown" && !job.manualResolution,
+      );
+      const resolutions = detail.jobs.flatMap((job) => job.manualResolution ?? []);
+      const decisions = resolutions.flatMap((resolution) => resolution.decisions);
+      const linked = decisions.filter((decision) => decision.linkedMessage);
+      const lastDelivery = detail.deliveries.find(
+        (delivery) => delivery.messageId === record.lastMessageId,
+      );
+      const lastLinked = linked.find(
+        (decision) => decision.linkedMessage?.messageId === record.lastMessageId,
+      )?.linkedMessage;
+      const links = [
+        ...new Set([
+          ...linked.map(
+            (decision) =>
+              `https://discord.com/channels/${record.guildId}/${decision.linkedMessage!.channelId}/${decision.linkedMessage!.messageId}`,
+          ),
+          ...(record.lastMessageId && (lastDelivery?.channelId || lastLinked?.channelId)
+            ? [
+                `https://discord.com/channels/${record.guildId}/${lastDelivery?.channelId || lastLinked?.channelId}/${record.lastMessageId}`,
+              ]
+            : []),
+        ]),
+      ];
       await interaction.editReply({
         content:
           `Ogłoszenie \`${record.id}\`: ${statuses[record.status]}.\nPotwierdzone publikacje: ${record.publishedCount}.` +
@@ -250,9 +276,13 @@ export async function announcementInteraction(
           (unconfirmed
             ? "\nNie udało się potwierdzić ostatniej wysyłki. Sprawdź kanał przed ponowieniem."
             : "") +
-          (record.lastMessageId
-            ? `\nhttps://discord.com/channels/${record.guildId}/${record.channelId}/${record.lastMessageId}`
-            : ""),
+          (resolutions.length
+            ? `\nPróby z ręcznie wskazaną wiadomością: ${linked.length}. Zamknięte bez potwierdzenia: ${decisions.length - linked.length}. Stan techniczny wysyłki pozostaje niepewny.`
+            : "") +
+          (resolutions.some((resolution) => resolution.conflictingMessageIds.length)
+            ? "\nHistoria zawiera różne identyfikatory wiadomości. Sprawdź szczegóły w panelu."
+            : "") +
+          (links.length ? "\n" + links.slice(0, 5).join("\n") : ""),
         allowedMentions: noMentions,
       });
       return true;

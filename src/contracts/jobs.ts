@@ -105,5 +105,27 @@ export type JobErrorCode =
   | "idempotency_conflict"
   | "revision_conflict";
 
-export type PublicJob = Omit<Job, "payload" | "result" | "leaseToken">;
+export interface ManualDeliveryResolution {
+  format: 1;
+  actorId: string;
+  decidedAt: number;
+  attemptIds: string[];
+  decisions: {
+    attemptId: string;
+    decision: "human_confirmed_message" | "closed_unconfirmed";
+    linkedMessage?: {
+      channelId: string;
+      messageId: string;
+      checkedAt: number;
+      fingerprint: string;
+    };
+  }[];
+}
+export type PublicJob = Omit<Job, "payload" | "result" | "leaseToken"> & {
+  attemptsFingerprint?: string;
+  manualResolution?: ManualDeliveryResolution & {
+    conflictingMessageIds: string[];
+    recordedMessageIds: string[];
+  };
+};
 export type PublicDelivery = Omit<DeliveryAttempt, "result" | "leaseToken" | "nonce">;

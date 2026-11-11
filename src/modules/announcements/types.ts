@@ -74,6 +74,9 @@ export type AnnouncementErrorCode =
   | "permission_revoked"
   | "channel_unavailable"
   | "asset_unavailable"
+  | "delivery_conflict"
+  | "message_changed"
+  | "already_resolved"
   | "expired";
 
 export class AnnouncementError extends Error {
