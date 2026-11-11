@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { Store } from "../store.js";
 import { migrate, migrationDefinitions } from "../migrations.js";
 import { TwitchHubStore, twitchSchemaDefinitions } from "../../modules/twitch/store.js";
+import { parseConfiguration } from "../../contracts/configuration.js";
+import { validateSettings } from "../../settings.js";
 
 export interface RecoverySchema {
   userVersion: number;
@@ -163,12 +165,88 @@ export function assertIntegrity(db: DatabaseSync): void {
     throw new Error("Recovery database integrity check failed.");
 }
 
+function quarantineCoreConfiguration(db: DatabaseSync, now: number): void {
+  const guildId = db.prepare("SELECT guild FROM guild_identity WHERE singleton=1").get()?.guild;
+  if (typeof guildId !== "string" || !/^\d{17,20}$/.test(guildId))
+    throw new Error("Recovery core configuration is missing its guild identity.");
+  if (
+    db.prepare("SELECT 1 FROM control_configuration WHERE guild<>? LIMIT 1").get(guildId) ||
+    db.prepare("SELECT 1 FROM runtime_settings WHERE guild<>? LIMIT 1").get(guildId)
+  )
+    throw new Error("Recovery core configuration contains another guild.");
+  const saved = db.prepare("SELECT body FROM control_configuration WHERE guild=?").get(guildId),
+    runtime = db.prepare("SELECT revision,body FROM runtime_settings WHERE guild=?").get(guildId),
+    previousConfiguration = saved ? JSON.parse(String(saved.body)) : null,
+    values = runtime ? validateSettings(JSON.parse(String(runtime.body))) : null,
+    configuration = parseConfiguration(
+      saved
+        ? previousConfiguration
+        : {
+            revision: 0,
+            modules: { rooms: false, reactions: false, files: false, reports: false },
+            rooms: {
+              entryChannelId: "",
+              categoryId: "",
+              maxRooms: values?.maximum ?? 10,
+              userLimit: 0,
+              idleSeconds: values?.emptySeconds ?? 60,
+            },
+            reactions: { channelId: "", choices: [] },
+            files: {
+              channelIds: [],
+              formats: values
+                ? values.extensions.map((extension) => extension.toUpperCase())
+                : ["PDF", "PNG", "JPG", "JPEG", "WEBP", "GIF"],
+              includeRooms: false,
+            },
+            reports: { channelId: "" },
+          },
+    ),
+    revision = Math.max(configuration.revision, Number(runtime?.revision ?? 0)) + 1;
+  if (
+    (runtime && (!Number.isSafeInteger(runtime.revision) || Number(runtime.revision) < 0)) ||
+    !Number.isSafeInteger(revision) ||
+    revision > Number.MAX_SAFE_INTEGER - 1
+  )
+    throw new Error("Recovery core configuration revision is invalid.");
+  const review = {
+    format: 1,
+    kind: "gildiusz-restored-core-configuration",
+    guildId,
+    previousConfiguration,
+    previousRuntimeRevision: runtime?.revision ?? null,
+    legacyFallbackDisabled: !saved,
+    roomMappingDetached: true,
+  };
+  // The archive remains unchanged; retain the detached mapping for explicit operator review too.
+  db.prepare("INSERT OR IGNORE INTO resources VALUES(?,'recovery-review',?,?)").run(
+    `recovery.core-configuration.${createHash("sha256").update(JSON.stringify(review)).digest("hex")}`,
+    guildId,
+    JSON.stringify({ ...review, quarantinedAt: now }),
+  );
+  configuration.revision = revision;
+  configuration.modules = { rooms: false, reactions: false, files: false, reports: false };
+  // Main constructs/reconciles rooms by category presence even when the rooms switch is OFF.
+  configuration.rooms.entryChannelId = "";
+  configuration.rooms.categoryId = "";
+  db.prepare(
+    "INSERT INTO control_configuration VALUES (?,?) ON CONFLICT(guild) DO UPDATE SET body=excluded.body",
+  ).run(guildId, JSON.stringify(configuration));
+  if (runtime)
+    db.prepare("UPDATE runtime_settings SET revision=?,updated=? WHERE guild=?").run(
+      revision,
+      now,
+      guildId,
+    );
+}
+
 export function quarantineDatabase(db: DatabaseSync, kind: "guild" | "hub", now: number): void {
   const has = (name: string) =>
     !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
   db.exec("BEGIN IMMEDIATE");
   try {
     if (kind === "guild") {
+      quarantineCoreConfiguration(db, now);
       if (has("jobs"))
         db.prepare(
           `UPDATE jobs SET state=CASE WHEN state='running' THEN 'unknown' ELSE 'cancelled' END,

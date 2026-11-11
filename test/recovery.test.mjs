@@ -17,6 +17,8 @@ import { join, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { Store } from "../dist/storage/store.js";
+import { SettingsService } from "../dist/settings.js";
+import { publicConfig, readControlConfiguration } from "../dist/control/configuration.js";
 import { JobStore } from "../dist/core/jobs/store.js";
 import { ModuleSettingsStore } from "../dist/core/modules/settings.js";
 import { TwitchHubStore } from "../dist/modules/twitch/store.js";
@@ -34,7 +36,7 @@ import {
 import { encryptArchive } from "../dist/storage/recovery/archive.js";
 import { configuredSnapshot, recoveryCommand } from "../scripts/recovery.mjs";
 import { stoppedSnapshot, deploymentPause } from "../scripts/hosting.mjs";
-import { quarantineDatabase } from "../dist/storage/recovery/schema.js";
+import { quarantineDatabase, schemaOf } from "../dist/storage/recovery/schema.js";
 import { serverRulesMigration } from "../dist/modules/server-rules/schema.js";
 
 const guildA = "900000000000000001",
@@ -245,6 +247,149 @@ async function fixture(t) {
   });
   return { root, options, stores, hubDb, bindingA, assetId, annId };
 }
+
+test("encrypted restore disables saved and legacy core configuration without adopting old rooms", async (t) => {
+  const f = await fixture(t),
+    original = {
+      revision: 1,
+      modules: { rooms: true, reactions: true, files: true, reports: true },
+      rooms: {
+        entryChannelId: actor,
+        categoryId: channel,
+        maxRooms: 7,
+        userLimit: 3,
+        idleSeconds: 125,
+      },
+      reactions: { channelId: channel, choices: [{ emoji: "🎨", roleId: actor }] },
+      files: { channelIds: [channel], formats: ["PDF", "PNG"], includeRooms: true },
+      reports: { channelId: channel },
+    },
+    settings = {
+      maximum: 7,
+      creationCooldownSeconds: 37,
+      emptySeconds: 125,
+      transferSeconds: 45,
+      extensions: ["pdf", "png"],
+    };
+  f.stores[0].saveControlConfiguration(guildA, original, settings, 0, actor);
+  const room = {
+      id: channel,
+      owner: actor,
+      locked: true,
+      allowed: [actor],
+      arrivals: { [actor]: 1000 },
+      emptySince: 2000,
+      ownerAbsentSince: 3000,
+    },
+    roomBodies = [];
+  for (const store of f.stores) {
+    store.putResource("category.rooms", "category", channel, { name: "Old category" });
+    store.putResource("channel.join", "channel", actor, { name: "Old entry" });
+    store.putResource("message.roles.0", "message", channel, { channelId: channel });
+    store.putRoom(room);
+    roomBodies.push(store.db.prepare("SELECT * FROM rooms").get());
+  }
+  const legacyConfig = publicConfig(),
+    legacyBefore = readControlConfiguration(
+      f.stores[1],
+      legacyConfig,
+      new SettingsService(f.stores[1], legacyConfig, guildB),
+      guildB,
+      true,
+    );
+  assert.equal(legacyBefore.modules.rooms, true);
+  assert.equal(legacyBefore.rooms.categoryId, channel);
+  const manifest = await createSnapshot(f.options),
+    archive = readFileSync(f.options.outputPath),
+    targetRoot = join(f.root, "restored-core");
+  await restoreSnapshot({ archivePath: f.options.outputPath, targetRoot, key: f.options.key });
+  assert.throws(() => assertRestoreStartupAllowed(targetRoot), /quarantined/);
+  for (const [index, entry] of manifest.guilds.entries()) {
+    const store = new Store(join(targetRoot, entry.databasePath), entry.guildId);
+    try {
+      const config = publicConfig(),
+        restored = readControlConfiguration(
+          store,
+          config,
+          new SettingsService(store, config, entry.guildId),
+          entry.guildId,
+          true,
+        ),
+        review = store.resources().filter((resource) => resource.kind === "recovery-review");
+      assert.deepEqual(restored.modules, {
+        rooms: false,
+        reactions: false,
+        files: false,
+        reports: false,
+      });
+      assert.equal(restored.rooms.entryChannelId, "");
+      assert.equal(restored.rooms.categoryId, "");
+      assert.deepEqual(store.db.prepare("SELECT * FROM rooms").get(), roomBodies[index]);
+      assert.equal(store.resource("category.rooms").id, channel);
+      assert.equal(store.resource("channel.join").id, actor);
+      assert.equal(store.resource("message.roles.0").id, channel);
+      assert.equal(review.length, 1);
+      const baseline = JSON.parse(review[0].baseline);
+      assert.equal(baseline.guildId, entry.guildId);
+      assert.equal(baseline.roomMappingDetached, true);
+      assert.equal(baseline.legacyFallbackDisabled, index === 1);
+      assert.deepEqual(baseline.previousConfiguration, index === 0 ? original : null);
+      assert.deepEqual(schemaOf(store.db, "guild"), schemaOf(f.stores[index].db, "guild"));
+      if (index === 0) {
+        assert.equal(restored.revision, 2);
+        assert.equal(store.controlConfiguration(entry.guildId).revision, 2);
+        assert.equal(store.settings(entry.guildId).revision, 2);
+        assert.deepEqual(JSON.parse(store.settings(entry.guildId).body), settings);
+        assert.deepEqual(restored.reactions, original.reactions);
+        assert.deepEqual(restored.files, original.files);
+        assert.deepEqual(restored.reports, original.reports);
+      }
+    } finally {
+      store.close();
+    }
+  }
+  assert.deepEqual(readFileSync(f.options.outputPath), archive);
+  assert.deepEqual(f.stores[0].controlConfiguration(guildA), original);
+  assert.equal(f.stores[1].controlConfiguration(guildB), undefined);
+  assert.throws(() => assertRestoreStartupAllowed(targetRoot), /quarantined/);
+});
+
+test("invalid restored core configuration rolls quarantine changes back", (t) => {
+  const cases = [
+    (db) => db.prepare("INSERT INTO control_configuration VALUES(?,'{')").run(guildA),
+    (db) => db.prepare("INSERT INTO control_configuration VALUES(?,'null')").run(guildA),
+    (db) => db.prepare("INSERT INTO control_configuration VALUES(?,'{}')").run(guildB),
+    (db) => db.prepare("INSERT INTO runtime_settings VALUES(?,0,'{}',?,1000)").run(guildA, actor),
+    (db) => db.prepare("INSERT INTO runtime_settings VALUES(?,0,'{}',?,1000)").run(guildB, actor),
+  ];
+  for (const corrupt of cases) {
+    const store = new Store(":memory:", guildA);
+    t.after(() => store.close());
+    const jobs = new JobStore(store.db, () => 1000),
+      job = jobs.enqueue({
+        guildId: guildA,
+        type: "announcement.publish",
+        payload: { test: true },
+        dueAt: 1000,
+        dedupeKey: "before-quarantine",
+      });
+    corrupt(store.db);
+    const before = ["control_configuration", "runtime_settings", "resources", "jobs"].map((table) =>
+      store.db.prepare(`SELECT * FROM ${table}`).all(),
+    );
+    assert.throws(() => quarantineDatabase(store.db, "guild", 2000));
+    assert.deepEqual(
+      ["control_configuration", "runtime_settings", "resources", "jobs"].map((table) =>
+        store.db.prepare(`SELECT * FROM ${table}`).all(),
+      ),
+      before,
+    );
+    assert.equal(
+      store.db.prepare("SELECT state FROM jobs WHERE id=?").get(job.id).state,
+      "pending",
+    );
+  }
+});
 
 test("rules from another guild cannot enter a guild snapshot", async (t) => {
   const f = await fixture(t);
