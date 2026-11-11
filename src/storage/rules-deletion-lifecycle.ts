@@ -20,7 +20,16 @@ import {
   withInput,
   writeAll,
 } from "./recovery/files.js";
-import { acquireDataRootLease, assertRestoreStartupAllowed } from "./recovery/lease.js";
+import {
+  acquireDataRootLease,
+  assertRestoreStartupAllowed,
+  assertColdSourceFenceAbsent,
+} from "./recovery/lease.js";
+import {
+  assertRecoverySourceLease,
+  assertRecoveryGuildLease,
+  type RecoverySourceLease,
+} from "./recovery/source-lease.js";
 import {
   assertIntegrity,
   currentRecoverySchemaPolicy,
@@ -139,6 +148,7 @@ export interface RulesDeletionLifecycleOptions {
   ownership: RulesDeletionLifecycleOwnership;
   readCanonicalInstallations(): readonly RulesDeletionInstallation[];
   clock?: () => number;
+  recoverySourceLease?: RecoverySourceLease;
   /** Trusted synchronous policy port; absence never means retirement was approved. */
   mayForgetRetired?: (decision: DeletionLedger, now: number) => boolean;
 }
@@ -506,6 +516,13 @@ export class RulesDeletionLifecycle {
   private owned(): void {
     this.options.ownership.assertHeld();
     assertRestoreStartupAllowed(this.root);
+    if (this.options.recoverySourceLease)
+      assertRecoverySourceLease(
+        this.options.recoverySourceLease,
+        this.root,
+        this.options.readCanonicalInstallations(),
+      );
+    else assertColdSourceFenceAbsent(this.root);
   }
   private now(): number {
     return deletionInteger((this.options.clock ?? Date.now)());
@@ -1475,6 +1492,26 @@ export function openRulesDeletionLifecycle(
 ): RulesDeletionLifecycle {
   return new RulesDeletionLifecycle(options);
 }
+/** Borrows only a capability minted by actual compound root/database acquisition. */
+export async function withRecoveryRulesDeletionLifecycle<T>(
+  options: QuiescentRulesDeletionLifecycleOptions & { sourceLease: RecoverySourceLease },
+  work: (port: RulesDeletionLifecycle) => Promise<T>,
+): Promise<T> {
+  assertRecoverySourceLease(options.sourceLease, options.dataRoot, options.installations);
+  const port = openRulesDeletionLifecycle({
+    dataRoot: options.dataRoot,
+    readCanonicalInstallations: () => options.installations,
+    clock: options.now === undefined ? undefined : () => options.now!,
+    recoverySourceLease: options.sourceLease,
+    ownership: {
+      assertHeld: () => assertRecoverySourceLease(options.sourceLease),
+      assertQuiescent: () => assertRecoverySourceLease(options.sourceLease),
+      assertGuildLease: (guildId, path) =>
+        assertRecoveryGuildLease(options.sourceLease, guildId, path),
+    },
+  });
+  return work(port);
+}
 export interface QuiescentRulesDeletionLifecycleOptions {
   dataRoot: string;
   installations: readonly RulesDeletionInstallation[];
@@ -1491,6 +1528,7 @@ async function withQuiescent<T>(
   let owned = false;
   try {
     assertRestoreStartupAllowed(root);
+    assertColdSourceFenceAbsent(root);
     try {
       releases.push(await acquireDataRootLease(root));
       owned = true;
@@ -1574,6 +1612,7 @@ export async function pruneRulesDeletionLifecycle<T = RulesDeletionPruneResult>(
   if (!isAbsolute(options.dataRoot) || absent(options.dataRoot)) fail("source_unavailable");
   const root = privateDirectory(resolve(options.dataRoot));
   assertRestoreStartupAllowed(root);
+  assertColdSourceFenceAbsent(root);
   let owned = false,
     release: (() => Promise<void>) | undefined;
   try {

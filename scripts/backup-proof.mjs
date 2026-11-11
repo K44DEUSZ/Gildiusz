@@ -267,61 +267,79 @@ async function sealSourceProof(options, includeRecoveryJournal) {
       sealRulesDeletionLifecycleSnapshot,
       pruneRulesDeletionLifecycle,
       readRulesDeletionLifecycleJournal,
+      withRecoveryRulesDeletionLifecycle,
     } = await import("../dist/storage/rules-deletion-lifecycle.js");
-    await pruneRulesDeletionLifecycle({
-      dataRoot,
-      ...(givenNow === undefined ? {} : { now: readNow() }),
-    });
-    const sealed = await sealRulesDeletionLifecycleSnapshot(
-      { dataRoot, installations, ...(givenNow === undefined ? {} : { now: readNow() }) },
-      (journal, lockedRoot) => {
-        if (!journal.complete || journal.blockers.length) fail("source_incomplete");
-        const now = readNow();
-        if (
-          now < journal.updatedAt ||
-          notBefore > now ||
-          now - notBefore > deletionProofLimits.maxFreshnessMs
-        )
-          fail("clock_rollback");
-        const body = {
-          format: 2,
-          kind: "gildiusz-latest-deletion-proof",
-          id: randomUUID(),
-          sourceId: journal.sourceId,
-          sequence: journal.sequence,
-          createdAt: now,
-          coveredFrom: journal.coveredFrom,
-          challenge,
-          complete: true,
-          coverage: ["guilds", "rules_acceptances"],
-          guildIds: journal.active.map((i) => i.guildId),
-          guilds: journal.retired.map(({ format, guildId, removedAt, purgedAt, outcome }) => ({
-            format,
-            guildId,
-            removedAt,
-            purgedAt,
-            outcome,
-          })),
-          acceptances: journal.entries,
-        };
-        validate(body, now, 0);
-        const sealed = encode(body, master);
-        if (!includeRecoveryJournal) return sealed;
-        // Read inside the same root and guild leases as the sealed proof.
-        const recoveryJournal = readRulesDeletionLifecycleJournal(lockedRoot);
-        if (
-          recoveryJournal.sourceId !== body.sourceId ||
-          recoveryJournal.sequence !== body.sequence ||
-          recoveryJournal.coveredFrom !== body.coveredFrom ||
-          recoveryJournal.globalGap !== null ||
-          recoveryJournal.admitting.length ||
-          recoveryJournal.retiring.length ||
-          JSON.stringify(recoveryJournal.entries) !== JSON.stringify(body.acceptances)
-        )
-          fail("source_changed_during_capture");
-        return { ...sealed, recoveryJournal };
-      },
-    );
+    const consume = (journal, lockedRoot) => {
+      if (!journal.complete || journal.blockers.length) fail("source_incomplete");
+      const now = readNow();
+      if (
+        now < journal.updatedAt ||
+        notBefore > now ||
+        now - notBefore > deletionProofLimits.maxFreshnessMs
+      )
+        fail("clock_rollback");
+      const body = {
+        format: 2,
+        kind: "gildiusz-latest-deletion-proof",
+        id: randomUUID(),
+        sourceId: journal.sourceId,
+        sequence: journal.sequence,
+        createdAt: now,
+        coveredFrom: journal.coveredFrom,
+        challenge,
+        complete: true,
+        coverage: ["guilds", "rules_acceptances"],
+        guildIds: journal.active.map((i) => i.guildId),
+        guilds: journal.retired.map(({ format, guildId, removedAt, purgedAt, outcome }) => ({
+          format,
+          guildId,
+          removedAt,
+          purgedAt,
+          outcome,
+        })),
+        acceptances: journal.entries,
+      };
+      validate(body, now, 0);
+      const sealed = encode(body, master);
+      if (!includeRecoveryJournal) return sealed;
+      // Read inside the same root and guild leases as the sealed proof.
+      const recoveryJournal = readRulesDeletionLifecycleJournal(lockedRoot);
+      if (
+        recoveryJournal.sourceId !== body.sourceId ||
+        recoveryJournal.sequence !== body.sequence ||
+        recoveryJournal.coveredFrom !== body.coveredFrom ||
+        recoveryJournal.globalGap !== null ||
+        recoveryJournal.admitting.length ||
+        recoveryJournal.retiring.length ||
+        JSON.stringify(recoveryJournal.entries) !== JSON.stringify(body.acceptances)
+      )
+        fail("source_changed_during_capture");
+      return { ...sealed, recoveryJournal };
+    };
+    let sealed;
+    if (options.sourceLease) {
+      sealed = await withRecoveryRulesDeletionLifecycle(
+        {
+          dataRoot,
+          installations,
+          sourceLease: options.sourceLease,
+          ...(givenNow === undefined ? {} : { now: readNow() }),
+        },
+        async (port) => {
+          await port.pruneExpired();
+          return consume(await port.sealSnapshot(), port.root);
+        },
+      );
+    } else {
+      await pruneRulesDeletionLifecycle({
+        dataRoot,
+        ...(givenNow === undefined ? {} : { now: readNow() }),
+      });
+      sealed = await sealRulesDeletionLifecycleSnapshot(
+        { dataRoot, installations, ...(givenNow === undefined ? {} : { now: readNow() }) },
+        consume,
+      );
+    }
     if (readNow() >= sealed.meta.expiresAt) fail("expired_decision");
     return sealed;
   } finally {

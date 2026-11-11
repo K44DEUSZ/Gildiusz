@@ -4,6 +4,11 @@ import { loadConfig, loadCredentials, loadEnvironment } from "./config.js";
 import { contentDigest, lintContent, publications, readJson } from "./content.js";
 import { Store } from "./storage/store.js";
 import { acquireLock } from "./storage/lock.js";
+import {
+  assertSourcePreparationComplete,
+  assertRestoreStartupAllowed,
+  assertDatabaseSourceOpenAllowed,
+} from "./storage/recovery/lease.js";
 import { desired } from "./bootstrap/desired.js";
 import { discordApi, snapshot, type Body } from "./bootstrap/api.js";
 import { applyPlan, buildPlan, type Plan } from "./bootstrap/plan.js";
@@ -22,6 +27,12 @@ function flag(name: string): boolean {
 function save(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+}
+function assertSourceOpenAllowed(databasePath: string): void {
+  const root = dirname(healthPath());
+  assertRestoreStartupAllowed(root);
+  assertSourcePreparationComplete(root);
+  assertDatabaseSourceOpenAllowed(databasePath);
 }
 
 async function main(): Promise<void> {
@@ -103,8 +114,12 @@ async function main(): Promise<void> {
     const output = resolve(option("output") ?? "");
     if (!option("output") || existsSync(output) || output === path)
       throw new Error("Choose a new --output path outside the repository history.");
-    const store = new Store(path);
+    assertSourceOpenAllowed(path);
+    const release = await acquireLock(path, { createTarget: false });
+    let store: Store | undefined;
     try {
+      assertSourceOpenAllowed(path);
+      store = new Store(path);
       await store.backup(output);
       save(`${output}.manifest.json`, {
         created: new Date().toISOString(),
@@ -117,7 +132,8 @@ async function main(): Promise<void> {
       });
       console.log(`Backup saved: ${output}`);
     } finally {
-      store.close();
+      store?.close();
+      await release();
     }
     return;
   }
@@ -139,12 +155,12 @@ async function main(): Promise<void> {
     );
     return;
   }
-  const mutations =
-    ["apply", "adopt", "resolve-operation"].includes(command) ||
-    (command === "forum-guides" && Boolean(option("approve")));
-  const release = mutations ? await acquireLock(environment.databasePath) : null;
-  const store = new Store(environment.databasePath, environment.guildId);
+  assertSourceOpenAllowed(environment.databasePath);
+  const release = await acquireLock(environment.databasePath);
+  let store: Store | undefined;
   try {
+    assertSourceOpenAllowed(environment.databasePath);
+    store = new Store(environment.databasePath, environment.guildId);
     const state = await snapshot(api, environment);
     if (command === "plan") {
       const plan = await buildPlan(api, state, store, config, environment, phase as Plan["phase"]);
@@ -272,7 +288,7 @@ async function main(): Promise<void> {
       console.log("Operation journal entry cleared after explicit reconciliation.");
     } else throw new Error("Unknown command. Run cli help.");
   } finally {
-    store.close();
+    store?.close();
     await release?.();
   }
 }

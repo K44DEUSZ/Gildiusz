@@ -26,6 +26,7 @@ import {
 import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
+  assertColdSourceFenceAbsent,
 } from "../dist/storage/recovery/lease.js";
 import {
   assertGlobalDeletionEvidence,
@@ -323,6 +324,7 @@ async function withLockedSource(
   if (!isAbsolute(dataRoot) || missing(dataRoot) || !lstatSync(dataRoot).isDirectory())
     fail("source_unavailable");
   dataRoot = privateDirectory(dataRoot);
+  assertColdSourceFenceAbsent(dataRoot);
   try {
     assertRestoreStartupAllowed(dataRoot);
   } catch {
@@ -338,6 +340,7 @@ async function withLockedSource(
     }
     try {
       assertRestoreStartupAllowed(dataRoot);
+      assertColdSourceFenceAbsent(dataRoot);
     } catch {
       fail("source_quarantined");
     }

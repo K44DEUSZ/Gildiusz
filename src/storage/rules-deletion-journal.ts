@@ -33,7 +33,11 @@ import {
   withInput,
   writeAll,
 } from "./recovery/files.js";
-import { acquireDataRootLease, assertRestoreStartupAllowed } from "./recovery/lease.js";
+import {
+  acquireDataRootLease,
+  assertRestoreStartupAllowed,
+  assertColdSourceFenceAbsent,
+} from "./recovery/lease.js";
 
 export interface RulesDeletionInstallation {
   guildId: string;
@@ -84,6 +88,7 @@ function rootOf(root: string): string {
   if (!isAbsolute(root) || missing(root)) fail("source_unavailable");
   privateDirectory(root);
   assertRestoreStartupAllowed(root);
+  assertColdSourceFenceAbsent(root);
   return resolve(root);
 }
 function sourcePath(root: string): string {
@@ -268,6 +273,7 @@ async function locked<T>(root: string, work: () => T | Promise<T>): Promise<T> {
   if (!missing(target)) regularFile(target);
   const release = await acquireLock(target);
   try {
+    assertColdSourceFenceAbsent(root);
     cleanupJournalTemps(root);
     return await work();
   } finally {
@@ -365,6 +371,7 @@ async function withRulesDeletionSource<T>(
       fail("writer_active");
     }
     assertRestoreStartupAllowed(root);
+    assertColdSourceFenceAbsent(root);
     const inventory = paths(root, options.installations);
     for (const item of inventory) {
       const path = join(root, ...item.path.split("/"));

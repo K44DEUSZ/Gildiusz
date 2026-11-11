@@ -19,6 +19,12 @@ import { randomUUID } from "node:crypto";
 import type { GuildInstallation } from "../../installations.js";
 import { acquireLock } from "../lock.js";
 import {
+  assertRecoverySourceLease,
+  assertRecoveryDatabaseLease,
+  assertRecoverySnapshotLease,
+  type RecoverySourceLease,
+} from "./source-lease.js";
+import {
   acquireDataRootLease,
   assertRestoreStartupAllowed,
   assertSourcePreparationComplete,
@@ -236,7 +242,10 @@ function scrubWeb(db: DatabaseSync): void {
 }
 
 /** Read-only planning validates independent key/configuration before an installer stops its worker. */
-export function planSnapshot(options: SnapshotOptions): {
+function inspectSnapshot(
+  options: SnapshotOptions,
+  sourceLease?: RecoverySourceLease,
+): {
   guilds: number;
   databases: number;
   maxBytes: number;
@@ -252,7 +261,8 @@ export function planSnapshot(options: SnapshotOptions): {
   )
     throw new Error("Invalid snapshot paths or guild count.");
   assertRestoreStartupAllowed(options.dataRoot);
-  assertSourcePreparationComplete(options.dataRoot);
+  if (sourceLease) assertRecoverySnapshotLease(sourceLease, options);
+  else assertSourcePreparationComplete(options.dataRoot);
   deletionLedgers(options.dataRoot);
   if (fileExists(options.outputPath)) throw new Error("Recovery output already exists.");
   const guilds = new Set<string>(),
@@ -300,23 +310,52 @@ export function planSnapshot(options: SnapshotOptions): {
   return { guilds: guilds.size, databases: databases.size, ...limits };
 }
 
+export function planSnapshot(options: SnapshotOptions) {
+  return inspectSnapshot(options);
+}
+
 export async function createSnapshot(options: SnapshotOptions): Promise<SnapshotManifest> {
-  const limits = planSnapshot(options),
+  return createSnapshotOwned(options);
+}
+
+export async function createSnapshotWithSourceLease(
+  options: SnapshotOptions,
+  sourceLease: RecoverySourceLease,
+): Promise<SnapshotManifest> {
+  assertRecoverySourceLease(sourceLease, options.dataRoot, options.guilds);
+  assertRecoverySnapshotLease(sourceLease, options);
+  for (const path of [options.hubDatabasePath, options.webDatabasePath])
+    if (path) assertRecoveryDatabaseLease(sourceLease, path);
+  const ownedOptions = Object.freeze({
+    ...options,
+    guilds: Object.freeze(options.guilds.map((row) => Object.freeze({ ...row }))),
+  });
+  return createSnapshotOwned(ownedOptions, sourceLease);
+}
+
+async function createSnapshotOwned(
+  options: SnapshotOptions,
+  sourceLease?: RecoverySourceLease,
+): Promise<SnapshotManifest> {
+  const limits = inspectSnapshot(options, sourceLease),
     key = backupKey(options.key, options.forbiddenKeys);
   privateDirectory(dirname(options.outputPath));
   const stage = mkdtempSync(join(dirname(options.outputPath), ".gildiusz-snapshot-"));
   const releases: (() => Promise<void>)[] = [];
   try {
-    releases.push(await acquireDataRootLease(options.dataRoot));
-    assertRestoreStartupAllowed(options.dataRoot);
-    assertSourcePreparationComplete(options.dataRoot);
-    for (const path of [
-      ...options.guilds.map((entry) => entry.databasePath),
-      ...(options.hubDatabasePath ? [options.hubDatabasePath] : []),
-    ].sort())
-      releases.push(await acquireLock(path));
+    if (sourceLease) assertRecoverySourceLease(sourceLease, options.dataRoot, options.guilds);
+    else {
+      releases.push(await acquireDataRootLease(options.dataRoot));
+      assertRestoreStartupAllowed(options.dataRoot);
+      assertSourcePreparationComplete(options.dataRoot);
+      for (const path of [
+        ...options.guilds.map((entry) => entry.databasePath),
+        ...(options.hubDatabasePath ? [options.hubDatabasePath] : []),
+      ].sort())
+        releases.push(await acquireLock(path));
+    }
     // Recheck the registry/configuration after all writers have stopped, under the common lease.
-    planSnapshot(options);
+    inspectSnapshot(options, sourceLease);
     const policy = options.schemaPolicy ?? currentRecoverySchemaPolicy();
     const manifest: SnapshotManifest = {
       format: 1,
@@ -457,12 +496,14 @@ export async function createSnapshot(options: SnapshotOptions): Promise<Snapshot
       writeJson(inside(stage, ledger.path), ledger.value);
       record(ledger.path, "configuration");
     }
+    if (sourceLease) assertRecoverySnapshotLease(sourceLease, options);
     encryptArchive(
       options.outputPath,
       manifest,
       manifest.files.map((entry) => inside(stage, entry.path)),
       key,
     );
+    if (sourceLease) assertRecoverySnapshotLease(sourceLease, options);
     return manifest;
   } finally {
     key.fill(0);
@@ -673,12 +714,15 @@ export async function restoreSnapshot(options: {
   maxFiles?: number;
   now?: number;
   maxArchiveAgeMs?: number;
+  quarantineWeb?: true;
 }): Promise<SnapshotManifest> {
   const key = backupKey(options.key, options.forbiddenKeys),
     limits = budgets(options);
   if (!isAbsolute(options.archivePath) || !isAbsolute(options.targetRoot))
     throw new Error("Recovery paths must be absolute.");
   const target = resolve(options.targetRoot);
+  if (options.quarantineWeb !== undefined && options.quarantineWeb !== true)
+    throw new Error("Invalid Web quarantine request.");
   privateDirectory(dirname(target));
   const assertEmpty = () => {
     if (fileExists(target)) {
@@ -818,6 +862,13 @@ export async function restoreSnapshot(options: {
     if (manifest.files.some((entry) => entry.kind === "asset" && !expectedAssets.has(entry.path)))
       throw new Error("Restored asset has no database metadata.");
     assertRecoveryArchiveAge(manifest.createdAt, options);
+    if (options.quarantineWeb && manifest.files.some((entry) => entry.kind === "web"))
+      writeJson(join(data, "web", "web.sqlite.restore-quarantine.json"), {
+        format: 1,
+        kind: "gildiusz-restored-web-quarantine",
+        backupId: manifest.id,
+        automaticResume: false,
+      });
     writeJson(join(data, "restore-manifest.json"), manifest);
     if (options.dryRun) return manifest;
     for (const entry of manifest.files.filter((entry) =>
