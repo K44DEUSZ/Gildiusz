@@ -47,7 +47,9 @@ npm run cli -- apply --file reports/deployment-plan.json --approve HASH_Z_PLANU
 
 Bot nie potrzebuje Administratora. Sprawdź jego uprawnienia i hierarchię ról. Baza wymaga trwałego dysku i jednej działającej instancji procesu. Po przygotowaniu serwera uruchom `npm start`. Dostępny jest też `docker compose up -d`.
 
-Operator może osobno skonfigurować `scripts/backup-relay.mjs serve ROOT` jako ograniczone polecenie nowego klucza SSH oraz `scripts/backup-pc.mjs CONFIG` jako jednorazowy odbiornik na Windows. Odbiornik wymaga istniejącego, przypiętego katalogu PC i osobnego klucza szyfrowania; nie instaluje dostępu ani harmonogramu. Przesyła tylko wskazaną zaszyfrowaną kopię i proof. Aktualizacja korzysta z dotychczasowego podpisanego potwierdzenia PC, a kopia dzienna potwierdza lokalny zapis na PC bez zmiany hostowego `offsiteSuccess: false`. Przeterminowany lub zmieniony punkt aktualizacji wymaga obsługi operatora.
+Opcjonalny autodeploy na hostingu pobiera dokładną paczkę `main` po udanym CI i sprawdza jej tożsamość oraz sumę SHA-256. Aktualizacja nie tworzy kopii danych i nie wymaga włączonego komputera operatora. Przed zatrzymaniem bota i przed aktywacją sprawdza zgodność pełnych schematów baz, migracji oraz dziennika usunięć. Wydanie wymagające migracji lub naprawy danych pozostaje do ręcznego wdrożenia. Nieudany start może cofnąć sam kod dopiero po ponownym potwierdzeniu zgodności danych; zapisane dane i wykonane działania Discorda pozostają bieżące.
+
+Ręczne kopie i odtwarzanie są osobnymi czynnościami operatora przez `scripts/recovery.mjs`. Opcjonalne narzędzia `scripts/backup-relay.mjs serve ROOT` i `scripts/backup-pc.mjs CONFIG` wymagają osobnego ograniczonego dostępu, przypiętego katalogu PC i klucza szyfrowania. Nie instalują dostępu ani harmonogramu, a zwykłe wdrożenie ich nie uruchamia. Istniejący niedokończony punkt aktualizacji wymaga rozstrzygnięcia przez operatora.
 
 </details>
 

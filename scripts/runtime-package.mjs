@@ -177,10 +177,17 @@ export function assertBackupTransportRuntime(directory) {
   assertRuntimePackage(directory);
   assertRuntimeFiles(directory, requiredBackupTransportFiles);
 }
+/** New deployment ports do not change the historical format6 minimum. */
+export function assertDeploymentRuntime(directory) {
+  assertRuntimePackage(directory);
+  assertRuntimeFiles(directory, ["scripts/deployment-state.mjs"]);
+}
 export function smokeRuntime(directory) {
   assertBackupTransportRuntime(directory);
+  assertDeploymentRuntime(directory);
   // This exercises packaged JS -> worker -> local WASM without tokens, databases or Discord.
   const source =
+    'const{inspectDeploymentState,assertSameDeploymentState}=await import("./scripts/deployment-state.mjs");const{readRulesDeletionLifecycleJournal}=await import("./dist/storage/rules-deletion-lifecycle.js");if(typeof inspectDeploymentState!=="function"||typeof assertSameDeploymentState!=="function"||typeof readRulesDeletionLifecycleJournal!=="function")throw Error("Missing packaged deployment ports");' +
     'await import("./scripts/recovery-deletions.mjs");await import("./scripts/backup-deletion-state.mjs");await import("./scripts/rules-deletion-lifecycle.mjs");await import("./scripts/prepare-legacy-source.mjs");await import("./scripts/backup-offsite.mjs");await import("./dist/storage/rules-deletion-lifecycle.js");' +
     'const{backupProtocol}=await import("./scripts/backup-relay.mjs");const{collectPcBackupOffer}=await import("./scripts/backup-pc.mjs");if(backupProtocol!=="gildiusz-backup-v1"||typeof collectPcBackupOffer!=="function")throw Error("Missing packaged transport ports");' +
     'const{planBackupRotation}=await import("./scripts/backup-catalog.mjs");const{planDailyBackup}=await import("./scripts/backup-scheduler.mjs");await import("./scripts/backup-collector.mjs");await import("./scripts/backup-ledger.mjs");if(planBackupRotation([],{now:0}).remove.length||!planDailyBackup([],0).due)throw Error("Unexpected packaged backup ports");' +

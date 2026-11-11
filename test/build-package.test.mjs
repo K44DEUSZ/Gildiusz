@@ -29,6 +29,7 @@ import {
 import {
   assertRuntimePackage,
   assertBackupTransportRuntime,
+  assertDeploymentRuntime,
   validateRuntimeTree,
   smokeRuntime,
   retiredAudioFiles,
@@ -261,7 +262,8 @@ test("format2 retains its historical requirements while format3 gates every back
     assert.throws(() => assertUpdateRuntime(release), /Withdrawn audio file/);
     for (const name of retiredAudioFiles) unlinkSync(join(release, name));
     assertUpdateRuntime(release);
-    // Old format6 candidates remain installable without the later optional operator transport.
+    // Historical format6 keeps its structural minimum without newer deployment or transport ports.
+    assert.throws(() => assertDeploymentRuntime(release), /deployment-state\.mjs/);
     assert.equal(existsSync(join(release, "scripts/backup-relay.mjs")), false);
     assert.equal(existsSync(join(release, "scripts/backup-pc.mjs")), false);
     assert.throws(() => assertBackupTransportRuntime(release), /backup-relay\.mjs/);

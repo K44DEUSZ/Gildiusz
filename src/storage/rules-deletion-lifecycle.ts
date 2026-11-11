@@ -463,6 +463,31 @@ function validate(value: unknown): RulesDeletionLifecycleJournal {
   return j;
 }
 
+/** Read-only optimistic observation; it does not establish ownership for mutations. */
+export function readRulesDeletionLifecycleJournal(dataRoot: string): RulesDeletionLifecycleJournal {
+  const root = privateDirectory(resolve(dataRoot));
+  assertRestoreStartupAllowed(root);
+  const journal = validate(
+    json(
+      join(root, "rules-acceptance-deletions", "journal.json"),
+      rulesDeletionLifecycleLimits.bytes,
+    ),
+  );
+  if (absent(join(root, "uninstall-retention", "source-policy.json")))
+    fail("source_policy_missing");
+  const policy = json(join(root, "uninstall-retention", "source-policy.json"), 1024);
+  if (
+    !equal(policy, {
+      format: 1,
+      kind: "gildiusz-retention-source-policy",
+      sourceId: journal.sourceId,
+      minimumJournalFormat: 2,
+    })
+  )
+    fail("source_policy_conflict");
+  return journal;
+}
+
 export class RulesDeletionLifecycle {
   readonly root: string;
   private readonly options: RulesDeletionLifecycleOptions;
@@ -516,9 +541,7 @@ export class RulesDeletionLifecycle {
   }
   private read(): RulesDeletionLifecycleJournal {
     if (absent(this.file())) fail("source_unavailable");
-    const value = validate(json(this.file(), rulesDeletionLifecycleLimits.bytes));
-    this.policy(value.sourceId);
-    return value;
+    return readRulesDeletionLifecycleJournal(this.root);
   }
   private atomic(path: string, value: unknown): void {
     const data = Buffer.from(JSON.stringify(value));
