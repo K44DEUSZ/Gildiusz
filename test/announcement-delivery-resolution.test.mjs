@@ -370,6 +370,19 @@ test("manual history expires after30 days without reviving work or restoring pri
   assert.equal(pruneDomainData(f.jobs, guildId, { now: f.now }).jobsRetired, 0);
   f.now++;
   assert.equal(pruneDomainData(f.jobs, guildId, { now: f.now }).jobsRetired, 1);
+  const retired = f.jobs.get(f.lease.id),
+    snapshot = f.snapshot();
+  for (const resolution of [
+    { outcome: "retry", notDelivered: true, at: f.now },
+    { outcome: "succeeded", messageId, result: { content: "Erased private metadata" } },
+    { outcome: "failed", error: "Erased private failure detail" },
+  ]) {
+    assert.throws(
+      () => f.jobs.reconcile(retired.id, retired.revision, resolution),
+      (error) => error.code === "state_conflict",
+    );
+    assert.equal(f.snapshot(), snapshot);
+  }
   const job = f.jobs.get(f.lease.id),
     attempt = f.jobs.attempts(job.id)[0];
   assert.equal(job.state, "unknown");

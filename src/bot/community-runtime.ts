@@ -2055,6 +2055,60 @@ export class CommunityRuntime {
             content: publication.content,
             roleIds: [],
             everyone: false,
+            components:
+              publication.audience === "public"
+                ? [
+                    {
+                      type: 1,
+                      components: [
+                        {
+                          type: 2,
+                          style: 3,
+                          label: "Za",
+                          custom_id: communityButtonId(
+                            "case",
+                            job.guildId,
+                            publication.caseId,
+                            "up",
+                          ),
+                        },
+                        {
+                          type: 2,
+                          style: 4,
+                          label: "Przeciw",
+                          custom_id: communityButtonId(
+                            "case",
+                            job.guildId,
+                            publication.caseId,
+                            "down",
+                          ),
+                        },
+                        {
+                          type: 2,
+                          style: 2,
+                          label: "Wycofaj głos",
+                          custom_id: communityButtonId(
+                            "case",
+                            job.guildId,
+                            publication.caseId,
+                            "unvote",
+                          ),
+                        },
+                        {
+                          type: 2,
+                          style: 2,
+                          label: "Szczegóły",
+                          custom_id: communityButtonId(
+                            "case",
+                            job.guildId,
+                            publication.caseId,
+                            "read",
+                          ),
+                        },
+                      ],
+                    },
+                  ]
+                : undefined,
           },
           execution,
           this.transport(async () => {

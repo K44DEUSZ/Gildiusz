@@ -694,7 +694,8 @@ export class JobStore {
       const current = this.require(id),
         now = this.now();
       if (current.revision !== expectedRevision) throw new JobError("revision_conflict");
-      if (current.state !== "unknown") throw new JobError("state_conflict");
+      if (current.state !== "unknown" || this.isHistoryRetired(id))
+        throw new JobError("state_conflict");
       const retired = this.isDomainRetired(id);
       if (retired && resolution.outcome === "retry") throw new JobError("state_conflict");
       let state: JobState,

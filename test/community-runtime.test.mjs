@@ -8,6 +8,7 @@ import {
   ChannelType,
   DiscordjsError,
   GuildChannelManager,
+  MessageFlags,
   PermissionFlagsBits as P,
   PermissionsBitField,
   RateLimitError,
@@ -15,6 +16,7 @@ import {
 import { Store } from "../dist/storage/store.js";
 import { ModuleRuntime } from "../dist/bot/module-runtime.js";
 import { JobRunner } from "../dist/core/jobs/runner.js";
+import { communityInteraction } from "../dist/bot/community-commands.js";
 
 const guildId = "700000000000000001",
   ownerId = "700000000000000002",
@@ -362,6 +364,221 @@ async function fixture(t, options = {}) {
     }),
   };
 }
+
+let nextInteractionId = 720000000000000000n;
+async function clickCaseButton(f, customId, options = {}) {
+  const replies = [],
+    interaction = {
+      id: (++nextInteractionId).toString(),
+      guildId: options.guildId ?? guildId,
+      customId,
+      user: { id: options.actorId ?? otherId },
+      isChatInputCommand: () => false,
+      isButton: () => true,
+      async deferReply(value) {
+        assert.equal(value.flags, MessageFlags.Ephemeral);
+      },
+      async editReply(value) {
+        assert.deepEqual(value.allowedMentions, { parse: [], repliedUser: false });
+        replies.push(value.content);
+      },
+    };
+  assert.equal(await communityInteraction(f.runtime, interaction), true);
+  return { interaction, replies, last: () => replies.at(-1) };
+}
+
+async function publishSuggestion(
+  f,
+  { approval = true, content = "Pomysł do wspólnej oceny." } = {},
+) {
+  if (!approval) {
+    const settings = f.runtime.settings.read();
+    f.runtime.settings.save(
+      { ...settings, cases: { ...settings.cases, suggestionVisibility: "immediate" } },
+      ownerId,
+    );
+  }
+  const saved = await f.request(
+    userId,
+    "cases.create",
+    f.case({ kind: "suggestion", title: "Pomysł uczestnika", content }),
+    undefined,
+    "create-public-suggestion",
+  );
+  if (approval) {
+    await f.drain();
+    assert.equal(
+      f.calls.some(
+        (call) => call.method === "POST" && call.route === `/channels/${suggestionId}/messages`,
+      ),
+      false,
+    );
+    assert.ok(
+      f.calls
+        .filter((call) => call.method === "POST" && call.route.endsWith("/messages"))
+        .every((call) => !call.body.components?.length),
+    );
+    await f.request(
+      staffId,
+      "cases.approve",
+      { revision: saved.case.revision },
+      saved.case.id,
+      "approve-suggestion",
+    );
+  }
+  await f.drain();
+  const published = f.calls.find(
+    (call) => call.method === "POST" && call.route === `/channels/${suggestionId}/messages`,
+  );
+  assert.ok(published);
+  const buttons = Object.fromEntries(
+    published.body.components
+      .flatMap((row) => row.components)
+      .map((button) => [button.label, button.custom_id]),
+  );
+  assert.deepEqual(Object.keys(buttons), ["Za", "Przeciw", "Wycofaj głos", "Szczegóły"]);
+  return { caseId: saved.case.id, published, buttons };
+}
+
+test("published public suggestion buttons let an ordinary member vote, change, withdraw and read after restart", async (t) => {
+  const f = await fixture(t),
+    { caseId, published, buttons } = await publishSuggestion(f, {
+      content: "@everyone <@&700000000000000011> " + "Opis pomysłu. ".repeat(280),
+    });
+  assert.ok(published.body.content.length <= 2000);
+  assert.deepEqual(published.body.allowed_mentions, {
+    parse: [],
+    roles: [],
+    users: [],
+    replied_user: false,
+  });
+  const sends = f.calls.filter((call) => call.method === "POST").length;
+  const voted = await clickCaseButton(f, buttons.Za);
+  assert.match(voted.last(), /Twój głos: za/);
+  assert.equal(
+    f.store.db
+      .prepare("SELECT value FROM case_votes WHERE case_id=? AND user_id=?")
+      .get(caseId, otherId).value,
+    1,
+  );
+  await f.restart();
+  await communityInteraction(f.runtime, voted.interaction);
+  assert.equal(
+    f.store.db.prepare("SELECT votes_revision FROM cases WHERE id=?").get(caseId).votes_revision,
+    1,
+  );
+  const changed = await clickCaseButton(f, buttons.Przeciw);
+  assert.match(changed.last(), /Twój głos: przeciw/);
+  assert.equal(
+    f.store.db
+      .prepare("SELECT value FROM case_votes WHERE case_id=? AND user_id=?")
+      .get(caseId, otherId).value,
+    -1,
+  );
+  const withdrawn = await clickCaseButton(f, buttons["Wycofaj głos"]);
+  assert.match(withdrawn.last(), /Twój głos: wycofany/);
+  assert.equal(
+    f.store.db.prepare("SELECT COUNT(*) AS n FROM case_votes WHERE case_id=?").get(caseId).n,
+    0,
+  );
+  const detail = await clickCaseButton(f, buttons["Szczegóły"]);
+  assert.ok(detail.last().includes(caseId));
+  assert.match(detail.last(), /Głosy za: 0. Przeciw: 0/);
+  assert.equal(
+    f.store.db.prepare("SELECT votes_revision FROM cases WHERE id=?").get(caseId).votes_revision,
+    3,
+  );
+  await f.drain();
+  assert.equal(f.calls.filter((call) => call.method === "POST").length, sends);
+});
+
+test("public-by-configuration suggestions publish the same actionable buttons without a private approval step", async (t) => {
+  const f = await fixture(t),
+    { buttons } = await publishSuggestion(f, { approval: false });
+  assert.match((await clickCaseButton(f, buttons.Za)).last(), /Twój głos: za/);
+});
+
+test("private reports and questions never publish public voting buttons", async (t) => {
+  const f = await fixture(t);
+  for (const kind of ["report", "question"])
+    await f.request(userId, "cases.create", f.case({ kind }), undefined, `private-${kind}`);
+  await f.drain();
+  const messages = f.calls.filter(
+    (call) => call.method === "POST" && call.route.endsWith("/messages"),
+  );
+  assert.equal(messages.length, 2);
+  assert.ok(messages.every((call) => !call.body.components?.length));
+  assert.ok(messages.every((call) => call.route !== `/channels/${suggestionId}/messages`));
+});
+
+for (const gate of [
+  "module-off",
+  "beta-off",
+  "voting-off",
+  "closed",
+  "pending",
+  "timed-out",
+  "left",
+  "other-guild",
+  "private-id",
+  "missing-id",
+])
+  test(`published suggestion vote buttons cannot bypass ${gate}`, async (t) => {
+    const fixtureOptions = { beta: true },
+      f = await fixture(t, fixtureOptions),
+      { caseId, buttons } = await publishSuggestion(f);
+    let customId = buttons.Za,
+      options = {};
+    if (gate === "module-off" || gate === "voting-off") {
+      const settings = f.runtime.settings.read();
+      f.runtime.settings.save(
+        {
+          ...settings,
+          enabled: { ...settings.enabled, cases: gate !== "module-off" },
+          cases: {
+            ...settings.cases,
+            voting: { ...settings.cases.voting, enabled: gate !== "voting-off" },
+          },
+        },
+        ownerId,
+      );
+    } else if (gate === "beta-off") {
+      fixtureOptions.beta = false;
+      await f.restart();
+    } else if (gate === "closed") {
+      const detail = await f.request(staffId, "cases.read", {}, caseId);
+      await f.request(
+        staffId,
+        "cases.transition",
+        { revision: detail.case.revision, status: "accepted", reason: "Przyjęto do realizacji." },
+        caseId,
+        "close-voting",
+      );
+    } else if (gate === "pending") f.people.get(otherId).pending = true;
+    else if (gate === "timed-out") f.people.get(otherId).timedOut = true;
+    else if (gate === "left") f.people.delete(otherId);
+    else if (gate === "other-guild") options = { guildId: "799999999999999999" };
+    else if (gate === "missing-id") customId = customId.replace(caseId, randomUUID());
+    else {
+      const saved = await f.request(
+        userId,
+        "cases.create",
+        f.case({ title: "PRIVATE_TITLE" }),
+        undefined,
+        "private-target",
+      );
+      customId = customId.replace(caseId, saved.case.id);
+    }
+    const sends = f.calls.filter((call) => call.method === "POST").length,
+      result = await clickCaseButton(f, customId, options);
+    assert.doesNotMatch(result.last(), /Twój głos: za|PRIVATE_TITLE|PRIVATE_BODY/);
+    assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM case_votes").get().n, 0);
+    assert.equal(
+      f.store.db.prepare("SELECT votes_revision FROM cases WHERE id=?").get(caseId).votes_revision,
+      0,
+    );
+    assert.equal(f.calls.filter((call) => call.method === "POST").length, sends);
+  });
 
 test("beta and explicit implementation gates keep unavailable modules from operating", async (t) => {
   const f = await fixture(t, { beta: false });
