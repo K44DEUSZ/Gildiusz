@@ -104,6 +104,7 @@ test("actual shutdown waits for pending Store opens and deletion queue cleanup b
       },
     ),
     timer: undefined,
+    observations: { close: () => events.push("observations_closed") },
     controlServer: undefined,
     twitch: undefined,
     twitchIngress: undefined,
@@ -141,18 +142,23 @@ test("actual shutdown waits for pending Store opens and deletion queue cleanup b
   });
   await new Promise(setImmediate);
   assert.equal(finished, false);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, ["observations_closed"]);
   lease.resolve(async () => {
     events.push("guild_lease_released");
   });
   await rejected;
   await new Promise(setImmediate);
   assert.equal(finished, false);
-  assert.deepEqual(events, ["guild_lease_released", "deletion_drain_started"]);
+  assert.deepEqual(events, [
+    "observations_closed",
+    "guild_lease_released",
+    "deletion_drain_started",
+  ]);
   deletion.resolve();
   await shutdown;
   assert.equal(writes, 0);
   assert.deepEqual(events, [
+    "observations_closed",
     "guild_lease_released",
     "deletion_drain_started",
     "deletion_drained",

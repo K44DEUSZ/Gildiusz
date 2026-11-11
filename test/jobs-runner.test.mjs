@@ -41,6 +41,46 @@ function deferred() {
   });
   return { promise, resolve };
 }
+
+test("runner queue observation aggregates only counters, includes unavailable guilds and never executes or recovers", async (t) => {
+  const f = fixture(t, 3);
+  const first = f.add(0),
+    second = f.add(1);
+  f.sources[1].available = () => false;
+  const broken = f.sources[2].store;
+  broken.db.close();
+  t.mock.method(broken.db, "close", () => {});
+  let executions = 0;
+  const runner = new JobRunner(
+    () => f.sources,
+    async () => {
+      executions++;
+      return { state: "succeeded" };
+    },
+    { clock: f.clock },
+  );
+  t.after(() => runner.stop());
+  await runner.suspendGuild(guilds[0]);
+  f.advance(700);
+  const observed = runner.observeQueues();
+  assert.deepEqual(observed, {
+    scope: "registered_guild_runtimes",
+    observedGuilds: 2,
+    failedGuilds: 1,
+    unavailableGuilds: 1,
+    pausedGuilds: 1,
+    due: 2,
+    deferredRetries: 0,
+    running: 0,
+    unknown: 0,
+    oldestOverdueMs: 700,
+  });
+  assert.equal(executions, 0);
+  assert.equal(f.sources[0].store.get(first.id).state, "pending");
+  assert.equal(f.sources[1].store.get(second.id).state, "pending");
+  assert.ok(!JSON.stringify(observed).includes(guilds[0]));
+  assert.ok(!JSON.stringify(observed).includes(first.id));
+});
 const publication = (guildId = guilds[0]) => ({
   guildId,
   channelId,

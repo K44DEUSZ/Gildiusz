@@ -58,6 +58,90 @@ function fixture(t) {
 
 const code = (expected) => (error) => error instanceof JobError && error.code === expected;
 
+test("queue observation excludes future work, cooldowns, expiry and known deliveries without changing stored state", (t) => {
+  const f = fixture(t);
+  const lease = (key) => {
+    f.jobs.enqueue(input(key, { type: key }));
+    return f.jobs.claim({ types: [key] })[0];
+  };
+  const retry = lease("ready-retry");
+  f.jobs.retry(retry.id, retry.leaseToken, { at: 9000, error: "retry" });
+  const cooldown = lease("cooldown");
+  f.jobs.beginAttempt(cooldown.id, cooldown.leaseToken);
+  f.jobs.retry(cooldown.id, cooldown.leaseToken, {
+    at: 11000,
+    error: "rate_limited",
+    rateLimited: true,
+  });
+  const failed = lease("failed");
+  f.jobs.fail(failed.id, failed.leaseToken, "failed");
+  const unknown = lease("unknown");
+  f.jobs.unknown(unknown.id, unknown.leaseToken, "uncertain");
+  const succeeded = lease("succeeded");
+  f.jobs.complete(succeeded.id, succeeded.leaseToken);
+  const running = lease("running");
+  const receipt = lease("late-receipt-observation");
+  f.jobs.beginAttempt(receipt.id, receipt.leaseToken);
+  const uncertain = f.jobs.unknown(receipt.id, receipt.leaseToken, "uncertain");
+  f.jobs.reconcile(receipt.id, uncertain.revision, {
+    outcome: "retry",
+    at: 1000,
+    notDelivered: true,
+  });
+  f.jobs.recordReceipt(receipt.id, receipt.leaseToken, { messageId: "confirmed" });
+  const cancelled = f.jobs.enqueue(input("cancelled-observation"));
+  f.jobs.cancel(cancelled.id);
+  const expired = f.jobs.enqueue(input("expired-observation", { expiresAt: 1100 }));
+  f.jobs.enqueue(input("future-observation", { dueAt: 12000 }));
+  f.jobs.enqueue(input("due-observation", { dueAt: 8000 }));
+  f.setNow(10000);
+  const before = f.jobs.list({ limit: 100 }, { includeRetired: true }),
+    attempts = f.store.db.prepare("SELECT * FROM delivery_attempts ORDER BY id").all(),
+    changes = f.store.db.prepare("SELECT total_changes() AS n").get().n;
+  assert.deepEqual(f.jobs.observeQueue(guildId), {
+    due: 2,
+    deferredRetries: 1,
+    running: 1,
+    unknown: 1,
+    oldestOverdueMs: 2000,
+  });
+  assert.deepEqual(f.jobs.list({ limit: 100 }, { includeRetired: true }), before);
+  assert.deepEqual(
+    f.store.db.prepare("SELECT * FROM delivery_attempts ORDER BY id").all(),
+    attempts,
+  );
+  assert.equal(f.store.db.prepare("SELECT total_changes() AS n").get().n, changes);
+  assert.equal(f.jobs.get(expired.id).state, "pending");
+  assert.equal(f.jobs.get(running.id).state, "running");
+  assert.deepEqual(f.jobs.observeQueue("100000000000000099"), {
+    due: 0,
+    deferredRetries: 0,
+    running: 0,
+    unknown: 0,
+    oldestOverdueMs: null,
+  });
+});
+
+test("queue overdue age begins after the retry eligibility time, rather than the original due time", (t) => {
+  const f = fixture(t);
+  f.jobs.enqueue(input("age-retry"));
+  const [leased] = f.jobs.claim();
+  f.jobs.retry(leased.id, leased.leaseToken, { at: 5000, error: "backoff", rateLimited: true });
+  f.setNow(4999);
+  assert.deepEqual(f.jobs.observeQueue(guildId), {
+    due: 0,
+    deferredRetries: 1,
+    running: 0,
+    unknown: 0,
+    oldestOverdueMs: null,
+  });
+  f.setNow(5000);
+  assert.equal(f.jobs.observeQueue(guildId).oldestOverdueMs, 0);
+  f.setNow(5500);
+  assert.equal(f.jobs.observeQueue(guildId).oldestOverdueMs, 500);
+  assert.throws(() => f.jobs.observeQueue(guildId, NaN), code("invalid_input"));
+});
+
 test("late receipts retain the old delivery fact without taking over the job", (t) => {
   const f = fixture(t);
   f.jobs.enqueue(input("late-receipt"));

@@ -1,5 +1,5 @@
 import { JobError, type JobLease } from "./types.js";
-import type { JobStore } from "./store.js";
+import type { JobQueueObservation, JobStore } from "./store.js";
 
 export interface JobSource {
   guildId: string;
@@ -29,6 +29,14 @@ export interface RunnerOptions {
   executionTimeoutMs?: number;
   stopTimeoutMs?: number;
   onError?: (code: string, jobId: string) => void;
+}
+
+export interface RunnerQueueObservation extends JobQueueObservation {
+  scope: "registered_guild_runtimes";
+  observedGuilds: number;
+  failedGuilds: number;
+  unavailableGuilds: number;
+  pausedGuilds: number;
 }
 
 function failureCode(error: unknown): string {
@@ -100,6 +108,41 @@ export class JobRunner {
       bounded(this.options.intervalMs, 5000, 1, 3600000),
     );
     this.timer.unref();
+  }
+
+  /** Aggregate private counters only; observing never claims, recovers or executes a job. */
+  observeQueues(): RunnerQueueObservation {
+    const result: RunnerQueueObservation = {
+      scope: "registered_guild_runtimes",
+      observedGuilds: 0,
+      failedGuilds: 0,
+      unavailableGuilds: 0,
+      pausedGuilds: 0,
+      due: 0,
+      deferredRetries: 0,
+      running: 0,
+      unknown: 0,
+      oldestOverdueMs: null,
+    };
+    const now = this.clock();
+    for (const source of this.sources()) {
+      try {
+        const queue = source.store.observeQueue(source.guildId, now);
+        const unavailable = !source.available();
+        result.observedGuilds++;
+        if (unavailable) result.unavailableGuilds++;
+        if (this.suspended.has(source.guildId) || this.quarantined.has(source.guildId))
+          result.pausedGuilds++;
+        for (const key of ["due", "deferredRetries", "running", "unknown"] as const)
+          result[key] += queue[key];
+        if (queue.oldestOverdueMs !== null)
+          result.oldestOverdueMs = Math.max(result.oldestOverdueMs ?? 0, queue.oldestOverdueMs);
+      } catch {
+        // An unavailable source must not prevent the existing health signal being written.
+        result.failedGuilds++;
+      }
+    }
+    return result;
   }
 
   async tick(): Promise<number> {

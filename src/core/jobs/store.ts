@@ -20,6 +20,13 @@ export { JobError } from "./types.js";
 export type * from "./types.js";
 
 type Row = Record<string, unknown>;
+export interface JobQueueObservation {
+  due: number;
+  deferredRetries: number;
+  running: number;
+  unknown: number;
+  oldestOverdueMs: number | null;
+}
 const terminal = new Set<JobState>(["succeeded", "failed", "cancelled", "expired"]);
 const states = new Set<JobState>([...terminal, "pending", "running", "retry", "unknown"]);
 
@@ -246,6 +253,38 @@ export class JobStore {
       .prepare(`SELECT * FROM jobs ${where} ORDER BY created_at,id LIMIT ?`)
       .all(...values, integer(filter.limit ?? 100, 1, 500))
       .map(job);
+  }
+
+  /** Read-only eligibility counts; intentional retry waits are not overdue worker work. */
+  observeQueue(guildId: string, now = this.now()): JobQueueObservation {
+    text(guildId);
+    integer(now);
+    const eligible = `guild_id=? AND state IN ('pending','retry') AND due_at<=?
+      AND cancel_requested=0 AND (expires_at IS NULL OR expires_at>?)
+      AND NOT EXISTS(SELECT 1 FROM delivery_attempts a
+        WHERE a.job_id=jobs.id AND a.state='succeeded' AND a.message_id IS NOT NULL)`,
+      due = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count,MIN(MAX(due_at,next_attempt_at)) AS oldest
+          FROM jobs WHERE ${eligible} AND next_attempt_at<=?`,
+        )
+        .get(guildId, now, now, now)!,
+      deferred = this.db
+        .prepare(`SELECT COUNT(*) AS count FROM jobs WHERE ${eligible} AND next_attempt_at>?`)
+        .get(guildId, now, now, now)!,
+      states = this.db
+        .prepare(
+          `SELECT state,COUNT(*) AS count FROM jobs
+          WHERE guild_id=? AND state IN ('running','unknown') GROUP BY state`,
+        )
+        .all(guildId);
+    return {
+      due: Number(due.count),
+      deferredRetries: Number(deferred.count),
+      running: Number(states.find((row) => row.state === "running")?.count ?? 0),
+      unknown: Number(states.find((row) => row.state === "unknown")?.count ?? 0),
+      oldestOverdueMs: due.oldest === null ? null : Math.max(0, now - Number(due.oldest)),
+    };
   }
 
   claim(options: ClaimOptions = {}): JobLease[] {

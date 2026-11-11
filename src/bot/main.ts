@@ -74,6 +74,7 @@ import { AnnouncementAssetStore } from "../modules/announcement-assets/store.js"
 import { freshBotGuildPresence } from "./guild-presence.js";
 import { GuildActivity } from "./guild-activity.js";
 import { RetentionSchedule } from "./retention-schedule.js";
+import { RuntimeObservations } from "./runtime-observations.js";
 import { serverRulesInteraction } from "./server-rules-interactions.js";
 import { ServerRulesRetention } from "../modules/server-rules/retention.js";
 import {
@@ -636,6 +637,7 @@ async function main(): Promise<void> {
   }
   const available = (runtime: GuildRuntime) =>
     runtime.context.guild.available && client.isReady() && client.ws.status === 0;
+  let observations: RuntimeObservations | undefined;
   function health() {
     if (!ownsDataRoot) return;
     const guilds = registry.statuses(available);
@@ -653,6 +655,7 @@ async function main(): Promise<void> {
         rulesDeletionProof: { state: deletionProofState, code: deletionProofCode },
         guilds,
         updated: Date.now(),
+        observations: observations?.sample() ?? null,
       }) + "\n",
     );
   }
@@ -1206,6 +1209,7 @@ async function main(): Promise<void> {
     if (shutdown) return shutdown;
     stopping = true;
     clearInterval(timer);
+    observations?.close();
     controlServer?.close();
     twitch?.close();
     health();
@@ -1568,6 +1572,11 @@ async function main(): Promise<void> {
   try {
     releases.push(await acquireDataRootLease(dataRoot));
     ownsDataRoot = true;
+    try {
+      observations = new RuntimeObservations(() => jobRunner.observeQueues());
+    } catch {
+      // Optional measurements must not change readiness or lifecycle maintenance.
+    }
     assertRestoreStartupAllowed(dataRoot);
     assertSourcePreparationComplete(dataRoot);
     health();
