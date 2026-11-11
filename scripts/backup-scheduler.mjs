@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredSnapshot, recoveryCommand, recoveryCredentials } from "./recovery.mjs";
-import { deploymentPause, startSupervisor, stopSupervisor } from "./hosting.mjs";
+import { deploymentPause, startSupervisor, stopSupervisor, pendingUpgrade } from "./hosting.mjs";
 import { sealLatestDeletionProof, verifyLatestDeletionProof } from "./backup-proof.mjs";
 import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
 import { archiveIdentity, BackupCatalog, backupFailure, backupDayMs } from "./backup-catalog.mjs";
@@ -79,7 +79,15 @@ export async function runDailyBackup({
   revision = null,
   signal,
 }) {
-  await pruneCollectedDeletionProofs({ catalog, key, forbiddenKeys });
+  const pending = lifecyclePort.hasPendingUpgrade?.() ?? false;
+  if (typeof pending !== "boolean") backupFailure("backup_pending_reconciliation_required");
+  const pruned = await pruneCollectedDeletionProofs({ catalog, key, forbiddenKeys });
+  if (pending)
+    return {
+      state: "deferred_pending_upgrade",
+      retentionBlocked: pruned.blocked,
+      offsiteSuccess: false,
+    };
   const location = await catalog.inspectLocation();
   if (!location.complete) backupFailure("backup_reconciliation_required");
   const state = await catalog.read();
@@ -323,6 +331,24 @@ export async function verifyUpgradeCheckpoint(options) {
 export function hostingLifecycle(root, assertFence = () => {}) {
   const shared = privateDirectory(join(root, "shared"));
   return {
+    hasPendingUpgrade() {
+      assertFence();
+      try {
+        const stat = lstatSync(join(shared, "pending-upgrade.json"));
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1)
+          backupFailure("backup_pending_reconciliation_required");
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        backupFailure("backup_pending_reconciliation_required");
+      }
+      try {
+        // Presence alone does not certify a valid pause/checkpoint. Never treat corruption as absence.
+        if (!pendingUpgrade(root)) backupFailure("backup_pending_reconciliation_required");
+        return true;
+      } catch {
+        backupFailure("backup_pending_reconciliation_required");
+      }
+    },
     pause() {
       assertFence();
       const path = join(shared, "paused");
@@ -638,13 +664,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
           });
           fence();
           const rotation = await catalog.applyRotation(await catalog.planRotation());
+          const blocked = [
+            ...rotation.blocked,
+            ...(daily.retentionBlocked ? [{ code: "deletion_proof_reconciliation_required" }] : []),
+          ];
           return {
             ...daily,
-            state: rotation.state === "retention_blocked" ? "retention_blocked" : daily.state,
+            state:
+              rotation.state === "retention_blocked" || blocked.length
+                ? "retention_blocked"
+                : daily.state,
             backupState: daily.state,
             rotation,
             removed: rotation.removed,
-            blocked: rotation.blocked,
+            blocked,
           };
         },
       );
