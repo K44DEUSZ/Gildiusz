@@ -19,9 +19,11 @@ Uczestnicy korzystają z `/pokoj` i `/zglos`. Role do samodzielnego wyboru musz�
 
 ## Status projektu
 
-Gildiusz jest we wczesnej wersji. Strona i panel są rozwijane oddzielnie, a publiczne uruchomienie wspólnej usługi jest w przygotowaniu. W tym repozytorium znajduje się kod bota do własnego uruchomienia.
+[Strona Gildiusza](https://gildiusz.kaadeusz.pl) i [panel](https://gildiusz.kaadeusz.pl/panel) są już publicznie dostępne. Działają cztery podstawowe funkcje: pokoje głosowe, role za reakcje, filtr plików i przekazywanie zgłoszeń moderacji.
 
-Na gałęzi `test` sprawdzamy spotkania, zgłoszenia z historią i pomysły, ogłoszenia na termin, integrację Twitch oraz akceptację regulaminu z rolą członka. Udostępnienie tych funkcji we wspólnej usłudze wymaga jeszcze odbioru. Aktywność i rangi są planowane.
+Spotkania, zgłoszenia z historią i pomysły, ogłoszenia na termin oraz akceptacja regulaminu z rolą członka pozostają w ograniczonych testach. Nie są jeszcze gotowe do ogólnego udostępnienia. Integracja z Twitchem oraz aktywność i rangi są planowane.
+
+W tym repozytorium znajduje się otwarty kod bota do własnego uruchomienia.
 
 <details>
 <summary>Uruchom własną instancję</summary>

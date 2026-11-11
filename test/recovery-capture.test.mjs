@@ -99,6 +99,7 @@ async function capture(f) {
   // Independent operator receipt pins are retained before the source is removed.
   const { createHash } = await import("node:crypto");
   f.archiveHash = createHash("sha256").update(readFileSync(f.archivePath)).digest("hex");
+  assert.deepEqual(result.verificationRequirements, requirements(f, result));
   return { result, pins: requirements(f, result) };
 }
 
@@ -385,7 +386,10 @@ test("the actual CLI accepts capture flags, rejects duplicates and verifies afte
     { createHash } = await import("node:crypto");
   f.archiveHash = createHash("sha256").update(readFileSync(f.archivePath)).digest("hex");
   const requirementsPath = join(f.manual, "requirements.json");
-  writeFileSync(requirementsPath, JSON.stringify(requirements(f, receipt)), { mode: 0o600 });
+  assert.deepEqual(receipt.verificationRequirements, requirements(f, receipt));
+  writeFileSync(requirementsPath, JSON.stringify(receipt.verificationRequirements), {
+    mode: 0o600,
+  });
   rmSync(f.dataRoot, { recursive: true });
   const verified = run(
     ["verify-capture", "--capture", f.outputPath, "--requirements", requirementsPath],
@@ -398,7 +402,8 @@ test("the actual CLI accepts capture flags, rejects duplicates and verifies afte
   for (const output of [created.stdout, verified.stdout]) {
     assert.ok(!output.includes(credentials.BACKUP_ENCRYPTION_KEY));
     assert.ok(!output.includes('"journal"'));
-    assert.ok(!output.includes('"proof"'));
+    assert.equal(JSON.parse(output).proof, undefined);
+    assert.ok(!output.includes('"acceptances"'));
     assert.ok(!output.includes('"epoch"'));
   }
 });

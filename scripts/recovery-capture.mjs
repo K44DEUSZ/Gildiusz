@@ -272,6 +272,7 @@ export async function createRecoveryCapture(options) {
       createdAt: captured.meta.createdAt,
       expiresAt: captured.meta.expiresAt,
       sha256: hashFile(outputPath).sha256,
+      verificationRequirements: requirements,
       activationAllowed: false,
       writesAfterCaptureExcluded: false,
       automaticBackupScheduled: false,
