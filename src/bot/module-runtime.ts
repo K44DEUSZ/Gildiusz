@@ -294,6 +294,9 @@ export class ModuleRuntime {
           "announcements.read",
           "announcements.delivery.inspect",
           "announcements.delivery.resolve",
+          "announcements.pause",
+          "announcements.cancel",
+          "announcements.remove",
         );
       if (this.beta && this.settings.read().enabled.announcements)
         available.push(
@@ -301,10 +304,7 @@ export class ModuleRuntime {
           "announcements.update",
           "announcements.preview",
           "announcements.test",
-          "announcements.pause",
           "announcements.resume",
-          "announcements.cancel",
-          "announcements.remove",
         );
       if (this.beta && this.settings.read().enabled.announcements && this.announcementAssets)
         available.push("announcements.assets.upload", "announcements.assets.read");
@@ -573,6 +573,9 @@ export class ModuleRuntime {
         "announcements.read",
         "announcements.delivery.inspect",
         "announcements.delivery.resolve",
+        "announcements.pause",
+        "announcements.cancel",
+        "announcements.remove",
       ].includes(operation);
       if (!this.beta) throw new AnnouncementError("permission_revoked");
       if (!historical) this.requireAnnouncements();
@@ -793,7 +796,8 @@ export class ModuleRuntime {
 
   private async authorizeAnnouncement(request: AnnouncementAuthorization): Promise<void> {
     if (!this.beta) throw new AnnouncementError("permission_revoked");
-    if (!["read", "list"].includes(request.operation)) this.requireAnnouncements();
+    if (!["read", "list", "pause", "cancel", "remove"].includes(request.operation))
+      this.requireAnnouncements();
     let current: Awaited<ReturnType<typeof freshMember>>;
     try {
       current = await freshMember(this.context.guild, request.actorId);

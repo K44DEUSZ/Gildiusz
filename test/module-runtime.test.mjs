@@ -480,6 +480,9 @@ test("beta hides announcement support while module OFF keeps history resolution 
           "announcements.read",
           "announcements.delivery.inspect",
           "announcements.delivery.resolve",
+          "announcements.pause",
+          "announcements.cancel",
+          "announcements.remove",
         ].sort(),
       );
       assert.deepEqual(view.announcementReconciliation, { version: 1 });
@@ -491,6 +494,157 @@ test("beta hides announcement support while module OFF keeps history resolution 
   enabled.runtime.announcements.sync = () => calls++;
   enabled.runtime.sync();
   assert.equal(calls, 1);
+});
+
+test("OFF-safe pause, cancel and remove stop existing work without changing UNKNOWN evidence or enabling publication", async (t) => {
+  for (const operation of ["pause", "cancel", "remove"]) {
+    const f = fixture(t),
+      created = await f.create(`off-safe-${operation}`),
+      jobs = f.runtime.jobs;
+    const queued = jobs.enqueue({
+      guildId,
+      type: "announcement.send",
+      objectId: created.announcement.id,
+      generation: created.announcement.generation,
+      dueAt: Date.now() - 1,
+      payload: {
+        announcementId: created.announcement.id,
+        generation: created.announcement.generation,
+      },
+      dedupeKey: `off-unknown-${operation}`,
+    });
+    const [lease] = jobs.claim();
+    assert.equal(lease.id, queued.id);
+    jobs.beginAttempt(lease.id, lease.leaseToken, { channelId, nonce: "retained-unknown" });
+    jobs.unknown(lease.id, lease.leaseToken, "discord_delivery_unconfirmed");
+    const before = jobs.get(lease.id),
+      attempts = jobs.attempts(lease.id);
+    const settings = f.runtime.settings.read();
+    settings.enabled.announcements = false;
+    f.runtime.settings.save(settings, actorId);
+    const settingsBefore = f.runtime.settings.read();
+    // Safe cleanup cannot depend on still being able to read or send to the old target.
+    f.state.channelError = Object.assign(Error("deleted channel"), { code: 10003 });
+    f.state.memberChannelFlags = 0n;
+    f.state.botChannelFlags = 0n;
+    const requestId = `off-safe-${operation}-request`,
+      payload = { revision: created.announcement.revision },
+      result = await f.runtime.request(
+        f.facts(),
+        `announcements.${operation}`,
+        payload,
+        created.announcement.id,
+        requestId,
+      );
+    assert.deepEqual(
+      await f.runtime.request(
+        f.facts(),
+        `announcements.${operation}`,
+        payload,
+        created.announcement.id,
+        requestId,
+      ),
+      result,
+    );
+    assert.equal(jobs.get(created.job.id).state, "cancelled");
+    const unknown = jobs.get(lease.id);
+    assert.equal(unknown.state, "unknown");
+    assert.equal(unknown.cancelRequested, true);
+    assert.equal(unknown.messageId, before.messageId);
+    assert.deepEqual(unknown.result, before.result);
+    assert.deepEqual(unknown.payload, before.payload);
+    assert.deepEqual(jobs.attempts(lease.id), attempts);
+    assert.equal(jobs.list().length, 2);
+    assert.equal(jobs.claim().length, 0);
+    assert.deepEqual(f.runtime.settings.read(), settingsBefore);
+    assert.equal(f.sent.length, 0);
+    if (operation === "remove") {
+      assert.equal(result.removed, true);
+      assert.equal(
+        jobs.db.prepare("SELECT content FROM announcements WHERE id=?").get(created.announcement.id)
+          .content,
+        "",
+      );
+    } else assert.equal(result.announcement.status, operation === "pause" ? "paused" : "cancelled");
+  }
+});
+
+test("OFF-safe cleanup still rejects stale revisions and revoked fresh roles despite cached administrator claims", async (t) => {
+  for (const operation of ["pause", "cancel", "remove"]) {
+    const f = fixture(t),
+      created = await f.create(`off-guard-${operation}`);
+    f.runtime.settings.save(
+      {
+        ...f.runtime.settings.read(),
+        enabled: { ...f.runtime.settings.read().enabled, announcements: false },
+      },
+      actorId,
+    );
+    const before = f.runtime.jobs.db
+      .prepare("SELECT * FROM announcements WHERE id=?")
+      .get(created.announcement.id);
+    await assert.rejects(
+      () =>
+        f.runtime.request(
+          f.facts(),
+          `announcements.${operation}`,
+          { revision: created.announcement.revision + 1 },
+          created.announcement.id,
+          `off-stale-${operation}`,
+        ),
+      isControl(409, "revision_conflict"),
+    );
+    f.state.roleIds = [];
+    await assert.rejects(
+      () =>
+        f.runtime.request(
+          f.admin(),
+          `announcements.${operation}`,
+          { revision: created.announcement.revision },
+          created.announcement.id,
+          `off-revoked-${operation}`,
+        ),
+      isControl(403, "permission_revoked"),
+    );
+    assert.deepEqual(
+      f.runtime.jobs.db
+        .prepare("SELECT * FROM announcements WHERE id=?")
+        .get(created.announcement.id),
+      before,
+    );
+    assert.equal(f.sent.length, 0);
+  }
+});
+
+test("OFF still refuses outgoing announcement actions and Beta OFF refuses even safe cleanup", async (t) => {
+  const f = fixture(t, { enabled: false });
+  for (const operation of ["create", "update", "preview", "test", "resume", "assets.upload"])
+    await assert.rejects(
+      () =>
+        f.runtime.request(
+          f.facts(),
+          `announcements.${operation}`,
+          {},
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          `off-outgoing-${operation}`,
+        ),
+      isControl(403, "permission_revoked"),
+    );
+  assert.equal(f.runtime.jobs.list().length, 0);
+  assert.equal(f.sent.length, 0);
+  const unavailable = fixture(t, { beta: false });
+  for (const operation of ["pause", "cancel", "remove"])
+    await assert.rejects(
+      () =>
+        unavailable.runtime.request(
+          unavailable.facts(),
+          `announcements.${operation}`,
+          { revision: 1 },
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          `no-beta-${operation}`,
+        ),
+      isControl(403, "permission_revoked"),
+    );
 });
 
 test("raw job authorization precedes lookup and admin responses strip private execution data", async (t) => {
