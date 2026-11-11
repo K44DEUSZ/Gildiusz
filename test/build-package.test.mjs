@@ -28,6 +28,7 @@ import {
 } from "../scripts/hosting.mjs";
 import {
   assertRuntimePackage,
+  assertBackupTransportRuntime,
   validateRuntimeTree,
   smokeRuntime,
   retiredAudioFiles,
@@ -56,6 +57,8 @@ test(
       const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
       prepareRuntimePackage(root, directory, { offline: true });
       assert.ok(existsSync(join(directory, "dist/modules/announcement-assets/decode-worker.js")));
+      for (const name of ["scripts/backup-relay.mjs", "scripts/backup-pc.mjs"])
+        assert.ok(existsSync(join(directory, name)), name);
       assert.ok(
         existsSync(join(directory, "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm")),
       );
@@ -74,6 +77,14 @@ test(
       for (const name of retiredAudioFiles) {
         assert.equal(existsSync(join(directory, name)), false, name);
         assert.equal(existsSync(join(directory, name + ".map")), false, name);
+      }
+      for (const name of ["scripts/backup-relay.mjs", "scripts/backup-pc.mjs"]) {
+        const path = join(directory, name),
+          source = readFileSync(path);
+        unlinkSync(path);
+        assertRuntimePackage(directory, { format: 6 });
+        assert.throws(() => smokeRuntime(directory), /Missing runtime file: scripts\/backup-/);
+        writeFileSync(path, source, { mode: 0o600 });
       }
       unlinkSync(join(directory, "dist/modules/announcement-assets/decode-worker.js"));
       assert.throws(() => assertRuntimePackage(directory));
@@ -249,6 +260,17 @@ test("format2 retains its historical requirements while format3 gates every back
     writeFileSync(join(release, "build.json"), JSON.stringify({ runtimeFormat: 6 }));
     assert.throws(() => assertUpdateRuntime(release), /Withdrawn audio file/);
     for (const name of retiredAudioFiles) unlinkSync(join(release, name));
+    assertUpdateRuntime(release);
+    // Old format6 candidates remain installable without the later optional operator transport.
+    assert.equal(existsSync(join(release, "scripts/backup-relay.mjs")), false);
+    assert.equal(existsSync(join(release, "scripts/backup-pc.mjs")), false);
+    assert.throws(() => assertBackupTransportRuntime(release), /backup-relay\.mjs/);
+    writeFileSync(join(release, "scripts/backup-relay.mjs"), "transport");
+    assert.throws(() => assertBackupTransportRuntime(release), /backup-pc\.mjs/);
+    writeFileSync(join(release, "scripts/backup-pc.mjs"), "transport");
+    assertBackupTransportRuntime(release);
+    for (const name of ["scripts/backup-relay.mjs", "scripts/backup-pc.mjs"])
+      unlinkSync(join(release, name));
     assertUpdateRuntime(release);
     assert.throws(() => assertRuntimePackage(release, { format: 5 }), /Missing runtime file/);
     for (const name of [...format5, ...format6]) {

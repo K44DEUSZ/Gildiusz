@@ -142,6 +142,7 @@ export const requiredRuntimeFiles = [
   "scripts/prepare-legacy-source.mjs",
   "scripts/backup-offsite.mjs",
 ];
+export const requiredBackupTransportFiles = ["scripts/backup-relay.mjs", "scripts/backup-pc.mjs"];
 export function assertRuntimePackage(directory, { format = 6 } = {}) {
   if (![1, 2, 3, 4, 5, 6].includes(format)) throw Error("Unsupported runtime package format.");
   const files =
@@ -160,6 +161,9 @@ export function assertRuntimePackage(directory, { format = 6 } = {}) {
     for (const name of retiredAudioFiles)
       if (existsSync(join(directory, name)))
         throw Error(`Withdrawn audio file in the runtime package: ${name}`);
+  assertRuntimeFiles(directory, files);
+}
+function assertRuntimeFiles(directory, files) {
   for (const name of files) {
     const path = join(directory, name);
     if (!existsSync(path)) throw Error(`Missing runtime file: ${name}`);
@@ -168,11 +172,17 @@ export function assertRuntimePackage(directory, { format = 6 } = {}) {
       throw Error(`Invalid runtime file: ${name}`);
   }
 }
-export function smokeRuntime(directory) {
+/** Current builds include these operator ports; historical format6 releases predate them. */
+export function assertBackupTransportRuntime(directory) {
   assertRuntimePackage(directory);
+  assertRuntimeFiles(directory, requiredBackupTransportFiles);
+}
+export function smokeRuntime(directory) {
+  assertBackupTransportRuntime(directory);
   // This exercises packaged JS -> worker -> local WASM without tokens, databases or Discord.
   const source =
     'await import("./scripts/recovery-deletions.mjs");await import("./scripts/backup-deletion-state.mjs");await import("./scripts/rules-deletion-lifecycle.mjs");await import("./scripts/prepare-legacy-source.mjs");await import("./scripts/backup-offsite.mjs");await import("./dist/storage/rules-deletion-lifecycle.js");' +
+    'const{backupProtocol}=await import("./scripts/backup-relay.mjs");const{collectPcBackupOffer}=await import("./scripts/backup-pc.mjs");if(backupProtocol!=="gildiusz-backup-v1"||typeof collectPcBackupOffer!=="function")throw Error("Missing packaged transport ports");' +
     'const{planBackupRotation}=await import("./scripts/backup-catalog.mjs");const{planDailyBackup}=await import("./scripts/backup-scheduler.mjs");await import("./scripts/backup-collector.mjs");await import("./scripts/backup-ledger.mjs");if(planBackupRotation([],{now:0}).remove.length||!planDailyBackup([],0).due)throw Error("Unexpected packaged backup ports");' +
     'import{validateImage}from"./dist/modules/announcement-assets/validate.js";const bytes=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP8AAP8FAAH/+lyI0QAAAABJRU5ErkJggg==","base64");const value=await validateImage(bytes,"image/png");if(value.width!==1||value.height!==1)throw Error("Unexpected packaged decoder result");';
   const environment = { NODE_ENV: "production", TZ: "Europe/Warsaw" };

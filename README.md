@@ -47,6 +47,8 @@ npm run cli -- apply --file reports/deployment-plan.json --approve HASH_Z_PLANU
 
 Bot nie potrzebuje Administratora. Sprawdź jego uprawnienia i hierarchię ról. Baza wymaga trwałego dysku i jednej działającej instancji procesu. Po przygotowaniu serwera uruchom `npm start`. Dostępny jest też `docker compose up -d`.
 
+Operator może osobno skonfigurować `scripts/backup-relay.mjs serve ROOT` jako ograniczone polecenie nowego klucza SSH oraz `scripts/backup-pc.mjs CONFIG` jako jednorazowy odbiornik na Windows. Odbiornik wymaga istniejącego, przypiętego katalogu PC i osobnego klucza szyfrowania; nie instaluje dostępu ani harmonogramu. Przesyła tylko wskazaną zaszyfrowaną kopię i proof. Aktualizacja korzysta z dotychczasowego podpisanego potwierdzenia PC, a kopia dzienna potwierdza lokalny zapis na PC bez zmiany hostowego `offsiteSuccess: false`. Przeterminowany lub zmieniony punkt aktualizacji wymaga obsługi operatora.
+
 </details>
 
 ## Problemy i licencja

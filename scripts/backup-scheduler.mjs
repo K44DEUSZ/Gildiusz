@@ -1,11 +1,17 @@
 import { closeSync, existsSync, lstatSync, openSync, readSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredSnapshot, recoveryCommand, recoveryCredentials } from "./recovery.mjs";
-import { deploymentPause, startSupervisor, stopSupervisor, pendingUpgrade } from "./hosting.mjs";
+import {
+  deploymentPause,
+  startSupervisor,
+  stopSupervisor,
+  pendingUpgrade,
+  offsiteLocation,
+} from "./hosting.mjs";
 import { sealLatestDeletionProof, verifyLatestDeletionProof } from "./backup-proof.mjs";
 import { privateDirectory, regularFile, syncDirectory } from "../dist/storage/recovery/files.js";
 import { archiveIdentity, BackupCatalog, backupFailure, backupDayMs } from "./backup-catalog.mjs";
@@ -19,6 +25,7 @@ import {
   verifyOffsiteAck,
   readOffsiteFile,
   writeOffsiteFile,
+  validateDailyOffsiteOffer,
 } from "./backup-offsite.mjs";
 import { readDeletionState } from "./backup-deletion-state.mjs";
 
@@ -78,6 +85,7 @@ export async function runDailyBackup({
   forbiddenKeys,
   revision = null,
   signal,
+  dailyOffsite,
 }) {
   const pending = lifecyclePort.hasPendingUpgrade?.() ?? false;
   if (typeof pending !== "boolean") backupFailure("backup_pending_reconciliation_required");
@@ -88,6 +96,15 @@ export async function runDailyBackup({
       retentionBlocked: pruned.blocked,
       offsiteSuccess: false,
     };
+  if (
+    dailyOffsite &&
+    (typeof dailyOffsite.path !== "string" ||
+      !isAbsolute(dailyOffsite.path) ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
+        dailyOffsite.destinationLocationId,
+      ))
+  )
+    backupFailure("invalid_backup_options");
   const location = await catalog.inspectLocation();
   if (!location.complete) backupFailure("backup_reconciliation_required");
   const state = await catalog.read();
@@ -116,6 +133,33 @@ export async function runDailyBackup({
   // This is an owned temporary capture, not a second retained archive tier.
   rmSync(outputPath);
   syncDirectory(catalog.captures);
+  if (dailyOffsite) {
+    if (sealed.sealedLedger.meta?.format !== 2) backupFailure("source_requires_v2");
+    const meta = sealed.sealedLedger.meta,
+      requirements = sealed.sealedLedger.proofRequirements;
+    const offer = validateDailyOffsiteOffer(
+      {
+        format: 1,
+        kind: "gildiusz-daily-offsite-offer",
+        backup: Object.fromEntries(
+          ["id", "createdAt", "size", "sha256"].map((k) => [k, collected.entry[k]]),
+        ),
+        sourceLocationId: collected.entry.locationId,
+        destinationLocationId: dailyOffsite.destinationLocationId,
+        proof: {
+          ...Object.fromEntries(
+            ["id", "sha256", "sourceId", "sequence", "createdAt", "expiresAt", "coveredFrom"].map(
+              (k) => [k, meta[k]],
+            ),
+          ),
+          challenge: requirements.challenge,
+          notBefore: requirements.notBefore,
+        },
+      },
+      catalog.clock(),
+    );
+    writeOffsiteFile(resolve(dailyOffsite.path), Buffer.from(JSON.stringify(offer)));
+  }
   return { state: "verified", ...collected, offsiteSuccess: false, needsOffsite: true };
 }
 
@@ -661,6 +705,21 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             lifecyclePort: lifecycle,
             ...recoveryCredentials(process.env),
             revision: process.env.DEPLOYMENT_REVISION ?? null,
+            ...(existsSync(
+              join(resolve(process.env.BACKUP_HOSTING_ROOT), "shared/offsite-location.json"),
+            )
+              ? {
+                  dailyOffsite: {
+                    path: join(
+                      resolve(process.env.BACKUP_HOSTING_ROOT),
+                      "shared/offsite-daily-offer.json",
+                    ),
+                    destinationLocationId: offsiteLocation(
+                      resolve(process.env.BACKUP_HOSTING_ROOT),
+                    ),
+                  },
+                }
+              : {}),
           });
           fence();
           const rotation = await catalog.applyRotation(await catalog.planRotation());

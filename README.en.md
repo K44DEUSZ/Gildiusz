@@ -45,6 +45,8 @@ npm run cli -- apply --file reports/deployment-plan.json --approve HASH_FROM_PLA
 
 The bot does not need Administrator. Check permissions and role hierarchy, use persistent storage and run one worker instance. Start the prepared bot with `npm start`, or use `docker compose up -d`.
 
+An operator can separately configure `scripts/backup-relay.mjs serve ROOT` as the restricted forced command for a new SSH key and `scripts/backup-pc.mjs CONFIG` as a Windows run-once receiver. The receiver requires an existing pinned PC catalogue and a separate encryption key; it provisions neither access nor a schedule. Only the offered encrypted archive and proof are transferred. Upgrades use the existing signed PC acknowledgement; daily copies confirm local physical PC storage while the host's `offsiteSuccess: false` remains unchanged. An expired or changed upgrade checkpoint requires operator reconciliation.
+
 </details>
 
 ## Help and license

@@ -32,6 +32,7 @@ import { readDeletionState } from "./backup-deletion-state.mjs";
 import { recoveryCredentials } from "./recovery.mjs";
 import {
   validateOffsiteTransfer,
+  validateDailyOffsiteOffer,
   offsiteProofRequirements,
   sealOffsiteAck,
   readOffsiteFile,
@@ -477,7 +478,10 @@ export function verifyTransferProof({
   forbiddenKeys = [],
   now = Date.now(),
 }) {
-  transfer = validateOffsiteTransfer(transfer, now);
+  transfer =
+    transfer?.kind === "gildiusz-daily-offsite-offer"
+      ? validateDailyOffsiteOffer(transfer, now)
+      : validateOffsiteTransfer(transfer, now);
   const value = verifyLatestDeletionProof({
     envelope,
     key,
@@ -506,6 +510,7 @@ export async function collectForOffsiteAck({
   key,
   forbiddenKeys = [],
   existingArchivePath,
+  fetchStream,
   signal,
 }) {
   transfer = validateOffsiteTransfer(transfer, catalog.clock());
@@ -523,6 +528,7 @@ export async function collectForOffsiteAck({
       catalog,
       expected: transfer.backup,
       existingArchivePath,
+      fetchStream,
       key: master,
       forbiddenKeys,
       latestProof: envelope,

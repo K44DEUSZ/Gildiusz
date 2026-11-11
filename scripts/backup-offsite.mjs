@@ -51,8 +51,36 @@ export function validateOffsiteTransfer(value, now = Date.now()) {
     value.sourceLocationId === value.destinationLocationId
   )
     fail("invalid_offsite_transfer");
+  validateArchiveAndProof(value.backup, value.proof, now);
   const b = value.backup,
     p = value.proof;
+  return {
+    format: 1,
+    kind: value.kind,
+    backup: { id: b.id, createdAt: b.createdAt, size: b.size, sha256: b.sha256 },
+    upgradeId: value.upgradeId,
+    targetRevision: value.targetRevision,
+    sourceLocationId: value.sourceLocationId,
+    destinationLocationId: value.destinationLocationId,
+    proof: proofFields(p),
+  };
+}
+function proofFields(p) {
+  return Object.fromEntries(
+    [
+      "id",
+      "sha256",
+      "sourceId",
+      "sequence",
+      "createdAt",
+      "expiresAt",
+      "coveredFrom",
+      "challenge",
+      "notBefore",
+    ].map((k) => [k, p[k]]),
+  );
+}
+function validateArchiveAndProof(b, p, now) {
   if (
     !exact(b, ["id", "createdAt", "size", "sha256"]) ||
     !uuid.test(b.id) ||
@@ -94,27 +122,36 @@ export function validateOffsiteTransfer(value, now = Date.now()) {
   )
     fail("invalid_offsite_transfer");
   if (now >= p.expiresAt) fail("offsite_proof_expired");
+}
+/** Metadata from an already sealed daily capture; this is not an upgrade or an ACK. */
+export function validateDailyOffsiteOffer(value, now = Date.now()) {
+  if (
+    !integer(now) ||
+    !exact(value, [
+      "format",
+      "kind",
+      "backup",
+      "sourceLocationId",
+      "destinationLocationId",
+      "proof",
+    ]) ||
+    value.format !== 1 ||
+    value.kind !== "gildiusz-daily-offsite-offer" ||
+    !uuid.test(value.sourceLocationId) ||
+    !uuid.test(value.destinationLocationId) ||
+    value.sourceLocationId === value.destinationLocationId
+  )
+    fail("invalid_offsite_transfer");
+  validateArchiveAndProof(value.backup, value.proof, now);
   return {
     format: 1,
     kind: value.kind,
-    backup: { id: b.id, createdAt: b.createdAt, size: b.size, sha256: b.sha256 },
-    upgradeId: value.upgradeId,
-    targetRevision: value.targetRevision,
+    backup: Object.fromEntries(
+      ["id", "createdAt", "size", "sha256"].map((k) => [k, value.backup[k]]),
+    ),
     sourceLocationId: value.sourceLocationId,
     destinationLocationId: value.destinationLocationId,
-    proof: Object.fromEntries(
-      [
-        "id",
-        "sha256",
-        "sourceId",
-        "sequence",
-        "createdAt",
-        "expiresAt",
-        "coveredFrom",
-        "challenge",
-        "notBefore",
-      ].map((k) => [k, p[k]]),
-    ),
+    proof: proofFields(value.proof),
   };
 }
 export function offsiteProofRequirements(transfer) {
