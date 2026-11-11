@@ -45,7 +45,7 @@ export function validatePackagePath(name) {
         ["restore-quarantine.json", "restore-manifest.json", "source-preparation.json"].includes(
           part.toLowerCase(),
         ) ||
-        /\.(?:gldbak|gldledger|gldproof)(?:$|[-.])/i.test(part) ||
+        /\.(?:gldbak|gldledger|gldproof|gldcapture)(?:$|[-.])/i.test(part) ||
         /\.(?:sqlite3?|db)(?:$|[-.])/i.test(part),
     ) ||
     !allowedRoots.has(parts[0])
@@ -189,6 +189,7 @@ export function smokeRuntime(directory) {
   const source =
     'const{inspectDeploymentState,assertSameDeploymentState}=await import("./scripts/deployment-state.mjs");const{readRulesDeletionLifecycleJournal}=await import("./dist/storage/rules-deletion-lifecycle.js");if(typeof inspectDeploymentState!=="function"||typeof assertSameDeploymentState!=="function"||typeof readRulesDeletionLifecycleJournal!=="function")throw Error("Missing packaged deployment ports");' +
     'await import("./scripts/recovery-deletions.mjs");await import("./scripts/backup-deletion-state.mjs");await import("./scripts/rules-deletion-lifecycle.mjs");await import("./scripts/prepare-legacy-source.mjs");await import("./scripts/backup-offsite.mjs");await import("./dist/storage/rules-deletion-lifecycle.js");' +
+    'const{recoveryCommand}=await import("./scripts/recovery.mjs");const{createRecoveryCapture,verifyRecoveryCapture}=await import("./scripts/recovery-capture.mjs");const{parseRulesDeletionLifecycleJournal}=await import("./dist/storage/rules-deletion-lifecycle.js");if([recoveryCommand,createRecoveryCapture,verifyRecoveryCapture,parseRulesDeletionLifecycleJournal].some(value=>typeof value!=="function"))throw Error("Missing packaged recovery capture ports");' +
     'const{backupProtocol}=await import("./scripts/backup-relay.mjs");const{collectPcBackupOffer}=await import("./scripts/backup-pc.mjs");if(backupProtocol!=="gildiusz-backup-v1"||typeof collectPcBackupOffer!=="function")throw Error("Missing packaged transport ports");' +
     'const{planBackupRotation}=await import("./scripts/backup-catalog.mjs");const{planDailyBackup}=await import("./scripts/backup-scheduler.mjs");await import("./scripts/backup-collector.mjs");await import("./scripts/backup-ledger.mjs");if(planBackupRotation([],{now:0}).remove.length||!planDailyBackup([],0).due)throw Error("Unexpected packaged backup ports");' +
     'import{validateImage}from"./dist/modules/announcement-assets/validate.js";const bytes=Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP8AAP8FAAH/+lyI0QAAAABJRU5ErkJggg==","base64");const value=await validateImage(bytes,"image/png");if(value.width!==1||value.height!==1)throw Error("Unexpected packaged decoder result");';

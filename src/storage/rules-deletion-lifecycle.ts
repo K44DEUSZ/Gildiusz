@@ -463,6 +463,11 @@ function validate(value: unknown): RulesDeletionLifecycleJournal {
   return j;
 }
 
+/** Validates an authenticated offline capture without claiming ownership of a live source. */
+export function parseRulesDeletionLifecycleJournal(value: unknown): RulesDeletionLifecycleJournal {
+  return validate(value);
+}
+
 /** Read-only optimistic observation; it does not establish ownership for mutations. */
 export function readRulesDeletionLifecycleJournal(dataRoot: string): RulesDeletionLifecycleJournal {
   const root = privateDirectory(resolve(dataRoot));

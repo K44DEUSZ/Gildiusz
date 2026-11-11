@@ -241,7 +241,7 @@ function decode(value, key, now, maxFutureMs) {
   }
 }
 /** Caller supplies the complete trusted installation inventory, not a client-selected guild list. */
-export async function sealLatestDeletionProof(options) {
+async function sealSourceProof(options, includeRecoveryJournal) {
   const {
     dataRoot,
     installations,
@@ -263,15 +263,18 @@ export async function sealLatestDeletionProof(options) {
     fail("invalid_input");
   const master = keyOf(key, forbiddenKeys);
   try {
-    const { sealRulesDeletionLifecycleSnapshot, pruneRulesDeletionLifecycle } =
-      await import("../dist/storage/rules-deletion-lifecycle.js");
+    const {
+      sealRulesDeletionLifecycleSnapshot,
+      pruneRulesDeletionLifecycle,
+      readRulesDeletionLifecycleJournal,
+    } = await import("../dist/storage/rules-deletion-lifecycle.js");
     await pruneRulesDeletionLifecycle({
       dataRoot,
       ...(givenNow === undefined ? {} : { now: readNow() }),
     });
     const sealed = await sealRulesDeletionLifecycleSnapshot(
       { dataRoot, installations, ...(givenNow === undefined ? {} : { now: readNow() }) },
-      (journal) => {
+      (journal, lockedRoot) => {
         if (!journal.complete || journal.blockers.length) fail("source_incomplete");
         const now = readNow();
         if (
@@ -302,7 +305,21 @@ export async function sealLatestDeletionProof(options) {
           acceptances: journal.entries,
         };
         validate(body, now, 0);
-        return encode(body, master);
+        const sealed = encode(body, master);
+        if (!includeRecoveryJournal) return sealed;
+        // Read inside the same root and guild leases as the sealed proof.
+        const recoveryJournal = readRulesDeletionLifecycleJournal(lockedRoot);
+        if (
+          recoveryJournal.sourceId !== body.sourceId ||
+          recoveryJournal.sequence !== body.sequence ||
+          recoveryJournal.coveredFrom !== body.coveredFrom ||
+          recoveryJournal.globalGap !== null ||
+          recoveryJournal.admitting.length ||
+          recoveryJournal.retiring.length ||
+          JSON.stringify(recoveryJournal.entries) !== JSON.stringify(body.acceptances)
+        )
+          fail("source_changed_during_capture");
+        return { ...sealed, recoveryJournal };
       },
     );
     if (readNow() >= sealed.meta.expiresAt) fail("expired_decision");
@@ -310,6 +327,13 @@ export async function sealLatestDeletionProof(options) {
   } finally {
     master.fill(0);
   }
+}
+export async function sealLatestDeletionProof(options) {
+  return sealSourceProof(options, false);
+}
+/** Operator-only private data. It is not a public status response or permission to resume a restore. */
+export async function captureLatestDeletionRecoveryState(options) {
+  return sealSourceProof(options, true);
 }
 export function verifyLatestDeletionProof({
   envelope,

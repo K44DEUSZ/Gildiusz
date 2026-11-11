@@ -12,6 +12,7 @@ import {
   snapshotSchemasUnchanged,
 } from "../dist/storage/recovery/index.js";
 import { reconcileRestoredDeletionData } from "./recovery-deletions.mjs";
+import { createRecoveryCapture, verifyRecoveryCapture } from "./recovery-capture.mjs";
 
 function privateSource(path) {
   const source = resolve(path);
@@ -183,6 +184,59 @@ export function configuredSnapshot(outputPath, values = process.env) {
 }
 
 export async function recoveryCommand(command, options, values = process.env, input) {
+  if (command === "capture") {
+    if (
+      !options.archive ||
+      !options.output ||
+      !options.challenge ||
+      Object.keys(options).some((name) => !["archive", "output", "challenge"].includes(name))
+    )
+      throw Error(
+        "Specify --archive, --output and --challenge for a manual stopped-source capture.",
+      );
+    const configured = configuredSnapshot(options.output, values);
+    return createRecoveryCapture({
+      dataRoot: configured.dataRoot,
+      installations: configured.guilds,
+      archivePath: privateSource(options.archive),
+      outputPath: resolve(options.output),
+      key: configured.key,
+      forbiddenKeys: configured.forbiddenKeys,
+      challenge: options.challenge,
+    });
+  }
+  if (command === "verify-capture") {
+    if (
+      !options.capture ||
+      !options.requirements ||
+      Object.keys(options).some((name) => !["capture", "requirements"].includes(name))
+    )
+      throw Error("Specify --capture and independently retained --requirements.");
+    const bytes = privateInput(options.requirements, 4096);
+    let requirements;
+    try {
+      requirements = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } finally {
+      bytes.fill(0);
+    }
+    const credentials = recoveryCredentials(values);
+    const { capture, meta } = verifyRecoveryCapture({
+      path: privateSource(options.capture),
+      requirements,
+      key: credentials.key,
+      forbiddenKeys: credentials.forbiddenKeys,
+    });
+    return {
+      state: "manual_recovery_capture_verified",
+      backupId: capture.archive.id,
+      sourceId: meta.sourceId,
+      sequence: meta.sequence,
+      capturedAt: meta.createdAt,
+      activeGuilds: capture.journal.active.length,
+      activationAllowed: false,
+      writesAfterCaptureExcluded: false,
+    };
+  }
   if (command === "reconcile-deletions") return reconcileDeletions(options, values);
   if (command === "restore") {
     if (!options.archive || !options.target)
@@ -212,7 +266,9 @@ export async function recoveryCommand(command, options, values = process.env, in
     return {
       compatible: await snapshotSchemasUnchanged(configuration, JSON.parse(input || "null")),
     };
-  throw Error("Expected plan, snapshot, restore, compatible or reconcile-deletions.");
+  throw Error(
+    "Expected plan, snapshot, restore, compatible, reconcile-deletions, capture or verify-capture.",
+  );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -237,7 +293,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const flags =
           command === "reconcile-deletions"
             ? ["--archive", "--target", "--proof", "--requirements", "--backup-id"]
-            : ["--output", "--archive", "--target"],
+            : command === "capture"
+              ? ["--archive", "--output", "--challenge"]
+              : command === "verify-capture"
+                ? ["--capture", "--requirements"]
+                : ["--output", "--archive", "--target"],
         name = flag === "--backup-id" ? "backupId" : flag.slice(2);
       if (!flags.includes(flag) || !value || options[name])
         throw Error("Invalid recovery options.");

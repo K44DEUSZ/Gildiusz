@@ -60,6 +60,14 @@ test(
       assert.ok(existsSync(join(directory, "dist/modules/announcement-assets/decode-worker.js")));
       for (const name of ["scripts/backup-relay.mjs", "scripts/backup-pc.mjs"])
         assert.ok(existsSync(join(directory, name)), name);
+      const capturePath = join(directory, "scripts/recovery-capture.mjs"),
+        captureSource = readFileSync(capturePath);
+      unlinkSync(capturePath);
+      // Historical format6 remains valid; a newly built package must load every current port.
+      assertRuntimePackage(directory, { format: 6 });
+      assert.throws(() => smokeRuntime(directory), /recovery-capture\.mjs/);
+      writeFileSync(capturePath, captureSource, { mode: 0o600 });
+      smokeRuntime(directory);
       assert.ok(
         existsSync(join(directory, "node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm")),
       );
@@ -106,6 +114,7 @@ test("package privacy validation blocks nested state and uploads inside an allow
       "node_modules/pkg/snapshot.gldbak",
       "node_modules/pkg/latest.gldledger",
       "node_modules/pkg/latest.gldproof",
+      "node_modules/pkg/private.gldcapture",
       "node_modules/pkg/rules-acceptance-deletions/journal.json",
       "config/restore-manifest.json",
       "config/restore-quarantine.json",
