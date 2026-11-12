@@ -444,6 +444,14 @@ test("shared live events enqueue once per binding and send current metadata thro
   await f.runtime.pump();
   assert.equal(f.targets.get(guildA).jobs.list().length, 1);
   assert.equal(f.targets.get(guildB).jobs.list().length, 1);
+  for (const guildId of [guildA, guildB]) {
+    const [job] = f.targets.get(guildId).jobs.list();
+    assert.deepEqual(job.payload, {
+      bindingId: job.objectId,
+      generation: job.generation,
+      stream: { id: "stream-one" },
+    });
+  }
   f.providerState.title = "Świeży tytuł przed wysyłką";
   await f.run();
   await f.run(guildB);

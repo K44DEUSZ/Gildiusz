@@ -121,9 +121,13 @@ export class TwitchDispatcher {
             dueAt: now,
             expiresAt: stream.startedAt + this.maxNotificationAgeMs,
             dedupeKey: `twitch:${digest({ bindingId: binding.id, streamId: stream.id })}`,
-            payload: this.publication(binding, stream),
+            payload: {
+              bindingId: binding.id,
+              generation: binding.generation,
+              stream: { id: stream.id },
+            },
           };
-          // Freeze the full cross-database enqueue input before calling the guild queue.
+          // Freeze the enqueue reference; publication content is refreshed at delivery.
           fanout = store.prepareFanout(binding, stream.id, job);
         }
         if (!binding.enabled || binding.removed || binding.generation !== fanout.job.generation) {

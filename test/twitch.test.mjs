@@ -12,6 +12,7 @@ import { EventSubReceiver } from "../dist/modules/twitch/webhook.js";
 import { TwitchDispatcher } from "../dist/modules/twitch/dispatcher.js";
 import { TwitchError } from "../dist/modules/twitch/types.js";
 import { JobStore } from "../dist/core/jobs/store.js";
+import { digest } from "../dist/shared/utils.js";
 
 const guildA = "100000000000000001",
   guildB = "100000000000000002",
@@ -420,12 +421,31 @@ test("one refreshed stream fans out into isolated per-guild queues and cannot pi
     const [job] = f.queue(guildId).list();
     assert.equal(job.guildId, guildId);
     assert.equal(job.type, "twitch.send");
-    assert.equal(job.payload.guildId, guildId);
-    assert.equal(job.payload.channelId, channelId);
-    assert.deepEqual(job.payload.roleIds, [roleId]);
-    assert.equal(job.payload.stream.title, "Tytuł z API");
-    assert.equal(job.payload.stream.url, "https://www.twitch.tv/twitchexample");
-    assert.ok(!job.payload.content.includes("Nie używaj mnie"));
+    const binding = guildId === guildA ? a : b;
+    assert.deepEqual(job.payload, {
+      bindingId: binding.id,
+      generation: binding.generation,
+      stream: { id: "stream-one" },
+    });
+    const [fanout] = f.hub.fanouts(binding.id);
+    assert.deepEqual(fanout.job.payload, job.payload);
+    for (const value of [JSON.stringify(job.payload), JSON.stringify(fanout.job)]) {
+      assert.ok(!value.includes("Tytuł z API"));
+      assert.ok(!value.includes("Twórca"));
+      assert.ok(!value.includes("static-cdn.jtvnw.net"));
+      assert.ok(!value.includes("Nie używaj mnie"));
+    }
+    const prepared = await dispatcher.prepareDelivery(
+      guildId,
+      binding.id,
+      binding.generation,
+      job.payload.stream.id,
+    );
+    assert.equal(prepared.channelId, channelId);
+    assert.deepEqual(prepared.roleIds, [roleId]);
+    assert.equal(prepared.stream.title, "Tytuł z API");
+    assert.equal(prepared.stream.url, "https://www.twitch.tv/twitchexample");
+    assert.ok(!prepared.content.includes("Nie używaj mnie"));
   }
   assert.equal(f.online().status, 204);
   assert.equal(f.online("same-stream-new-event").status, 204);
@@ -441,6 +461,54 @@ test("one refreshed stream fans out into isolated per-guild queues and cannot pi
   assert.equal(f.queue(guildB).list().length, 1);
   assert.equal(f.hub.fanouts(a.id).length, 1);
   assert.equal(f.hub.fanouts(b.id).length, 1);
+});
+
+test("legacy frozen publication payloads survive enqueue acknowledgement recovery without a second job", async (t) => {
+  for (const alreadyEnqueued of [false, true]) {
+    const f = fixture(t),
+      binding = await f.ready();
+    f.online();
+    const legacy = {
+      guildId: guildA,
+      type: "twitch.send",
+      objectId: binding.id,
+      generation: binding.generation,
+      dueAt: initialNow,
+      expiresAt: initialNow + 599000,
+      dedupeKey: `twitch:${digest({ bindingId: binding.id, streamId: "stream-one" })}`,
+      payload: {
+        bindingId: binding.id,
+        generation: binding.generation,
+        guildId: guildA,
+        actorId: actor,
+        channelId: channelA,
+        roleIds: [roleA],
+        mentionEveryone: false,
+        stream: { ...stream(), url: "https://www.twitch.tv/twitchexample" },
+        content: "Poprzedni zapisany tekst transmisji",
+      },
+    };
+    const fanout = f.hub.prepareFanout(binding, "stream-one", legacy),
+      prior = alreadyEnqueued ? f.queue(guildA).enqueue(legacy) : null;
+    f.setLive(stream(initialNow, { title: "Aktualny tytuł po wznowieniu" }));
+    const dispatcher = f.dispatcher();
+    assert.equal((await dispatcher.drain()).queued, 1);
+    const [job] = f.queue(guildA).list();
+    assert.equal(f.queue(guildA).list().length, 1);
+    if (prior) assert.equal(job.id, prior.id);
+    assert.deepEqual(job.payload, legacy.payload);
+    assert.deepEqual(f.hub.fanouts(binding.id)[0].job, legacy);
+    assert.equal(f.hub.fanouts(binding.id)[0].id, fanout.id);
+    assert.equal(f.hub.fanouts(binding.id)[0].state, "queued");
+    const prepared = await dispatcher.prepareDelivery(
+      guildA,
+      binding.id,
+      binding.generation,
+      "stream-one",
+    );
+    assert.match(prepared.content, /Aktualny tytuł po wznowieniu/);
+    assert.deepEqual(await dispatcher.drain(), { processed: 0, queued: 0, skipped: 0, failed: 0 });
+  }
 });
 
 test("one recipient's transient failure does not block another guild and is retried safely", async (t) => {

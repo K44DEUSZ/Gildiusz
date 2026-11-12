@@ -108,7 +108,11 @@ export interface TwitchPublication {
 }
 export interface TwitchJobInput extends JobInput {
   type: "twitch.send";
-  payload: TwitchPublication;
+  payload: {
+    bindingId: string;
+    generation: number;
+    stream: { id: string };
+  };
 }
 export interface TwitchFanout {
   id: string;
