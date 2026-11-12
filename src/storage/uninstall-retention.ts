@@ -14,6 +14,7 @@ import type { Store } from "./store.js";
 import type { GuildInstallation } from "../installations.js";
 import { transaction } from "./migrations.js";
 import { privateDirectory, regularFile, syncDirectory } from "./recovery/files.js";
+import { minimizeOrphanTwitchSource } from "../modules/twitch/store.js";
 
 export const guildUninstallRetentionMs = 30 * 86400000;
 export const uninstallResourceKey = "retention.guild-uninstalled";
@@ -651,10 +652,14 @@ export class GuildUninstallRetention {
 export function wipeGuildIntegrations(db: DatabaseSync, guildId: string): void {
   if (!snowflake(guildId)) throw new Error("Invalid retention guild.");
   transaction(db, () => {
+    const sources = db
+      .prepare("SELECT DISTINCT broadcaster_id FROM twitch_bindings WHERE guild_id=?")
+      .all(guildId);
     db.prepare(
       "DELETE FROM twitch_fanout WHERE binding_id IN (SELECT id FROM twitch_bindings WHERE guild_id=?)",
     ).run(guildId);
     db.prepare("DELETE FROM twitch_bindings WHERE guild_id=?").run(guildId);
     db.prepare("DELETE FROM twitch_mutations WHERE scope GLOB ?").run(`${guildId}:*`);
+    for (const source of sources) minimizeOrphanTwitchSource(db, String(source.broadcaster_id));
   });
 }

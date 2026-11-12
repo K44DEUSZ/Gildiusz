@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, backup } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { URL, URLSearchParams } from "node:url";
 import { TwitchHubStore } from "../dist/modules/twitch/store.js";
 import { EventSubReceiver, webhookSecretRef } from "../dist/modules/twitch/webhook.js";
 import { TwitchProvider, TwitchProviderError } from "../dist/modules/twitch/provider.js";
+import { wipeGuildIntegrations } from "../dist/storage/uninstall-retention.js";
 
 const guildA = "100000000000000001",
   guildB = "100000000000000002",
@@ -746,4 +750,505 @@ test("migration2 upgrades the existing hub without changing schema1 or storing c
     assert.ok(!value.includes(secret));
     assert.ok(!value.includes("synthetic-token"));
   }
+});
+
+test("guild purge preserves shared and removed bindings, then minimizes only the last source's inbox", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  const other = await f.ready(guildB),
+    provider = f.provider();
+  f.setPostMode("challenge-first");
+  await provider.reconcile();
+  const confirmed = f.db.prepare("SELECT * FROM twitch_inbox").get(),
+    envelope = JSON.parse(confirmed.envelope);
+  f.hub.accept({
+    ...envelope,
+    id: "pending-stream",
+    bodyHash: "pending-stream-hash",
+    messageType: "notification",
+    subscriptionStatus: "enabled",
+    streamId: "stream-one",
+    streamType: "live",
+    startedAt: f.now(),
+  });
+  f.hub.accept({
+    ...envelope,
+    id: "other-source",
+    bodyHash: "other-source-hash",
+    broadcasterId: "9999",
+    subscriptionId: "other-subscription",
+    messageType: "notification",
+  });
+  f.db
+    .prepare("INSERT INTO twitch_inbox VALUES (?,?,?,?,'ignored',?,?)")
+    .run("already-minimized", "old-hash", "{}", f.now(), '{"status":204,"body":""}', "unknown");
+  await f.hub.removeBinding(guildB, actorId, "remove-other", other.id, other.revision);
+  const before = f.db.prepare("SELECT * FROM twitch_inbox ORDER BY id").all(),
+    source = f.hub.source(broadcaster),
+    intents = f.hub.subscriptionIntents();
+  wipeGuildIntegrations(f.db, guildA);
+  assert.deepEqual(f.db.prepare("SELECT * FROM twitch_inbox ORDER BY id").all(), before);
+  assert.equal(f.hub.binding(other.id).removed, true);
+  assert.deepEqual(f.hub.subscriptionIntents(), intents);
+  assert.equal(f.hub.source(broadcaster).subscriptionId, source.subscriptionId);
+  wipeGuildIntegrations(f.db, guildB);
+  assert.equal(f.hub.sourceBindings(broadcaster).length, 0);
+  assert.deepEqual(f.hub.subscriptionIntents(), intents);
+  const reply = f.db.prepare("SELECT * FROM twitch_inbox WHERE id=?").get(confirmed.id);
+  assert.equal(reply.envelope, "{}");
+  assert.equal(reply.body_hash, confirmed.body_hash);
+  assert.equal(reply.response, confirmed.response);
+  assert.deepEqual(f.hub.accept(envelope), JSON.parse(confirmed.response));
+  assert.throws(() => f.hub.accept({ ...envelope, bodyHash: "changed" }), /message_collision/);
+  assert.equal(
+    f.db.prepare("SELECT state FROM twitch_inbox WHERE id='pending-stream'").get().state,
+    "ignored",
+  );
+  assert.equal(
+    f.db.prepare("SELECT last_error FROM twitch_inbox WHERE id='already-minimized'").get()
+      .last_error,
+    "unknown",
+  );
+  assert.equal(
+    JSON.parse(
+      f.db.prepare("SELECT envelope FROM twitch_inbox WHERE id='other-source'").get().envelope,
+    ).broadcasterId,
+    "9999",
+  );
+  assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 0);
+});
+
+test("never-attempted orphan sources disappear locally without credentials or provider work", async (t) => {
+  for (const withIntent of [false, true]) {
+    const f = fixture(t);
+    await f.ready();
+    if (withIntent) f.hub.beginSubscriptionIntent(broadcaster, callback, webhookSecretRef(secret));
+    const schema = f.db.prepare("SELECT * FROM twitch_hub_migrations ORDER BY version").all();
+    wipeGuildIntegrations(f.db, guildA);
+    assert.equal(f.hub.source(broadcaster), undefined);
+    assert.deepEqual(f.hub.subscriptionIntents(), []);
+    assert.deepEqual(
+      f.db.prepare("SELECT * FROM twitch_hub_migrations ORDER BY version").all(),
+      schema,
+    );
+    assert.equal(f.calls.length, 0);
+    wipeGuildIntegrations(f.db, guildA);
+  }
+});
+
+test("last guild cleanup requires actual DELETE 204 or 404 and preserves foreign callbacks", async (t) => {
+  for (const remotelyAbsent of [false, true]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("challenge-first");
+    const provider = f.provider();
+    await provider.reconcile();
+    const ours = f.subscriptions.get("subscription-1"),
+      envelope = JSON.parse(f.db.prepare("SELECT envelope FROM twitch_inbox").get().envelope);
+    f.subscriptions.set("foreign", {
+      ...ours,
+      id: "foreign",
+      transport: { method: "webhook", callback: "https://other.example.test/callback" },
+    });
+    if (remotelyAbsent) f.subscriptions.delete("subscription-1");
+    wipeGuildIntegrations(f.db, guildA);
+    assert.ok(f.hub.source(broadcaster));
+    const result = await provider.reconcile();
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.deleted, 1);
+    assert.equal(result.pending, 0);
+    assert.equal(f.hub.source(broadcaster), undefined);
+    assert.deepEqual(f.hub.subscriptionIntents(), []);
+    assert.equal(f.subscriptions.has("foreign"), true);
+    assert.deepEqual(
+      f.calls
+        .filter((call) => call.method === "DELETE")
+        .map((call) => call.url.searchParams.get("id")),
+      ["subscription-1"],
+    );
+    const reply = f.hub.accept(envelope);
+    assert.equal(reply.status, 200);
+    assert.equal(reply.body, "answer-subscription-1");
+  }
+});
+
+async function reopenedHub(t, f) {
+  const directory = mkdtempSync(join(tmpdir(), "gildiusz-twitch-orphan-")),
+    file = join(directory, "integrations.sqlite");
+  await backup(f.db, file);
+  const db = new DatabaseSync(file);
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  return new TwitchHubStore(db, { authorize: () => {}, clock: f.now });
+}
+
+function providerForHub(f, hub) {
+  return f.provider({ store: hub, retries: 0 });
+}
+
+test("ambiguous callback discovery persists its locator before DELETE and survives a database reopen", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("lost-response");
+  const provider = f.provider({ retries: 0 });
+  assert.equal((await provider.reconcile()).errors[0].code, "ambiguous_create");
+  const callbackBefore = f.hub.subscriptionIntents()[0].callbackUrl;
+  wipeGuildIntegrations(f.db, guildA);
+  assert.equal(f.hub.subscriptionIntents()[0].subscriptionId, null);
+  f.intercept(async ({ method }) => {
+    if (method !== "DELETE") return;
+    const locator = f.hub.subscriptionIntents()[0];
+    assert.equal(locator.subscriptionId, "subscription-1");
+    assert.equal(locator.callbackUrl, callbackBefore);
+    assert.equal(locator.state, "pending");
+    throw Error("fixture transport interrupted before receipt");
+  });
+  assert.equal((await provider.reconcile()).errors[0].code, "network");
+  provider.close();
+  const hub = await reopenedHub(t, f);
+  f.intercept(async () => undefined);
+  assert.equal((await providerForHub(f, hub).reconcile()).deleted, 1);
+  assert.equal(hub.source(broadcaster), undefined);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+});
+
+test("crash after DELETE but before finalizer repeats the known ID as 404, not a new POST", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("lost-response");
+  const provider = f.provider({ retries: 0 });
+  await provider.reconcile();
+  wipeGuildIntegrations(f.db, guildA);
+  f.hub.finalizeOrphanSource = () => {
+    throw Error("fixture crash before local commit");
+  };
+  const failed = await provider.reconcile();
+  assert.equal(failed.deleted, 1);
+  assert.equal(failed.errors.length, 1);
+  assert.equal(f.subscriptions.size, 0);
+  assert.equal(f.hub.subscriptionIntents()[0].subscriptionId, "subscription-1");
+  provider.close();
+  const hub = await reopenedHub(t, f),
+    result = await providerForHub(f, hub).reconcile();
+  assert.equal(result.deleted, 1);
+  assert.deepEqual(result.errors, []);
+  assert.equal(hub.source(broadcaster), undefined);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 2);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+});
+
+test("empty lists and expired or superseded ambiguous intents never authorize orphan deletion", async (t) => {
+  for (const state of ["pending", "expired", "superseded"]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("lost-response");
+    const provider = f.provider({ retries: 0 });
+    await provider.reconcile();
+    f.subscriptions.clear();
+    f.db.prepare("UPDATE twitch_subscription_intents SET state=?").run(state);
+    wipeGuildIntegrations(f.db, guildA);
+    f.setNow(initialNow + 600001);
+    const before = f.hub.subscriptionIntents(),
+      result = await provider.reconcile();
+    assert.equal(result.pending, 1);
+    assert.deepEqual(result.errors, []);
+    assert.deepEqual(f.hub.subscriptionIntents(), before);
+    assert.ok(f.hub.source(broadcaster));
+    assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 0);
+    assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+  }
+});
+
+test("rebind during DELETE preserves the source and intents instead of finalizing a stale orphan", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("challenge-first");
+  const provider = f.provider();
+  await provider.reconcile();
+  wipeGuildIntegrations(f.db, guildA);
+  f.intercept(async ({ method }) => {
+    if (method === "DELETE") await f.ready(guildB);
+  });
+  const result = await provider.reconcile();
+  assert.equal(result.deleted, 1);
+  assert.equal(result.pending, 1);
+  assert.ok(f.hub.source(broadcaster));
+  assert.equal(f.hub.sourceBindings(broadcaster)[0].guildId, guildB);
+  assert.equal(f.hub.subscriptionIntents().length, 1);
+});
+
+test("source or intent changes during remote listing invalidate the entire cleanup snapshot", async (t) => {
+  for (const change of ["source", "intent"]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("challenge-first");
+    const provider = f.provider();
+    await provider.reconcile();
+    wipeGuildIntegrations(f.db, guildA);
+    f.intercept(async ({ method, url }) => {
+      if (method !== "GET" || url.pathname !== "/helix/eventsub/subscriptions") return;
+      if (change === "source") f.hub.registerSubscription(broadcaster, "new-current");
+      else f.db.exec("UPDATE twitch_subscription_intents SET retry_at=retry_at+1");
+    });
+    const result = await provider.reconcile();
+    assert.equal(result.pending, 1);
+    assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 0);
+    assert.ok(f.hub.source(broadcaster));
+  }
+});
+
+test("a successful DELETE cannot finalize source or intent changes made during its await", async (t) => {
+  for (const change of ["source", "intent"]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("challenge-first");
+    const provider = f.provider();
+    await provider.reconcile();
+    wipeGuildIntegrations(f.db, guildA);
+    f.intercept(async ({ method }) => {
+      if (method !== "DELETE") return;
+      if (change === "source") f.hub.registerSubscription(broadcaster, "new-current");
+      else f.db.exec("UPDATE twitch_subscription_intents SET retry_at=retry_at+1");
+    });
+    const result = await provider.reconcile();
+    assert.equal(result.deleted, 1);
+    assert.equal(result.pending, 1);
+    assert.ok(f.hub.source(broadcaster));
+    assert.equal(f.hub.subscriptionIntents().length, 1);
+    if (change === "source") assert.equal(f.hub.source(broadcaster).subscriptionId, "new-current");
+  }
+});
+
+test("an observed foreign callback under a stored subscription ID blocks cleanup without DELETE", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("challenge-first");
+  const provider = f.provider();
+  await provider.reconcile();
+  wipeGuildIntegrations(f.db, guildA);
+  f.subscriptions.get("subscription-1").transport.callback =
+    "https://foreign.example.test/callback";
+  assert.equal((await provider.reconcile()).pending, 1);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 0);
+  assert.ok(f.hub.source(broadcaster));
+});
+
+test("orphan DELETE retries recheck bindings and source/intent facts after rate-limit or backoff waits", async (t) => {
+  for (const failure of ["429", "503", "network"]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("challenge-first");
+    let changed = false;
+    const provider = f.provider({
+      sleep: async (milliseconds) => {
+        f.setNow(f.now() + milliseconds);
+        if (failure === "429") await f.ready(guildB);
+        else if (failure === "503") f.hub.registerSubscription(broadcaster, "replacement");
+        else f.db.exec("UPDATE twitch_subscription_intents SET retry_at=retry_at+1");
+        changed = true;
+      },
+    });
+    await provider.reconcile();
+    wipeGuildIntegrations(f.db, guildA);
+    let deletes = 0;
+    f.intercept(async ({ method }) => {
+      if (method !== "DELETE") return;
+      deletes++;
+      if (deletes !== 1) return;
+      if (failure === "network") throw Error("fixture connection interrupted");
+      return json({}, Number(failure), failure === "429" ? { "retry-after": "0" } : {});
+    });
+    const result = await provider.reconcile();
+    assert.equal(changed, true);
+    assert.equal(deletes, 1, `No repeated DELETE after ${failure} and a changed cleanup scope`);
+    assert.equal(result.pending, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.deleted, 0);
+    assert.equal(f.subscriptions.has("subscription-1"), true);
+    assert.ok(f.hub.source(broadcaster));
+    assert.equal(f.hub.subscriptionIntents().length, 1);
+  }
+});
+
+test("orphan DELETE after 401 refresh rechecks the scope before another request reaches transport", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("challenge-first");
+  const provider = f.provider();
+  await provider.reconcile();
+  wipeGuildIntegrations(f.db, guildA);
+  let deletes = 0,
+    refreshed = false;
+  f.intercept(async ({ method, url }) => {
+    if (method === "DELETE") {
+      deletes++;
+      if (deletes === 1) return json({}, 401);
+    }
+    if (url.pathname === "/oauth2/token") {
+      await f.ready(guildB);
+      refreshed = true;
+    }
+  });
+  const result = await provider.reconcile();
+  assert.equal(refreshed, true);
+  assert.equal(deletes, 1);
+  assert.equal(f.count("/oauth2/token"), 2);
+  assert.equal(result.pending, 1);
+  assert.deepEqual(result.errors, []);
+  assert.equal(f.subscriptions.has("subscription-1"), true);
+  assert.ok(f.hub.source(broadcaster));
+});
+
+test("orphan cleanup cannot send its first DELETE if authority changes while awaiting a token", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("challenge-first");
+  const provider = f.provider();
+  await provider.reconcile();
+  wipeGuildIntegrations(f.db, guildA);
+  let refreshed = false;
+  f.intercept(async ({ method, url }) => {
+    if (method === "GET" && url.pathname === "/helix/eventsub/subscriptions")
+      f.setNow(f.now() + 7200000);
+    if (url.pathname === "/oauth2/token") {
+      await f.ready(guildB);
+      refreshed = true;
+    }
+  });
+  const result = await provider.reconcile();
+  assert.equal(refreshed, true);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 0);
+  assert.equal(result.pending, 1);
+  assert.deepEqual(result.errors, []);
+  assert.equal(f.subscriptions.has("subscription-1"), true);
+  assert.ok(f.hub.source(broadcaster));
+});
+
+test("normal DELETE retries stop on changed external eligibility or persisted source/intent/binding facts", async (t) => {
+  for (const change of ["active", "unknown", "source", "intent", "binding"]) {
+    const f = fixture(t),
+      a = await f.ready();
+    f.setPostMode("challenge-first");
+    let moduleActive = true,
+      changed = false;
+    const provider = f.provider({
+      activeBinding: () => moduleActive,
+      sleep: async (milliseconds) => {
+        f.setNow(f.now() + milliseconds);
+        if (change === "active") moduleActive = true;
+        else if (change === "unknown") moduleActive = undefined;
+        else if (change === "source") f.hub.registerSubscription(broadcaster, "replacement");
+        else if (change === "intent")
+          f.db.exec("UPDATE twitch_subscription_intents SET retry_at=retry_at+1");
+        else
+          await f.hub.updateBinding(guildA, actorId, "disable", a.id, a.revision, {
+            ...binding(),
+            enabled: false,
+          });
+        changed = true;
+      },
+    });
+    await provider.reconcile();
+    moduleActive = false;
+    let deletes = 0;
+    f.intercept(async ({ method }) => {
+      if (method !== "DELETE") return;
+      deletes++;
+      if (deletes !== 1) return;
+      if (change === "intent") throw Error("fixture network interrupted");
+      return json({}, change === "binding" ? 503 : 429, { "retry-after": "0" });
+    });
+    const result = await provider.reconcile();
+    assert.equal(changed, true);
+    assert.equal(f.hub.orphanSource(broadcaster), undefined, "Exercise the normal deletion path");
+    assert.equal(deletes, 1, `Do not repeat DELETE after ${change} changes`);
+    assert.equal(result.pending, 1);
+    assert.equal(result.deleted, 0);
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.subscriptions.has("subscription-1"), true);
+    assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+    assert.equal(f.hub.subscriptionIntents().length, 1);
+  }
+});
+
+test("normal DELETE rechecks external eligibility after 401 refresh and before its first token-delayed send", async (t) => {
+  for (const initialSend of [true, false]) {
+    const f = fixture(t);
+    await f.ready();
+    f.setPostMode("challenge-first");
+    let moduleActive = true,
+      refreshed = false;
+    const provider = f.provider({ activeBinding: () => moduleActive });
+    await provider.reconcile();
+    moduleActive = false;
+    let deletes = 0;
+    f.intercept(async ({ method, url }) => {
+      if (!initialSend && method === "GET" && url.pathname === "/helix/eventsub/subscriptions")
+        f.setNow(f.now() + 7200000);
+      if (method === "DELETE") {
+        deletes++;
+        if (deletes === 1) return json({}, 401);
+      }
+      if (url.pathname === "/oauth2/token") {
+        moduleActive = true;
+        refreshed = true;
+      }
+    });
+    const result = await provider.reconcile();
+    assert.equal(refreshed, true);
+    assert.equal(deletes, initialSend ? 1 : 0);
+    assert.equal(result.pending, 1);
+    assert.deepEqual(result.errors, []);
+    assert.equal(f.subscriptions.has("subscription-1"), true);
+    assert.equal(f.hub.source(broadcaster).status, "enabled");
+    assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+  }
+});
+
+test("scope changes during a successful normal DELETE stop remaining deletes and replacement creation", async (t) => {
+  const f = fixture(t);
+  await f.ready();
+  f.setPostMode("challenge-first");
+  const original = f.provider();
+  await original.reconcile();
+  original.close();
+  const extraCallback = `${callback}?gildiusz_intent=extra`;
+  f.db
+    .prepare(
+      `INSERT INTO twitch_subscription_intents
+     VALUES ('extra',?,?,?,'superseded','stale-extra',?,?,?,?)`,
+    )
+    .run(
+      broadcaster,
+      extraCallback,
+      webhookSecretRef(secret),
+      f.now(),
+      f.now(),
+      f.now(),
+      f.now() + 600000,
+    );
+  f.subscriptions.set("stale-extra", {
+    ...f.subscriptions.get("subscription-1"),
+    id: "stale-extra",
+    transport: { method: "webhook", callback: extraCallback },
+  });
+  let moduleActive = true;
+  const provider = f.provider({
+    activeBinding: () => moduleActive,
+    webhookSecret: "replacement-synthetic-secret-".repeat(2),
+  });
+  f.intercept(async ({ method }) => {
+    if (method === "DELETE") moduleActive = false;
+  });
+  const result = await provider.reconcile();
+  assert.equal(result.deleted, 1, "Report the receipt that actually completed");
+  assert.equal(result.pending, 1);
+  assert.deepEqual(result.errors, []);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "DELETE"), 1);
+  assert.equal(f.count("/helix/eventsub/subscriptions", "POST"), 1);
+  assert.equal(f.subscriptions.has("stale-extra"), true);
+  assert.equal(f.hub.source(broadcaster).status, "enabled");
+  assert.equal(f.hub.subscriptionIntents().length, 2);
 });

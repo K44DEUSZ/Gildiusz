@@ -1,9 +1,10 @@
-import type { TwitchHubStore } from "./store.js";
+import type { OrphanTwitchSource, TwitchHubStore } from "./store.js";
 import { webhookSecretRef } from "./webhook.js";
 import { broadcasterId, integer, liveStream, record, text, timestamp } from "./validation.js";
 import type { LiveStream, SubscriptionIntent, TwitchBinding } from "./types.js";
 import type { TwitchBroadcaster } from "../../contracts/twitch.js";
 import { TwitchError } from "./types.js";
+import { digest } from "../../shared/utils.js";
 
 export type TwitchProviderErrorCode =
   | "invalid_configuration"
@@ -72,6 +73,11 @@ const active = (value: Subscription) =>
   ["enabled", "webhook_callback_verification_pending"].includes(value.status);
 const mode = (value: Subscription) =>
   value.status === "enabled" ? ("enabled" as const) : ("pending" as const);
+class ReconciliationChanged extends Error {}
+interface DeletionGuard {
+  unchanged(): boolean;
+  advance(): void;
+}
 
 export class TwitchProvider {
   readonly #store: TwitchHubStore;
@@ -233,12 +239,18 @@ export class TwitchProvider {
     );
     return Math.min(now + 86400000, Math.max(...candidates));
   }
-  async #request(url: URL, init: RequestInit, safe: boolean): Promise<ResponseData> {
+  async #request(
+    url: URL,
+    init: RequestInit,
+    safe: boolean,
+    beforeSend?: () => boolean,
+  ): Promise<ResponseData> {
     for (let attempt = 0; ; attempt++) {
       const wait = this.#blockedUntil - this.#now();
       if (wait > this.#maxWait)
         throw new TwitchProviderError("rate_limited", 429, this.#blockedUntil);
       if (wait > 0) await this.#sleep(wait);
+      if (beforeSend && !beforeSend()) throw new ReconciliationChanged();
       let response: ResponseData;
       try {
         response = await this.#exchange(url, init);
@@ -379,6 +391,7 @@ export class TwitchProvider {
     path: "/helix/streams" | "/helix/eventsub/subscriptions" | "/helix/users",
     query: Record<string, string> = {},
     body?: unknown,
+    beforeSend?: () => boolean,
   ): Promise<ResponseData> {
     const url = new URL(path, helix);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
@@ -398,6 +411,7 @@ export class TwitchProvider {
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           },
           method !== "POST",
+          beforeSend,
         );
       } catch (error) {
         if (
@@ -515,15 +529,108 @@ export class TwitchProvider {
           (intent.subscriptionId === null || intent.subscriptionId === subscription.id),
       );
   }
-  async #delete(subscription: Subscription): Promise<void> {
+  #deletionDecision(broadcaster: string): string | undefined {
+    try {
+      const source = this.#store.sourceFingerprint(broadcaster);
+      if (!source) return undefined;
+      const eligibility = this.#store
+        .sourceBindings(broadcaster)
+        .filter((binding) => binding.enabled && !binding.removed)
+        .map((binding) => ({
+          id: binding.id,
+          state: this.#activeBinding ? this.#activeBinding(binding) : true,
+        }));
+      if (eligibility.some((value) => value.state !== true && value.state !== false))
+        return undefined;
+      return digest({ source, eligibility });
+    } catch {
+      return undefined;
+    }
+  }
+  #deletionGuard(broadcaster: string): DeletionGuard {
+    let expected = this.#deletionDecision(broadcaster);
+    return {
+      unchanged: () => expected !== undefined && this.#deletionDecision(broadcaster) === expected,
+      advance: () => {
+        expected = this.#deletionDecision(broadcaster);
+      },
+    };
+  }
+  async #delete(subscription: Subscription, guard: DeletionGuard): Promise<boolean> {
+    if (!guard.unchanged()) throw new ReconciliationChanged();
     const intent = this.#intentFor(subscription);
-    await this.#api("DELETE", "/helix/eventsub/subscriptions", { id: subscription.id });
+    if (intent) {
+      this.#store.recordSubscriptionLocator(intent.id, subscription.id, subscription.callbackUrl);
+      guard.advance();
+    }
+    await this.#api(
+      "DELETE",
+      "/helix/eventsub/subscriptions",
+      { id: subscription.id },
+      undefined,
+      guard.unchanged,
+    );
+    if (!guard.unchanged()) return false;
     this.#store.revokeSubscriptionIfCurrent(
       subscription.broadcasterId,
       subscription.id,
       "provider_subscription_removed",
     );
     if (intent) this.#store.retireSubscriptionIntent(intent.id, subscription.id);
+    guard.advance();
+    return true;
+  }
+  async #cleanupOrphan(
+    expected: OrphanTwitchSource,
+    subscriptions: readonly Subscription[],
+    result: ReconciliationResult,
+  ): Promise<boolean> {
+    const unchanged = () =>
+      this.#store.orphanSource(expected.broadcasterId)?.fingerprint === expected.fingerprint;
+    if (!unchanged()) return false;
+    const targets = new Map<string, string>();
+    for (const intent of expected.intents)
+      if (intent.subscriptionId !== null) targets.set(intent.subscriptionId, intent.callbackUrl);
+    if (expected.subscriptionId !== null && !targets.has(expected.subscriptionId))
+      targets.set(expected.subscriptionId, this.#callback);
+    for (const subscription of subscriptions) {
+      const intent = expected.intents.find(
+        (value) =>
+          subscription.broadcasterId === expected.broadcasterId &&
+          value.callbackUrl === subscription.callbackUrl,
+      );
+      if (intent) {
+        if (intent.subscriptionId !== null && intent.subscriptionId !== subscription.id)
+          return false;
+        this.#store.recordSubscriptionLocator(intent.id, subscription.id, subscription.callbackUrl);
+        // No await between the locator commit and this new comparison baseline.
+        expected = this.#store.orphanSource(expected.broadcasterId)!;
+        targets.set(subscription.id, subscription.callbackUrl);
+      }
+    }
+    // A known ID observed with a different callback/broadcaster is not authority to delete it.
+    for (const [id, callback] of targets) {
+      const observed = subscriptions.find((value) => value.id === id);
+      if (
+        observed &&
+        (observed.broadcasterId !== expected.broadcasterId || observed.callbackUrl !== callback)
+      )
+        return false;
+    }
+    const deletedIds: string[] = [];
+    for (const id of targets.keys()) {
+      if (!unchanged()) return false;
+      // Repeating a known DELETE after a crash is safe; an empty list alone is not a receipt.
+      try {
+        await this.#api("DELETE", "/helix/eventsub/subscriptions", { id }, undefined, unchanged);
+      } catch (error) {
+        if (error instanceof ReconciliationChanged) return false;
+        throw error;
+      }
+      deletedIds.push(id);
+      result.deleted++;
+    }
+    return this.#store.finalizeOrphanSource(expected, deletedIds);
   }
   reconcile(): Promise<ReconciliationResult> {
     if (!this.#reconcileFlight)
@@ -533,12 +640,32 @@ export class TwitchProvider {
     return this.#reconcileFlight;
   }
   async #reconcile(): Promise<ReconciliationResult> {
-    const snapshots = this.#store.sources();
+    const snapshots = this.#store.sources(),
+      orphans = new Map(
+        snapshots.map((source) => [
+          source.broadcasterId,
+          this.#store.orphanSource(source.broadcasterId),
+        ]),
+      );
     const subscriptions = await this.#subscriptions(),
       result: ReconciliationResult = { created: 0, adopted: 0, deleted: 0, pending: 0, errors: [] };
     for (const snapshot of snapshots) {
       const stored = this.#store.source(snapshot.broadcasterId);
       if (!stored) continue;
+      if (orphans.get(snapshot.broadcasterId) || this.#store.orphanSource(snapshot.broadcasterId)) {
+        try {
+          const orphan = orphans.get(snapshot.broadcasterId);
+          if (!orphan || !(await this.#cleanupOrphan(orphan, subscriptions, result)))
+            result.pending++;
+        } catch (error) {
+          result.errors.push({
+            broadcasterId: snapshot.broadcasterId,
+            code:
+              error instanceof TwitchProviderError ? error.code : "provider_reconciliation_failed",
+          });
+        }
+        continue;
+      }
       const states = this.#store
         .sourceBindings(snapshot.broadcasterId)
         .filter((binding) => binding.enabled && !binding.removed)
@@ -583,12 +710,16 @@ export class TwitchProvider {
             break;
           }
         }
+        const decision = this.#deletionGuard(source.broadcasterId);
         for (const value of owned) {
+          if (!decision.unchanged()) throw new ReconciliationChanged();
           const current = this.#store.source(source.broadcasterId)!;
           if (retained && value.id === current.subscriptionId) continue;
-          await this.#delete(value);
+          const unchanged = await this.#delete(value, decision);
           result.deleted++;
+          if (!unchanged) throw new ReconciliationChanged();
         }
+        if (!decision.unchanged()) throw new ReconciliationChanged();
         const latest = this.#store.source(source.broadcasterId);
         if (!latest?.activeBindingCount || !source.activeBindingCount || retained) continue;
         if (latest.subscriptionId !== source.subscriptionId && latest.status !== "revoked") {
@@ -653,6 +784,10 @@ export class TwitchProvider {
           throw error;
         }
       } catch (error) {
+        if (error instanceof ReconciliationChanged) {
+          result.pending++;
+          continue;
+        }
         result.errors.push({
           broadcasterId: source.broadcasterId,
           code:

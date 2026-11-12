@@ -85,6 +85,78 @@ const readFanout = (row: Row): TwitchFanout => ({
   reason: row.reason === null ? null : String(row.reason),
 });
 
+export interface OrphanTwitchSource {
+  broadcasterId: string;
+  subscriptionId: string | null;
+  intents: SubscriptionIntent[];
+  fingerprint: string;
+}
+
+function orphanSource(db: DatabaseSync, id: string): OrphanTwitchSource | undefined {
+  broadcasterId(id);
+  if (db.prepare("SELECT 1 FROM twitch_bindings WHERE broadcaster_id=? LIMIT 1").get(id))
+    return undefined;
+  const source = db.prepare("SELECT * FROM twitch_sources WHERE broadcaster_id=?").get(id);
+  if (!source) return undefined;
+  const intents = db
+    .prepare("SELECT * FROM twitch_subscription_intents WHERE broadcaster_id=? ORDER BY id")
+    .all(id);
+  return {
+    broadcasterId: id,
+    subscriptionId: source.subscription_id === null ? null : String(source.subscription_id),
+    intents: intents.map(readIntent),
+    fingerprint: digest({ source, intents }),
+  };
+}
+
+function minimizeOrphanInbox(db: DatabaseSync, id: string): void {
+  // Minimized envelopes have no source locator. Preserve them and every exact webhook reply.
+  db.prepare(
+    `UPDATE twitch_inbox SET envelope='{}',last_error=NULL,
+       state=CASE WHEN state='pending' THEN 'ignored' ELSE state END
+     WHERE CASE WHEN json_valid(envelope)
+       THEN json_extract(envelope,'$.broadcasterId') END=?`,
+  ).run(id);
+}
+
+function finalizeOrphanSource(
+  db: DatabaseSync,
+  expected: OrphanTwitchSource,
+  deletedIds: readonly string[],
+): boolean {
+  return transaction(db, () => {
+    const current = orphanSource(db, expected.broadcasterId),
+      deleted = new Set(deletedIds);
+    if (
+      !current ||
+      current.fingerprint !== expected.fingerprint ||
+      (current.subscriptionId !== null && !deleted.has(current.subscriptionId)) ||
+      current.intents.some((intent) =>
+        intent.subscriptionId === null
+          ? intent.attemptedAt !== null || ["registered", "confirmed"].includes(intent.state)
+          : !deleted.has(intent.subscriptionId),
+      )
+    )
+      return false;
+    minimizeOrphanInbox(db, current.broadcasterId);
+    db.prepare("DELETE FROM twitch_subscription_intents WHERE broadcaster_id=?").run(
+      current.broadcasterId,
+    );
+    db.prepare("DELETE FROM twitch_sources WHERE broadcaster_id=?").run(current.broadcasterId);
+    return true;
+  });
+}
+
+/** Guild purge is local: external cleanup locators survive until DELETE has been confirmed. */
+export function minimizeOrphanTwitchSource(db: DatabaseSync, id: string): void {
+  transaction(db, () => {
+    const source = orphanSource(db, id);
+    if (!source) return;
+    minimizeOrphanInbox(db, id);
+    finalizeOrphanSource(db, source, []);
+  });
+}
+
 export class TwitchHubStore {
   readonly retention: TwitchRetention;
   private readonly clock: () => number;
@@ -369,6 +441,46 @@ export class TwitchHubStore {
             )
             .all(broadcasterId(broadcaster))
     ).map(readIntent);
+  }
+  orphanSource(broadcaster: string): OrphanTwitchSource | undefined {
+    return orphanSource(this.db, broadcaster);
+  }
+  sourceFingerprint(broadcaster: string): string | undefined {
+    broadcasterId(broadcaster);
+    const source = this.db
+      .prepare("SELECT * FROM twitch_sources WHERE broadcaster_id=?")
+      .get(broadcaster);
+    if (!source) return undefined;
+    return digest({
+      source,
+      intents: this.db
+        .prepare("SELECT * FROM twitch_subscription_intents WHERE broadcaster_id=? ORDER BY id")
+        .all(broadcaster),
+      bindings: this.db
+        .prepare("SELECT * FROM twitch_bindings WHERE broadcaster_id=? ORDER BY id")
+        .all(broadcaster),
+    });
+  }
+  recordSubscriptionLocator(intentId: string, subscriptionId: string, callbackUrl: string): void {
+    text(subscriptionId);
+    transaction(this.db, () => {
+      const row = this.db
+        .prepare("SELECT * FROM twitch_subscription_intents WHERE id=?")
+        .get(text(intentId));
+      if (
+        !row ||
+        row.callback_url !== callbackUrl ||
+        (row.subscription_id !== null && row.subscription_id !== subscriptionId)
+      )
+        throw new TwitchError("subscription_mismatch");
+      // Discovery is not a DELETE receipt; keep the callback and intent state across crashes.
+      this.db
+        .prepare("UPDATE twitch_subscription_intents SET subscription_id=? WHERE id=?")
+        .run(subscriptionId, intentId);
+    });
+  }
+  finalizeOrphanSource(expected: OrphanTwitchSource, deletedIds: readonly string[]): boolean {
+    return finalizeOrphanSource(this.db, expected, deletedIds);
   }
   beginSubscriptionIntent(
     broadcaster: string,
