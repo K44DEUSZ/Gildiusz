@@ -313,8 +313,17 @@ export class ModuleRuntime {
           available.push("meetings.list", "meetings.create", "meetings.preview");
         if (this.settings.read().enabled.cases) available.push("cases.list", "cases.create");
       }
-      if (this.beta && this.integrations?.capability(guild.id).availability === "available")
-        available.push("integrations.list", "integrations.create");
+      if (this.beta && this.integrations?.capability(guild.id).availability === "available") {
+        available.push(
+          "integrations.list",
+          "integrations.lookup",
+          "integrations.create",
+          "integrations.read",
+          "integrations.update",
+          "integrations.remove",
+        );
+        if (this.settings.read().enabled.integrations) available.push("integrations.test");
+      }
       if (this.rules.effectsReady)
         available.push(
           "rules.read",

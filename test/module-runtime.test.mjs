@@ -348,11 +348,35 @@ test("the shared module API exposes and delegates only configured Twitch capabil
     f.runtime.capabilities().modules.find((item) => item.key === "integrations").availability,
     "available",
   );
+  const integrationPermissions = (view) =>
+    view.permissions.filter((value) => value.startsWith("integrations.")).sort();
+  const management = [
+    "integrations.list",
+    "integrations.lookup",
+    "integrations.create",
+    "integrations.read",
+    "integrations.update",
+    "integrations.remove",
+  ].sort();
   const ordinary = await f.runtime.capabilitiesView(actorId);
-  assert.ok(!ordinary.permissions.includes("integrations.list"));
+  assert.deepEqual(integrationPermissions(ordinary), []);
   f.state.ownerId = actorId;
   const manager = await f.runtime.capabilitiesView(actorId);
-  assert.ok(manager.permissions.includes("integrations.list"));
+  assert.deepEqual(integrationPermissions(manager), management);
+  const enabled = f.runtime.settings.read();
+  enabled.enabled.integrations = true;
+  f.runtime.settings.save(enabled, actorId);
+  const active = await f.runtime.request(f.facts(), "capabilities.read", {});
+  assert.deepEqual(integrationPermissions(active), [...management, "integrations.test"].sort());
+  const disabled = f.runtime.settings.read();
+  disabled.enabled.integrations = false;
+  f.runtime.settings.save(disabled, actorId);
+  assert.deepEqual(integrationPermissions(await f.runtime.capabilitiesView(actorId)), management);
+  f.state.ownerId = otherOwner;
+  f.state.rolePermissions = P.ManageGuild;
+  assert.deepEqual(integrationPermissions(await f.runtime.capabilitiesView(actorId)), management);
+  f.state.rolePermissions = 0n;
+  assert.deepEqual(integrationPermissions(await f.runtime.capabilitiesView(actorId)), []);
   const payload = {};
   assert.deepEqual(
     await f.runtime.request(f.admin(), "integrations.list", payload, undefined, "request_123"),
@@ -369,6 +393,19 @@ test("the shared module API exposes and delegates only configured Twitch capabil
       .availability,
     "planned",
   );
+  inactive.state.ownerId = actorId;
+  assert.deepEqual(integrationPermissions(await inactive.runtime.capabilitiesView(actorId)), []);
+  const planned = fixture(t, {
+    integrations: {
+      ...integrations,
+      capability: () => ({ ...capability, availability: "planned" }),
+    },
+  });
+  planned.state.ownerId = actorId;
+  assert.deepEqual(integrationPermissions(await planned.runtime.capabilitiesView(actorId)), []);
+  const missing = fixture(t);
+  missing.state.ownerId = actorId;
+  assert.deepEqual(integrationPermissions(await missing.runtime.capabilitiesView(actorId)), []);
 });
 
 test("turning Twitch off cancels its queued work in the same settings transaction", async (t) => {
