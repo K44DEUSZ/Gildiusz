@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Routes } from "discord.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../dist/storage/store.js";
@@ -180,6 +180,62 @@ test("repeated core, community, and content deployment updates only mapped resou
   const audit = auditPermissions(f.state, f.store, f.config);
   assert.deepEqual(audit.failures, []);
 });
+
+for (const mode of ["flag", "existing registry", "custom registry"])
+  test(`public bootstrap with ${mode} leaves guild commands and their mappings untouched`, async (t) => {
+    const f = setup(t);
+    for (const phase of ["core", "community"]) await f.apply(await f.plan(phase));
+    const legacy = clone(f.state.commands);
+    const mappings = f.store.resources().filter((resource) => resource.kind === "command");
+    f.state.commands.push({ id: "100000000000000099", name: "unmanaged", type: 1 });
+    const directory = mkdtempSync(join(tmpdir(), "gildiusz-command-scope-"));
+    const previous = Object.fromEntries(
+      ["PUBLIC_INSTALLS", "CONTROL_DATA_DIR", "HEALTH_PATH"].map((key) => [key, process.env[key]]),
+    );
+    t.after(() => {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(directory, { recursive: true, force: true });
+    });
+    process.env.PUBLIC_INSTALLS = mode === "flag" ? "1" : "0";
+    delete process.env.CONTROL_DATA_DIR;
+    process.env.HEALTH_PATH = join(directory, "health.json");
+    if (mode !== "flag") {
+      const registry = join(directory, mode === "custom registry" ? "custom" : "public-guilds");
+      if (mode === "custom registry") process.env.CONTROL_DATA_DIR = registry;
+      mkdirSync(registry);
+      writeFileSync(join(registry, "installations.json"), "[]");
+    }
+    const plan = await f.plan("community");
+    assert.deepEqual(plan.conflicts, []);
+    assert.equal(
+      plan.changes.some((change) => change.item.kind === "command"),
+      false,
+    );
+    const before = f.writes.length;
+    await f.apply(plan);
+    assert.equal(
+      f.writes.slice(before).some(([, route]) => route.includes("/commands")),
+      false,
+    );
+    assert.deepEqual(f.state.commands.slice(0, legacy.length), legacy);
+    assert.equal(f.state.commands.at(-1).name, "unmanaged");
+    assert.deepEqual(
+      f.store.resources().filter((resource) => resource.kind === "command"),
+      mappings,
+    );
+    f.state.commands = [];
+    const afterCleanup = await f.plan("community");
+    assert.deepEqual(afterCleanup.conflicts, []);
+    assert.equal(
+      afterCleanup.changes.some((change) => change.item.kind === "command"),
+      false,
+    );
+    await f.apply(afterCleanup);
+    assert.deepEqual(f.state.commands, []);
+  });
 
 test("publishing repairs a failed text pin without duplicate messages and leaves voice notes unpinned", async (t) => {
   const f = setup(t);

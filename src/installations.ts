@@ -79,3 +79,10 @@ export function healthPath(values = process.env): string {
       resolve(dirname(resolve(values.DATABASE_PATH || "data/gildiusz.sqlite")), "health.json"),
   );
 }
+
+export function globalCommandsEnabled(values = process.env): boolean {
+  const directory = resolve(
+    values.CONTROL_DATA_DIR || resolve(dirname(healthPath(values)), "public-guilds"),
+  );
+  return values.PUBLIC_INSTALLS === "1" || existsSync(resolve(directory, "installations.json"));
+}

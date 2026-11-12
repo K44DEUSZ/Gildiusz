@@ -10,6 +10,7 @@ import { readContent, readJson, render, publications } from "../content.js";
 import { commands } from "../bot/commands.js";
 import { memberPermissions, overwrites, P } from "../permissions/model.js";
 import type { Body } from "./api.js";
+import { globalCommandsEnabled } from "../installations.js";
 
 export interface Desired {
   key: string;
@@ -230,12 +231,14 @@ export function desired(
             ],
           },
         });
-      for (const command of commands()) {
-        const body = { ...command };
-        delete body.contexts;
-        delete body.integration_types;
-        result.push({ key: `command.${command.name}`, kind: "command", body: { ...body } });
-      }
+      // The shared service registers these globally; guild copies duplicate autocomplete entries.
+      if (!globalCommandsEnabled())
+        for (const command of commands()) {
+          const body = { ...command };
+          delete body.contexts;
+          delete body.integration_types;
+          result.push({ key: `command.${command.name}`, kind: "command", body: { ...body } });
+        }
     }
   } else
     for (const publication of publications(config))

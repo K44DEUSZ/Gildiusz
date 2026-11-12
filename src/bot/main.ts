@@ -35,7 +35,12 @@ import { isManagedPinNotice } from "../shared/pin-notices.js";
 import { settingsInteraction } from "./settings-panel.js";
 import { discordRoleSelection } from "./role-selection.js";
 
-import { loadInstallations, healthPath, type GuildInstallation } from "../installations.js";
+import {
+  loadInstallations,
+  healthPath,
+  globalCommandsEnabled,
+  type GuildInstallation,
+} from "../installations.js";
 import { GuildRegistry } from "./guild-registry.js";
 import { PublicInstallations } from "../control/installations.js";
 import { publicConfig } from "../control/configuration.js";
@@ -114,10 +119,9 @@ async function main(): Promise<void> {
   const credentials = loadCredentials();
   const memberEvents = process.env.GILDIUSZ_MEMBER_EVENTS === "1";
   const publicDirectory = resolve(process.env.CONTROL_DATA_DIR || join(dataRoot, "public-guilds"));
-  const publicInstallations =
-    process.env.PUBLIC_INSTALLS === "1" || existsSync(join(publicDirectory, "installations.json"))
-      ? new PublicInstallations(publicDirectory)
-      : undefined;
+  const publicInstallations = globalCommandsEnabled()
+    ? new PublicInstallations(publicDirectory)
+    : undefined;
   const legacy =
     publicInstallations && !process.env.GUILDS_PATH && !process.env.DISCORD_GUILD_ID
       ? []
