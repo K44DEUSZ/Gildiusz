@@ -69,6 +69,7 @@ import { MeetingMembership } from "./meeting-membership.js";
 import { TwitchRuntime } from "./twitch-runtime.js";
 import { twitchConfiguration } from "./twitch-config.js";
 import { createTwitchIngress, type TwitchIngress } from "../modules/twitch/server.js";
+import { TwitchHistoryRetention } from "../modules/twitch/retention.js";
 import { ModuleSettingsStore } from "../core/modules/settings.js";
 import { AnnouncementAssetStore } from "../modules/announcement-assets/store.js";
 import { freshBotGuildPresence } from "./guild-presence.js";
@@ -193,6 +194,9 @@ async function main(): Promise<void> {
   let twitch: TwitchRuntime | undefined;
   let integrationDatabase: DatabaseSync | undefined;
   let twitchIngress: TwitchIngress | undefined;
+  let twitchHistory: TwitchHistoryRetention | undefined;
+  let twitchHistoryAt = 0;
+  const twitchHistoryJobs = new WeakMap<Store, JobStore>();
   const deletionQueue = new SerialQueue();
   let deletionLifecycle: RulesDeletionLifecycle | undefined;
   const epoch = (guildId: string) => guildEpochs.get(guildId) ?? 0;
@@ -1135,6 +1139,28 @@ async function main(): Promise<void> {
         })(),
         guildId,
       );
+    }
+    if (ownsDataRoot && integrationDatabase && Date.now() >= twitchHistoryAt) {
+      twitchHistoryAt = Date.now() + 60000;
+      try {
+        if (twitchHistory?.db !== integrationDatabase)
+          twitchHistory = new TwitchHistoryRetention(integrationDatabase, {
+            resolveJobStore: (guildId) => {
+              if (changing.has(guildId) || purgingGuilds.has(guildId)) return undefined;
+              const store = stores.get(guildId);
+              if (!store) return undefined;
+              let jobs = twitchHistoryJobs.get(store);
+              if (!jobs) {
+                jobs = new JobStore(store.db);
+                twitchHistoryJobs.set(store, jobs);
+              }
+              return jobs;
+            },
+          });
+        twitchHistory.prune(100);
+      } catch (error) {
+        console.error(`Twitch history retention failed: ${errorCode(error)}`);
+      }
     }
     if (!connected || !client.isReady()) return;
     if (!uninstallSweeping && Date.now() >= uninstallSweepAt) {
